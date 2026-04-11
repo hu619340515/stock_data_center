@@ -1,7 +1,7 @@
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
-from database import MongoManager
+from database import DuckDBManager  # ✅ 修改：导入 DuckDBManager
 from data_source import BaoStockClient
 from config import MAX_WORKERS
 from logger_config import setup_logger
@@ -10,7 +10,7 @@ logger = setup_logger("Core")
 
 class StockDataPipeline:
     def __init__(self):
-        self.mongo = MongoManager()
+        self.db = DuckDBManager()      # ✅ 修改：实例化 DuckDBManager
         self.stock_client = BaoStockClient()
 
     def _process_single_stock(self, stock_code: str, stock_name: str, start_date: str, end_date: str, retries=3) -> dict:
@@ -32,7 +32,7 @@ class StockDataPipeline:
                     return {"code": stock_code, "status": "no_data", "rows": 0}
 
                 # 2. 入库
-                success = self.mongo.upload_df(df)
+                success = self.db.upload_df(df) # ✅ 修改：调用 db.upload_df
                 status = "success" if success else "upload_failed"
                 
                 return {"code": stock_code, "status": status, "rows": len(df)}
@@ -50,7 +50,7 @@ class StockDataPipeline:
         """
         全量下载流水线
         """
-        logger.info("🚀 启动全量流式下载流水线...")
+        logger.info("🚀 启动全量流式下载流水线 (DuckDB版)...")
         stocks = self.stock_client.get_stock_list()
         
         if stocks.empty:
@@ -79,6 +79,7 @@ class StockDataPipeline:
                     success_count += 1
                 else:
                     fail_count += 1
+                # 简化日志输出
                 logger.info(f"📊 {result['code']} | {result['status']} | 行数: {result['rows']}")
 
         logger.info(f"✅ 全量流水线结束 | 成功: {success_count} | 失败: {fail_count}")
@@ -97,9 +98,14 @@ class StockDataPipeline:
             futures = []
             for _, row in stocks.iterrows():
                 code = row['code']
-                last_date = self.mongo.get_last_date(code)
+                # 获取最后日期
+                last_date = self.db.get_last_date(code) # ✅ 修改：调用 db.get_last_date
+                
                 if last_date:
-                    start_date = (last_date + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+                    # 注意：last_date 已经是 datetime.date 对象
+                    # 需要将其转换为字符串格式以便比较
+                    last_date_str = last_date.strftime("%Y-%m-%d")
+                    start_date = (pd.to_datetime(last_date) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
                 else:
                     start_date = "1999-01-01"
                 
