@@ -119,8 +119,28 @@ class BaoStockClient(DataSourceInterface):
         )
         
         if rs.error_code != '0':
-            logger.error(f"❌ 获取数据失败 {code}: {rs.error_msg}")
-            raise Exception(f"获取数据失败 {code}: {rs.error_msg}")
+            # 检查是否是登录失效错误
+            if "用户未登录" in rs.error_msg:
+                logger.warning(f"⚠️ 会话已过期，需要重新登录: {rs.error_msg}")
+                # 重置登录状态
+                self.lg = None
+                # 重新登录
+                self.login()
+                # 重新尝试获取数据
+                rs = bs.query_history_k_data_plus(
+                    code,
+                    fields,
+                    start_date=start_date,
+                    end_date=end_date,
+                    frequency=bs_frequency,
+                    adjustflag="2" 
+                )
+                if rs.error_code != '0':
+                    logger.error(f"❌ 重新登录后获取数据失败 {code}: {rs.error_msg}")
+                    raise Exception(f"获取数据失败 {code}: {rs.error_msg}")
+            else:
+                logger.error(f"❌ 获取数据失败 {code}: {rs.error_msg}")
+                raise Exception(f"获取数据失败 {code}: {rs.error_msg}")
             
         data_list = []
         while rs.next():
