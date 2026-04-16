@@ -57,7 +57,7 @@ class BaoStockClient(DataSourceInterface):
                 logger.warning(f"⚠️ 登出失败: {e}")
 
     @retry_with_backoff
-    def get_stock_list(self) -> pd.DataFrame:
+    def get_stock_list(self, data_type: str = "stock") -> pd.DataFrame:
         self.login()
         # 使用昨天作为查询日期
         yesterday = (pd.Timestamp.now() - timedelta(days=1)).strftime("%Y-%m-%d")
@@ -82,10 +82,22 @@ class BaoStockClient(DataSourceInterface):
             return pd.DataFrame()
             
         df = pd.DataFrame(data_list, columns=rs.fields)
-        # 过滤A股
-        df = df[df['code'].str.contains(r'sh\.6|sz\.0|sz\.3|bj\.')]
         
-        logger.info(f"✅ 获取到 {len(df)} 只A股股票")
+        # 根据 data_type 过滤股票和/或ETF
+        if data_type == "stock":
+            stock_etf_pattern = r'sh\.6|sz\.0|sz\.3|bj\.' # A股股票
+            df = df[df['code'].str.contains(stock_etf_pattern)]
+            logger.info(f"✅ 获取到 {len(df)} 只A股股票")
+        elif data_type == "etf":
+            stock_etf_pattern = r'sh\.5|sz\.1' # ETF
+            df = df[df['code'].str.contains(stock_etf_pattern)]
+            logger.info(f"✅ 获取到 {len(df)} 只ETF")
+        elif data_type == "special":
+            logger.info("ℹ️ 特色数据类型暂不支持，返回空列表。")
+            return pd.DataFrame() # 暂时返回空DataFrame
+        else:
+            logger.warning(f"⚠️ 未知的数据类型: {data_type}，返回空列表。")
+            return pd.DataFrame()
         return df
 
     @retry_with_backoff

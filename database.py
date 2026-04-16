@@ -1,6 +1,7 @@
 import duckdb
 import pandas as pd
 import os
+from typing import Tuple
 from config import DATABASE_PATH
 from logger_config import setup_logger
 
@@ -9,15 +10,55 @@ logger = setup_logger("Database")
 class DuckDBManager:
     def __init__(self, db_path=None):
         db_path = db_path or DATABASE_PATH
-        self.con = duckdb.connect(db_path)
+        self.db_path = db_path
+        self.con = None
+        self._connect()
         self._create_table()
         logger.info(f"✅ DuckDB 初始化完成 (文件: {db_path})")
+    
+    def _connect(self):
+        """建立数据库连接"""
+        try:
+            self.con = duckdb.connect(self.db_path)
+        except Exception as e:
+            logger.error(f"数据库连接失败: {e}")
+            raise
+    
+    def _reconnect(self):
+        """重新连接数据库"""
+        logger.info("尝试重新连接数据库...")
+        try:
+            if self.con:
+                try:
+                    self.con.close()
+                except:
+                    pass
+            self._connect()
+            logger.info("数据库重新连接成功")
+            return True
+        except Exception as e:
+            logger.error(f"数据库重新连接失败: {e}")
+            return False
 
     def _create_table(self):
         """
         创建股票数据表
         支持不同时间粒度的数据
         """
+        # 创建股票基本信息表
+        stock_info_sql = """
+        CREATE TABLE IF NOT EXISTS stock_info (
+            code VARCHAR PRIMARY KEY,
+            code_name VARCHAR,
+            industry VARCHAR,
+            market VARCHAR,
+            list_date DATE,
+            is_active BOOLEAN DEFAULT TRUE,
+            last_update DATE
+        )
+        """
+        self.con.execute(stock_info_sql)
+        
         # 创建日线表
         daily_sql = """
         CREATE TABLE IF NOT EXISTS stock_daily (
@@ -35,7 +76,8 @@ class DuckDBManager:
             tradestatus VARCHAR,
             pctChg DOUBLE,
             isST VARCHAR,
-            PRIMARY KEY (code, date)
+            PRIMARY KEY (code, date),
+            FOREIGN KEY (code) REFERENCES stock_info(code)
         )
         """
         self.con.execute(daily_sql)
@@ -57,7 +99,8 @@ class DuckDBManager:
             tradestatus VARCHAR,
             pctChg DOUBLE,
             isST VARCHAR,
-            PRIMARY KEY (code, date)
+            PRIMARY KEY (code, date),
+            FOREIGN KEY (code) REFERENCES stock_info(code)
         )
         """
         self.con.execute(weekly_sql)
@@ -79,7 +122,8 @@ class DuckDBManager:
             tradestatus VARCHAR,
             pctChg DOUBLE,
             isST VARCHAR,
-            PRIMARY KEY (code, date)
+            PRIMARY KEY (code, date),
+            FOREIGN KEY (code) REFERENCES stock_info(code)
         )
         """
         self.con.execute(monthly_sql)
@@ -90,6 +134,8 @@ class DuckDBManager:
             self.con.execute("CREATE INDEX IF NOT EXISTS idx_daily_code_date ON stock_daily (code, date)")
             self.con.execute("CREATE INDEX IF NOT EXISTS idx_weekly_code_date ON stock_weekly (code, date)")
             self.con.execute("CREATE INDEX IF NOT EXISTS idx_monthly_code_date ON stock_monthly (code, date)")
+            self.con.execute("CREATE INDEX IF NOT EXISTS idx_stock_info_industry ON stock_info (industry)")
+            self.con.execute("CREATE INDEX IF NOT EXISTS idx_stock_info_market ON stock_info (market)")
         except Exception as e:
             logger.warning(f"索引创建提示: {e}")
 
@@ -111,33 +157,39 @@ class DuckDBManager:
         """
         if not df_list: return 0
         
-        try:
-            combined_df = pd.concat(df_list, ignore_index=True)
-            if combined_df.empty: return 0
+        max_retries = 2
+        for attempt in range(max_retries):
+            try:
+                combined_df = pd.concat(df_list, ignore_index=True)
+                if combined_df.empty: return 0
 
-            df_clean = self._clean_data(combined_df)
-            count = len(df_clean)
-            table_name = self._get_table_name(frequency)
-            
-            # 优化：使用DuckDB的COPY命令进行更高效的批量导入
-            # 对于大型DataFrame，COPY命令比INSERT更高效
-            if count > 1000:
-                # 对于大型数据，使用COPY命令
-                temp_table = f"temp_{table_name}"
-                self.con.execute(f"CREATE TEMP TABLE {temp_table} AS SELECT * FROM {table_name} WHERE 1=0")
-                self.con.execute(f"INSERT INTO {temp_table} SELECT * FROM df_clean")
-                self.con.execute(f"INSERT OR REPLACE INTO {table_name} SELECT * FROM {temp_table}")
-                self.con.execute(f"DROP TABLE {temp_table}")
-            else:
-                # 对于小型数据，使用常规INSERT
-                self.con.execute(f"INSERT OR REPLACE INTO {table_name} SELECT * FROM df_clean")
-            
-            logger.info(f"💾 批量写入完成: {count} 条记录 (表: {table_name})")
-            return count
-            
-        except Exception as e:
-            logger.error(f"❌ 批量写入失败: {e}")
-            return 0
+                df_clean = self._clean_data(combined_df)
+                count = len(df_clean)
+                table_name = self._get_table_name(frequency)
+                
+                # 优化：使用DuckDB的COPY命令进行更高效的批量导入
+                # 对于大型DataFrame，COPY命令比INSERT更高效
+                if count > 1000:
+                    # 对于大型数据，使用COPY命令
+                    temp_table = f"temp_{table_name}"
+                    self.con.execute(f"CREATE TEMP TABLE {temp_table} AS SELECT * FROM {table_name} WHERE 1=0")
+                    self.con.execute(f"INSERT INTO {temp_table} SELECT * FROM df_clean")
+                    self.con.execute(f"INSERT OR REPLACE INTO {table_name} SELECT * FROM {temp_table}")
+                    self.con.execute(f"DROP TABLE {temp_table}")
+                else:
+                    # 对于小型数据，使用常规INSERT
+                    self.con.execute(f"INSERT OR REPLACE INTO {table_name} SELECT * FROM df_clean")
+                
+                logger.info(f"💾 批量写入完成: {count} 条记录 (表: {table_name})")
+                return count
+                
+            except Exception as e:
+                logger.error(f"❌ 批量写入失败 (尝试 {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    # 尝试重新连接
+                    if self._reconnect():
+                        continue
+                return 0
     
     def _get_table_name(self, frequency: str) -> str:
         """
@@ -207,6 +259,7 @@ class DuckDBManager:
                 # 月线数据，按月生成日期
                 all_dates = pd.date_range(start=start, end=end, freq='M').date.tolist()
             else:
+                # 默认日线
                 all_dates = pd.date_range(start=start, end=end).date.tolist()
             
             # 找出缺失的日期
@@ -230,29 +283,158 @@ class DuckDBManager:
             
             ranges.append((current_start.strftime("%Y-%m-%d"), current_end.strftime("%Y-%m-%d")))
             return ranges
-            
         except Exception as e:
-            logger.error(f"查询缺失日期范围失败: {e}")
-            return [(start_date, end_date)]
+            logger.error(f"🔍 获取缺失日期范围失败 {code}: {e}")
+            return []
+
+    def get_table_status(self, frequency: str):
+        """
+        获取指定频率数据表的总记录数和股票数量
+        返回 (total_records, distinct_stocks)
+        """
+        table_name = self._get_table_name(frequency)
+        try:
+            record_count_res = self.con.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()
+            stock_count_res = self.con.execute(f"SELECT COUNT(DISTINCT code) FROM {table_name}").fetchone()
+            record_count = record_count_res[0] if record_count_res else 0
+            stock_count = stock_count_res[0] if stock_count_res else 0
+            return record_count, stock_count
+        except Exception as e:
+            logger.warning(f"获取表 {table_name} 状态失败: {e}")
+            return 0, 0
+
+    def drop_table(self, frequency: str):
+        """
+        删除指定频率的数据表
+        """
+        table_name = self._get_table_name(frequency)
+        try:
+            self.con.execute(f"DROP TABLE IF EXISTS {table_name}")
+            logger.info(f"已删除表: {table_name}")
+        except Exception as e:
+            logger.error(f"删除表 {table_name} 失败: {e}")
+
+    def clear_all_tables(self):
+        """
+        删除所有数据表
+        """
+        # 先删除有外键依赖的表
+        frequencies = ["d", "w", "m"]
+        for freq in frequencies:
+            self.drop_table(freq)
+        # 再删除股票基本信息表
+        try:
+            self.con.execute("DROP TABLE IF EXISTS stock_info")
+            logger.info("已删除表: stock_info")
+        except Exception as e:
+            logger.error(f"删除表 stock_info 失败: {e}")
+        logger.info("所有数据表已清理。")
+
+    def upsert_stock_info(self, code: str, code_name: str, industry: str = None, market: str = None, list_date: str = None):
+        """
+        插入或更新股票基本信息
+        
+        Args:
+            code: 股票代码
+            code_name: 股票名称
+            industry: 所属行业
+            market: 所属市场
+            list_date: 上市日期
+        """
+        max_retries = 2
+        for attempt in range(max_retries):
+            try:
+                # 检查股票是否已存在
+                exists = self.con.execute("SELECT 1 FROM stock_info WHERE code = ?", [code]).fetchone() is not None
+                
+                if exists:
+                    # 更新现有股票信息
+                    self.con.execute("""
+                        UPDATE stock_info 
+                        SET code_name = ?, industry = ?, market = ?, list_date = ?, last_update = CURRENT_DATE
+                        WHERE code = ?
+                    """, [code_name, industry, market, list_date, code])
+                else:
+                    # 插入新股票信息
+                    self.con.execute("""
+                        INSERT INTO stock_info (code, code_name, industry, market, list_date, last_update)
+                        VALUES (?, ?, ?, ?, ?, CURRENT_DATE)
+                    """, [code, code_name, industry, market, list_date])
+                return True
+            except Exception as e:
+                logger.error(f"更新股票信息失败 (尝试 {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    # 尝试重新连接
+                    if self._reconnect():
+                        continue
+                return False
+
+    def get_stock_info(self, code: str):
+        """
+        获取股票基本信息
+        
+        Args:
+            code: 股票代码
+            
+        Returns:
+            股票基本信息字典
+        """
+        try:
+            res = self.con.execute("SELECT * FROM stock_info WHERE code = ?", [code]).fetchone()
+            if res:
+                return {
+                    'code': res[0],
+                    'code_name': res[1],
+                    'industry': res[2],
+                    'market': res[3],
+                    'list_date': res[4],
+                    'is_active': res[5],
+                    'last_update': res[6]
+                }
+            return None
+        except Exception as e:
+            logger.error(f"获取股票信息失败: {e}")
+            return None
+
+    def get_all_stocks(self):
+        """
+        获取所有股票列表
+        
+        Returns:
+            股票列表
+        """
+        try:
+            res = self.con.execute("SELECT code, code_name FROM stock_info ORDER BY code").fetchall()
+            return res
+        except Exception as e:
+            logger.error(f"获取股票列表失败: {e}")
+            return []
+
 
     def get_last_date(self, stock_code: str, frequency: str = "d"):
         """获取某只股票在数据库中的最后交易日"""
-        try:
-            table_name = self._get_table_name(frequency)
-            res = self.con.execute(
-                f"SELECT MAX(date) FROM {table_name} WHERE code = ?", 
-                [stock_code]
-            ).fetchone()
-            if res[0]:
-                # 确保返回字符串格式
-                if isinstance(res[0], str):
-                    return res[0]
-                else:
-                    return res[0].strftime("%Y-%m-%d")
-            return None
-        except Exception as e:
-            logger.error(f"查询最后日期失败: {e}")
-            return None
+        max_retries = 2
+        for attempt in range(max_retries):
+            try:
+                table_name = self._get_table_name(frequency)
+                res = self.con.execute(
+                    f"SELECT MAX(date) FROM {table_name} WHERE code = ?", 
+                    [stock_code]
+                ).fetchone()
+                if res and res[0]:
+                    # 确保返回字符串格式
+                    if isinstance(res[0], str):
+                        return res[0]
+                    else:
+                        return res[0].strftime("%Y-%m-%d")
+                return None
+            except Exception as e:
+                logger.error(f"查询最后日期失败 (尝试 {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    # 尝试重新连接
+                    if self._reconnect():
+                        continue
+                return None
 
     def vacuum(self):
         """压缩数据库，释放空间"""
