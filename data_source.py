@@ -2,6 +2,7 @@ import baostock as bs
 import pandas as pd
 import time
 import random
+import re
 import akshare as ak
 from datetime import timedelta
 from logger_config import setup_logger
@@ -268,59 +269,86 @@ class AKShareClient(DataSourceInterface):
         # 去掉代码前缀
         pure_code = code.split('.')[1]
         
-        # 处理日期格式，AKShare要求YYYYMMDD格式
-        start_date = start_date.replace('-', '')
-        end_date = end_date.replace('-', '')
+        # 处理日期格式
+        # 股票接口要求YYYYMMDD，基金接口要求YYYY-MM-DD
+        start_date_stock = start_date.replace('-', '')
+        end_date_stock = end_date.replace('-', '')
+        start_date_fund = start_date
+        end_date_fund = end_date
         
-        # 调用接口获取数据
-        df = ak.stock_zh_a_hist(
-            symbol=pure_code,
-            period=period,
-            start_date=start_date,
-            end_date=end_date,
-            adjust="hfq"  # 默认后复权，和Baostock保持一致
-        )
+        # 判断是股票还是ETF
+        is_etf = bool(re.match(r'sh\.5[168]|sz\.15[09]', code))
+        
+        if is_etf:
+            # ETF改用新浪财经数据源，更稳定
+            logger.info(f"📥 [新浪财经] 获取ETF {code} 数据: {start_date_fund} ~ {end_date_fund}")
+            df = ak.fund_etf_hist_sina(
+                symbol=pure_code,
+                start_date=start_date_fund,
+                end_date=end_date_fund,
+                adjust="hfq"
+            )
+        else:
+            # 股票保留原有的东方财富A股接口
+            logger.info(f"📥 [AKShare] 获取股票 {code} 数据: {start_date_stock} ~ {end_date_stock}")
+            df = ak.stock_zh_a_hist(
+                symbol=pure_code,
+                period=period,
+                start_date=start_date_stock,
+                end_date=end_date_stock,
+                adjust="hfq"
+            )
         
         if df.empty:
             logger.warning(f"⚠️ 未获取到 {code} 的历史数据")
             return pd.DataFrame()
         
-        # 格式化列名，和Baostock返回格式保持一致
-        df = df.rename(columns={
-            "日期": "date",
-            "开盘": "open",
-            "最高": "high",
-            "最低": "low",
-            "收盘": "close",
-            "前收盘": "preclose",
-            "成交量": "volume",
-            "成交额": "amount",
-            "涨跌幅": "pctChg",
-            "换手率": "turn",
-            "交易状态": "tradestatus",
-            "是否ST": "isST"
-        })
+        # 调试信息：返回数据的日期范围
+        if not df.empty and '日期' in df.columns:
+            min_date = pd.to_datetime(df['日期']).min().strftime('%Y-%m-%d')
+            max_date = pd.to_datetime(df['日期']).max().strftime('%Y-%m-%d')
+            logger.info(f"✅ {code} 返回数据范围: {min_date} ~ {max_date}，共 {len(df)} 条")
         
-        # 添加代码列
+        # 格式化列名，统一格式
         df['code'] = code
-        df['adjustflag'] = "2"  # 后复权标记
         
-        # 补充缺失的列，和Baostock格式保持一致
-        for col in ['tradestatus', 'isST']:
-            if col not in df.columns:
-                df[col] = "1" if col == 'tradestatus' else "0"
+        if is_etf:
+            # 新浪财经ETF字段映射
+            rename_dict = {
+                "date": "date",
+                "open": "open",
+                "high": "high",
+                "low": "low",
+                "close": "close",
+                "volume": "volume",
+                "amount": "amount"
+            }
+            # 新浪接口没有这些字段，补充默认值
+            df['pct_chg'] = 0.0
+            df['chg'] = 0.0
+            df['turnover'] = 0.0
+        else:
+            # 东方财富股票字段映射
+            rename_dict = {
+                "日期": "date",
+                "开盘": "open",
+                "最高": "high",
+                "最低": "low",
+                "收盘": "close",
+                "前收盘": "preclose",
+                "成交量": "volume",
+                "成交额": "amount",
+                "涨跌幅": "pct_chg",
+                "涨跌额": "chg",
+                "换手率": "turnover"
+            }
+            # 处理可能缺少的字段
+            for col in ["preclose", "turnover"]:
+                if col not in df.columns:
+                    df[col] = 0.0
         
-        # 转换日期格式
-        df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
-        
-        # 转换数值类型
-        numeric_cols = ['open', 'high', 'low', 'close', 'preclose', 'volume', 'amount', 'turn', 'pctChg']
-        for col in numeric_cols:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-        
-        logger.info(f"✅ {code} 下载成功，数据量: {len(df)} 条")
-        return df
+        df.rename(columns=rename_dict, inplace=True)
+        return df[['code', 'date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg', 'chg', 'turnover']]
     
     def get_data_source_name(self) -> str:
         """

@@ -8,10 +8,10 @@ baostock:
 
 # 并发与性能配置
 concurrency:
-  max_workers: 10  # 最大并发进程数，建议3-5，过高可能导致IP被封或网络拥堵
+  max_workers: 3  # 新浪接口请求频繁会被限制，调小并发数
   dynamic_concurrency: true  # 是否启用动态并发控制，true表示根据错误率和成功率自动调整进程数
-  min_workers: 2  # 最小并发进程数，当错误率过高时会减少到此值
-  max_workers_limit: 10  # 最大并发进程数限制，动态调整时不会超过此值
+  min_workers: 1  # 最小并发进程数，当错误率过高时会减少到此值
+  max_workers_limit: 5  # 最大并发进程数限制，动态调整时不会超过此值
   error_threshold: 3  # 错误率阈值(%)，当错误率超过此值时自动减少进程数
   success_threshold: 95  # 成功率阈值(%)，当成功率超过此值时自动增加进程数
 
@@ -31,9 +31,9 @@ retry:
 
 # 数据源配置
 datasource:
-  default: "baostock"  # 默认数据源，当前支持baostock，未来可扩展tushare、akshare等
+  default: "akshare"  # 默认数据源优先用AKShare，更稳定
   enable_fallback: true  # 是否启用数据源故障切换，true表示当主数据源失败时自动切换到备用数据源
-  priority: ["baostock", "akshare"]  # 数据源优先级列表，按顺序尝试，可添加多个数据源实现故障切换
+  priority: ["akshare", "baostock"]  # 数据源优先级列表，优先用AKShare，失败再用Baostock
 
 # 数据范围配置
 data:

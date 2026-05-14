@@ -754,6 +754,10 @@ class StockDataPipeline:
         Args:
             frequency: 数据频率
         """
+        # 初始化进度条
+        reset_progress()
+        set_progress(is_running=True, task_name=f"全量下载ETF({frequency})", start_time=time.time())
+        
         # 记录开始时间
         self.start_time = pd.Timestamp.now()
         self.end_time = None
