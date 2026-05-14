@@ -38,7 +38,7 @@ datasource:
 # 数据范围配置
 data:
   start_date_full: "1999-01-01"  # 全量下载的起始日期，首次运行时从此日期开始下载
-  start_date_incremental: "2024-01-01"  # 增量更新的起始日期，用于每日更新任务
+  start_date_incremental: "2026-04-01"  # 增量更新的起始日期，用于每日更新任务
 
 # 错误处理配置
 error:

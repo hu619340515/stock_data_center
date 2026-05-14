@@ -81,7 +81,7 @@ class ConfigLoader:
             "datasource": {
                 "default": "baostock",
                 "enable_fallback": True,
-                "priority": ["baostock"]
+                "priority": ["baostock", "akshare"]
             },
             "data": {
                 "start_date_full": "1999-01-01"

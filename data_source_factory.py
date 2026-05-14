@@ -1,5 +1,5 @@
 from data_source_interface import DataSourceInterface
-from data_source import BaoStockClient
+from data_source import BaoStockClient, AKShareClient
 
 class DataSourceFactory:
     """
@@ -20,6 +20,8 @@ class DataSourceFactory:
         """
         if source_type.lower() == "baostock":
             return BaoStockClient()
+        elif source_type.lower() == "akshare":
+            return AKShareClient()
         # 未来可以添加其他数据源
         # elif source_type.lower() == "tushare":
         #     return TuShareClient()

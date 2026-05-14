@@ -86,28 +86,99 @@ class DuckDBManager:
         
         # ✅ 优化：手动创建索引以加速查询
         # 如果索引已存在，IGNORE 会避免报错
+        # 创建ETF日线表
+        etf_daily_sql = """
+        CREATE TABLE IF NOT EXISTS etf_daily (
+            code VARCHAR,
+            date DATE,
+            open DOUBLE,
+            high DOUBLE,
+            low DOUBLE,
+            close DOUBLE,
+            preclose DOUBLE,
+            volume BIGINT,
+            amount DOUBLE,
+            adjustflag VARCHAR,
+            turn DOUBLE,
+            tradestatus VARCHAR,
+            pctChg DOUBLE,
+            isST VARCHAR,
+            PRIMARY KEY (code, date)
+        )
+        """
+        self.con.execute(etf_daily_sql)
+        
+        # 创建ETF周线表
+        etf_weekly_sql = """
+        CREATE TABLE IF NOT EXISTS etf_weekly (
+            code VARCHAR,
+            date DATE,
+            open DOUBLE,
+            high DOUBLE,
+            low DOUBLE,
+            close DOUBLE,
+            preclose DOUBLE,
+            volume BIGINT,
+            amount DOUBLE,
+            adjustflag VARCHAR,
+            turn DOUBLE,
+            tradestatus VARCHAR,
+            pctChg DOUBLE,
+            isST VARCHAR,
+            PRIMARY KEY (code, date)
+        )
+        """
+        self.con.execute(etf_weekly_sql)
+        
+        # 创建ETF月线表
+        etf_monthly_sql = """
+        CREATE TABLE IF NOT EXISTS etf_monthly (
+            code VARCHAR,
+            date DATE,
+            open DOUBLE,
+            high DOUBLE,
+            low DOUBLE,
+            close DOUBLE,
+            preclose DOUBLE,
+            volume BIGINT,
+            amount DOUBLE,
+            adjustflag VARCHAR,
+            turn DOUBLE,
+            tradestatus VARCHAR,
+            pctChg DOUBLE,
+            isST VARCHAR,
+            PRIMARY KEY (code, date)
+        )
+        """
+        self.con.execute(etf_monthly_sql)
+        
+        # ✅ 优化：手动创建索引以加速查询
+        # 如果索引已存在，IGNORE 会避免报错
         try:
             self.con.execute("CREATE INDEX IF NOT EXISTS idx_daily_code_date ON stock_daily (code, date)")
             self.con.execute("CREATE INDEX IF NOT EXISTS idx_weekly_code_date ON stock_weekly (code, date)")
             self.con.execute("CREATE INDEX IF NOT EXISTS idx_monthly_code_date ON stock_monthly (code, date)")
+            self.con.execute("CREATE INDEX IF NOT EXISTS idx_etf_daily_code_date ON etf_daily (code, date)")
+            self.con.execute("CREATE INDEX IF NOT EXISTS idx_etf_weekly_code_date ON etf_weekly (code, date)")
+            self.con.execute("CREATE INDEX IF NOT EXISTS idx_etf_monthly_code_date ON etf_monthly (code, date)")
         except Exception as e:
             logger.warning(f"索引创建提示: {e}")
 
-    def upload_df(self, df: pd.DataFrame, frequency: str = "d") -> bool:
-        """单只股票写入（支持不同时间粒度）"""
+    def upload_df(self, df: pd.DataFrame, frequency: str = "d", asset_type: str = "stock") -> bool:
+        """单只股票/ETF写入（支持不同时间粒度）"""
         if df.empty: return False
         try:
             df_clean = self._clean_data(df)
-            table_name = self._get_table_name(frequency)
+            table_name = self._get_table_name(frequency, asset_type)
             self.con.execute(f"INSERT OR REPLACE INTO {table_name} SELECT * FROM df_clean")
             return True
         except Exception as e:
             logger.error(f"❌ 写入失败: {e}")
             return False
 
-    def upload_batch(self, df_list: list, frequency: str = "d") -> int:
+    def upload_batch(self, df_list: list, frequency: str = "d", asset_type: str = "stock") -> int:
         """
-        🚀 批量写入优化（支持不同时间粒度）
+        🚀 批量写入优化（支持不同时间粒度和资产类型）
         """
         if not df_list: return 0
         
@@ -117,7 +188,7 @@ class DuckDBManager:
 
             df_clean = self._clean_data(combined_df)
             count = len(df_clean)
-            table_name = self._get_table_name(frequency)
+            table_name = self._get_table_name(frequency, asset_type)
             
             # 优化：使用DuckDB的COPY命令进行更高效的批量导入
             # 对于大型DataFrame，COPY命令比INSERT更高效
@@ -139,27 +210,35 @@ class DuckDBManager:
             logger.error(f"❌ 批量写入失败: {e}")
             return 0
     
-    def _get_table_name(self, frequency: str) -> str:
+    def _get_table_name(self, frequency: str, asset_type: str = "stock") -> str:
         """
-        根据时间粒度获取表名
+        根据时间粒度和资产类型获取表名
         """
-        frequency_map = {
-            "d": "stock_daily",
-            "w": "stock_weekly",
-            "m": "stock_monthly"
-        }
-        return frequency_map.get(frequency, "stock_daily")
+        if asset_type == "etf":
+            frequency_map = {
+                "d": "etf_daily",
+                "w": "etf_weekly",
+                "m": "etf_monthly"
+            }
+            return frequency_map.get(frequency, "etf_daily")
+        else:
+            frequency_map = {
+                "d": "stock_daily",
+                "w": "stock_weekly",
+                "m": "stock_monthly"
+            }
+            return frequency_map.get(frequency, "stock_daily")
 
-    def get_finished_stocks(self, frequency: str = "d") -> set:
+    def get_finished_stocks(self, frequency: str = "d", asset_type: str = "stock") -> set:
         """
-        🛡️ 断点续传支持 - 获取已完成的股票代码
+        🛡️ 断点续传支持 - 获取已完成的股票/ETF代码
         """
         try:
-            table_name = self._get_table_name(frequency)
+            table_name = self._get_table_name(frequency, asset_type)
             res = self.con.execute(f"SELECT DISTINCT code FROM {table_name}").fetchall()
             return {row[0] for row in res}
         except Exception as e:
-            logger.error(f"查询已存在股票失败: {e}")
+            logger.error(f"查询已存在{asset_type}失败: {e}")
             return set()
 
     def get_stock_date_range(self, code: str, frequency: str = "d") -> tuple:
@@ -235,10 +314,10 @@ class DuckDBManager:
             logger.error(f"查询缺失日期范围失败: {e}")
             return [(start_date, end_date)]
 
-    def get_last_date(self, stock_code: str, frequency: str = "d"):
-        """获取某只股票在数据库中的最后交易日"""
+    def get_last_date(self, stock_code: str, frequency: str = "d", asset_type: str = "stock"):
+        """获取某只股票/ETF在数据库中的最后交易日"""
         try:
-            table_name = self._get_table_name(frequency)
+            table_name = self._get_table_name(frequency, asset_type)
             res = self.con.execute(
                 f"SELECT MAX(date) FROM {table_name} WHERE code = ?", 
                 [stock_code]
@@ -251,7 +330,7 @@ class DuckDBManager:
                     return res[0].strftime("%Y-%m-%d")
             return None
         except Exception as e:
-            logger.error(f"查询最后日期失败: {e}")
+            logger.error(f"查询{asset_type}最后日期失败: {e}")
             return None
 
     def vacuum(self):

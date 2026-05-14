@@ -1,9 +1,11 @@
 # 高性能 A股量化数据下载器 (DuckDB版)
 
-这是一个基于 Python 的高性能 A股历史行情数据下载工具。它利用 **Baostock** 作为数据源，**DuckDB** 作为存储引擎，实现了**多进程并发下载**、**断点续传**、**批量高速写入**、**动态并发控制**和**多时间粒度支持**。
+这是一个基于 Python 的高性能 A股历史行情数据下载工具，同时内置了一个**可视化 Web Viewer**。它利用 **Baostock / AKShare** 作为数据源，**DuckDB** 作为存储引擎，实现了**多进程并发下载**、**断点续传**、**批量高速写入**、**动态并发控制**和**多时间粒度支持**，并提供浏览器可视化界面方便查询与管理。
 
 ## 核心特性
 
+- **多数据源支持**：内置Baostock和AKShare双数据源支持，覆盖不同使用场景需求
+- **自动故障切换**：主数据源故障时自动按优先级切换到备用数据源，无需人工干预，保证下载任务不中断
 - **多进程并发**：利用多核 CPU 优势，开启多个进程同时下载，速度是单线程的数倍
 - **动态并发控制**：根据错误率和成功率自动调整进程数，平衡下载速度与API限制
 - **动态批处理**：基于内存使用率自动调整批处理大小，优化写入性能
@@ -11,11 +13,13 @@
 - **断点续传增强**：自动检测数据库中已有的股票数据，支持按日期范围断点续传，智能补全缺失数据
 - **指数退避重试**：网络错误时自动重试，延迟时间指数增长并加入随机抖动，提高成功率
 - **多时间粒度支持**：支持日线、周线、月线等不同时间粒度数据存储与查询
+- **全量ETF支持**：覆盖全市场1400+只ETF基金，支持51/56/58/15/159所有号段
 - **数据导出功能**：支持将数据导出为CSV、Parquet、JSON等格式
 - **数据源抽象接口**：定义统一数据源接口，支持多数据源切换和故障自动切换
 - **实时进度监控**：显示处理进度、速度统计、剩余时间和成功率等关键指标
 - **配置管理优化**：使用YAML配置文件集中管理参数，支持环境变量替换
 - **多进程增量更新**：增量更新也采用多进程方式，与全量下载一样高效，速度可达26+只/秒
+- **Web 可视化 Viewer**：内置 Flask 服务，提供浏览器界面，支持数据浏览、K线图表、趋势分析、数据管理与一键数据更新
 
 ---
 
@@ -42,19 +46,26 @@ pip install duckdb pandas baostock click pyyaml psutil
 
 ```
 stock_data_center/
-├── cli.py            # 命令行入口
-├── config.py         # 配置加载器 (支持YAML配置文件)
-├── config.yaml       # 配置文件 (数据库路径、并发数等)
-├── core.py           # 核心逻辑 (多进程调度、动态控制、进度监控)
-├── database.py       # 数据库操作封装 (多时间粒度表支持)
-├── data_source.py    # 数据源接口封装 (Baostock实现)
-├── logger_config.py  # 日志配置
-├── test/             # 测试目录
-│   ├── test_database.py    # 数据库操作测试
-│   ├── test_data_source.py # 数据源接口测试
-│   ├── test_config.py      # 配置加载器测试
-│   └── run_tests.py        # 测试运行器
-└── README.md         # 说明文档
+├── cli.py                    # 命令行入口
+├── config.py                 # 配置加载器 (支持YAML配置文件)
+├── config.yaml               # 配置文件 (数据库路径、并发数等)
+├── core.py                   # 核心逻辑 (多进程调度、动态控制、进度监控)
+├── database.py               # 数据库操作封装 (多时间粒度表支持)
+├── data_source.py            # 数据源接口封装 (Baostock / AKShare 实现)
+├── data_source_factory.py    # 数据源工厂类
+├── data_source_interface.py  # 数据源统一接口定义
+├── logger_config.py          # 日志配置
+├── start_viewer.bat          # Windows 一键启动 Web Viewer 脚本
+├── viewer/                   # Web 可视化查看器
+│   ├── server.py             # Flask API 服务端 (14个接口 + 数据更新接口)
+│   ├── index.html            # 前端单页应用 (SPA)
+│   └── README.md             # Viewer 使用说明
+├── test/                     # 测试目录
+│   ├── test_database.py      # 数据库操作测试
+│   ├── test_data_source.py   # 数据源接口测试
+│   ├── test_config.py        # 配置加载器测试
+│   └── run_tests.py          # 测试运行器
+└── README.md                 # 说明文档
 ```
 
 ---
@@ -99,9 +110,20 @@ retry:
 
 # 数据源配置
 datasource:
-  default: "baostock"  # 默认数据源，当前支持baostock，未来可扩展tushare、akshare等
+  default: "baostock"  # 默认数据源，支持 baostock / akshare
   enable_fallback: true  # 是否启用数据源故障切换，true表示当主数据源失败时自动切换到备用数据源
-  priority: ["baostock"]  # 数据源优先级列表，按顺序尝试，可添加多个数据源实现故障切换
+  priority: ["baostock", "akshare"]  # 数据源优先级列表，按顺序尝试，自动故障切换
+
+## 数据源对比
+| 特性 | Baostock | AKShare |
+|------|----------|---------|
+| 股票数量 | ~5000只 | ~5300只（更全） |
+| ETF数量 | ~900只 | ~1400只（全覆盖所有号段） |
+| 登录要求 | 需要登录，会话可能过期 | 无需登录 |
+| 稳定性 | 一般，服务经常维护 | 高，基于东方财富接口 |
+| 数据更新 | T+1盘后较晚 | T+1盘后更新更快 |
+| 调用限制 | 有并发限制 | 无明确限制 |
+| 推荐场景 | 历史数据批量下载 | 日常增量更新、ETF数据下载
 
 # 数据范围配置
 data:
@@ -171,6 +193,87 @@ python cli.py export --code sh.600000 --start-date 2024-01-01 --end-date 2024-12
 ```bash
 python cli.py status
 ```
+
+---
+
+## 🖥️ Web 可视化 Viewer
+
+项目内置了一个基于 Flask + 原生 JS 的浏览器可视化界面，无需额外前端框架，开箱即用。
+
+### 启动方式
+
+**方式一（推荐，Windows）**：双击运行 `start_viewer.bat`，脚本会自动检查依赖、启动服务并打开浏览器。
+
+**方式二（命令行）**：
+
+```bash
+# 在项目根目录下执行
+python viewer/server.py
+```
+
+服务启动后，在浏览器访问：**http://localhost:5678/**
+
+### 界面功能
+
+新版 UI 采用左侧侧边栏 + 右侧主区域的布局，侧边栏共 **5 个菜单**：
+
+| 菜单 | 功能说明 |
+|------|---------|
+| 📊 **数据表** | 分页浏览数据库表格，支持关键词搜索（纯数字代码直接搜索）、日期范围筛选、字段统计 |
+| 📈 **行情图表** | K 线图 + 成交量合并图表，支持证券代码搜索与自定义日期选择器 |
+| 📉 **趋势图** | 指数/均线走势聚合图，按市场/时间粒度展示趋势 |
+| 🛠️ **管理** | 数据删除、CSV 导出、表结构查看、按 code 聚合统计 |
+| 🔄 **数据更新** | 一键触发数据下载与更新任务（见下表） |
+
+### 数据更新功能（6 个操作按钮）
+
+| 按钮 | 后端接口 | 说明 |
+|------|---------|------|
+| 🔄 日数据更新至最新（股票） | `POST /api/daily_to_latest` | 增量更新股票日线到最新交易日 |
+| 🔄 日数据更新至最新（ETF） | `POST /api/daily_to_latest` | 增量更新 ETF 日线到最新交易日 |
+| 📦 股票全量下载 | `POST /api/daily_download` | 全量下载所有 A 股历史日线数据 |
+| 📦 ETF 全量下载 | `POST /api/daily_download` | 全量下载全市场 1400+ 只 ETF 历史数据 |
+| 🔁 股票更新至最新 | `POST /api/daily_to_latest` | 同增量更新（股票） |
+| 🔁 ETF 更新至最新 | `POST /api/daily_to_latest` | 同增量更新（ETF） |
+
+每个按钮均支持：
+- **Loading 防重复点击**：任务执行中按钮置灰
+- **完成 Toast 提示**：成功/失败均有弹窗提示
+- **耗时显示**：实时计时，完成后展示总耗时
+- **自动刷新概览**：任务完成后自动更新数据统计卡片
+
+### 图表特性
+
+- **K 线 + 成交量合并图**：K 线图与成交量柱状图上下联动，共享时间轴
+- **证券代码搜索**：支持纯数字输入（如 `600000`），自动匹配 `sh.600000`
+- **日期选择器**：可自由选择查询的起止日期范围
+- **涨跌幅排行榜**：实时展示涨跌幅 Top N 个股
+
+### API 接口一览
+
+`viewer/server.py` 提供共 **17 个 HTTP 接口**：
+
+```
+GET  /                     → 前端首页 (index.html)
+GET  /api/status           → 数据库连接状态
+GET  /api/overview         → 概览卡片 / 各表行数
+GET  /api/table            → 分页表格查询（关键词 + 日期筛选）
+GET  /api/codes            → 获取指定表的 code 列表
+GET  /api/kline            → 单只证券 K 线数据
+GET  /api/stats            → 数值列统计（min/max/avg/sum）
+GET  /api/top_movers       → 涨跌幅排行榜
+GET  /api/distribution     → 成交量/价格区间分布
+GET  /api/trend            → 指数/均线走势聚合
+GET  /api/refresh_status   → 各表最新更新时间
+GET  /api/export           → 导出 CSV（流式下载）
+GET  /api/schema           → 查询表字段结构
+GET  /api/summary_by_code  → 按 code 聚合统计
+POST /api/delete           → 删除指定 code 或日期范围记录
+POST /api/daily_download   → 触发全量下载（股票 / ETF）
+POST /api/daily_to_latest  → 触发增量更新（股票 / ETF）
+```
+
+---
 
 ### 3. 运行测试
 

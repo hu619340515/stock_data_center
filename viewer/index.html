@@ -1,0 +1,763 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>量化数据可视化管理</title>
+  <style>
+    /* ── Reset & Variables ── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --primary: #2563eb;
+      --primary-light: #3b82f6;
+      --blue-card: #3b82f6;
+      --green-card: #10b981;
+      --orange-card: #f59e0b;
+      --purple-card: #8b5cf6;
+      --bg: #f8fafc;
+      --surface: #ffffff;
+      --border: #e2e8f0;
+      --text: #1e293b;
+      --text-dim: #64748b;
+      --text-light: #94a3b8;
+      --sidebar-w: 220px;
+      --header-h: 60px;
+      --radius: 12px;
+      --shadow: 0 4px 20px rgba(0,0,0,.05);
+      --shadow-sm: 0 2px 8px rgba(0,0,0,.04);
+    }
+    body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; font-size: 14px; height: 100vh; overflow: hidden; display: flex; flex-direction: column; }
+
+    /* ── Header ── */
+    header {
+      height: var(--header-h);
+      background: linear-gradient(90deg, #1e40af 0%, #3b82f6 100%);
+      color: white;
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 0 24px;
+      flex-shrink: 0;
+      box-shadow: var(--shadow);
+      z-index: 10;
+    }
+    .header-left {
+      display: flex; align-items: center; gap: 12px;
+    }
+    .logo { font-size: 18px; font-weight: 700; }
+    .db-info {
+      display: flex; align-items: center; gap: 8px;
+      background: rgba(255,255,255,.15);
+      border-radius: 20px;
+      padding: 4px 12px;
+      font-size: 12px;
+      backdrop-filter: blur(8px);
+    }
+    .db-dot { width: 8px; height: 8px; border-radius: 50%; background: #4ade80; flex-shrink: 0; animation: pulse 2s infinite; }
+    .db-dot.err { background: #f87171; animation: none; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .6; } }
+    .header-right {
+      display: flex; align-items: center; gap: 12px;
+    }
+    .refresh-btn {
+      background: rgba(255,255,255,.2);
+      color: white;
+      border: none;
+      padding: 8px 16px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 13px;
+      transition: background .2s;
+      display: flex; align-items: center; gap: 6px;
+    }
+    .refresh-btn:hover { background: rgba(255,255,255,.3); }
+    .table-selector {
+      display: flex; align-items: center; gap: 8px;
+      background: rgba(255,255,255,.15);
+      padding: 6px 12px;
+      border-radius: 8px;
+    }
+    .table-selector label { font-size: 12px; opacity: .9; }
+    .table-selector select {
+      background: rgba(255,255,255,.9);
+      color: var(--text);
+      border: none;
+      border-radius: 6px;
+      padding: 4px 8px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+
+    /* ── Layout ── */
+    .layout { display: flex; flex: 1; overflow: hidden; }
+
+    /* ── Sidebar ── */
+    aside {
+      width: var(--sidebar-w);
+      background: var(--surface);
+      border-right: 1px solid var(--border);
+      display: flex; flex-direction: column;
+      overflow-y: auto;
+      flex-shrink: 0;
+      padding: 16px 0;
+    }
+    .nav-group { padding: 0 12px 20px; }
+    .nav-group-title {
+      font-size: 11px; font-weight: 600; letter-spacing: .06em;
+      color: var(--text-light); text-transform: uppercase;
+      padding: 0 8px 10px;
+    }
+    .nav-item {
+      display: flex; align-items: center; gap: 10px;
+      padding: 10px 12px; border-radius: 8px;
+      cursor: pointer; color: var(--text-dim);
+      transition: background .15s, color .15s;
+      user-select: none;
+      margin-bottom: 2px;
+    }
+    .nav-item:hover { background: var(--bg); color: var(--text); }
+    .nav-item.active { background: rgba(37,99,235,.1); color: var(--primary); font-weight: 600; }
+    .nav-item .icon { font-size: 16px; flex-shrink: 0; }
+
+    /* ── Divider ── */
+    .sidebar-divider {
+      border: none; border-top: 1px solid var(--border);
+      margin: 8px 16px 20px;
+    }
+
+    /* ── 数据更新区 ── */
+    .update-section { padding: 0 12px; }
+    .update-title {
+      font-size: 11px; font-weight: 600; letter-spacing: .06em;
+      color: var(--text-light); text-transform: uppercase;
+      padding: 0 8px 12px;
+    }
+    .update-btn {
+      display: flex; align-items: center; gap: 8px;
+      width: 100%; padding: 10px 12px;
+      background: var(--bg); border: 1px solid var(--border);
+      border-radius: 8px; color: var(--text);
+      font-size: 12px; cursor: pointer; text-align: left;
+      transition: all .15s;
+      margin-bottom: 6px;
+    }
+    .update-btn:hover { background: var(--primary); color: white; border-color: var(--primary); }
+    .update-btn:disabled { opacity: .5; cursor: not-allowed; }
+    .update-btn.running { border-color: var(--orange-card); color: var(--orange-card); background: rgba(245,158,11,.1); }
+    .update-btn.ok     { border-color: var(--green-card);  color: var(--green-card); background: rgba(16,185,129,.1); }
+    .update-btn.fail   { border-color: #ef4444;    color: #ef4444; background: rgba(239,68,68,.1); }
+    .update-btn .btn-icon { font-size: 14px; flex-shrink: 0; }
+
+    /* ── Main ── */
+    main {
+      flex: 1; overflow-y: auto;
+      padding: 24px;
+      display: flex; flex-direction: column; gap: 20px;
+    }
+
+    /* ── Panel ── */
+    .panel { display: none; flex-direction: column; gap: 20px; }
+    .panel.active { display: flex; }
+
+    /* ── Card ── */
+    .card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 20px;
+      box-shadow: var(--shadow-sm);
+    }
+    .card-title {
+      font-size: 15px; font-weight: 600; color: var(--text);
+      margin-bottom: 16px; display: flex; align-items: center; gap: 8px;
+    }
+
+    /* ── Overview Cards ── */
+    .overview-grid {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px;
+    }
+    .ov-card {
+      border-radius: var(--radius);
+      padding: 20px;
+      color: white;
+      box-shadow: var(--shadow);
+      transition: transform .2s;
+    }
+    .ov-card:hover { transform: translateY(-2px); }
+    .ov-card.blue { background: linear-gradient(135deg, var(--blue-card), #2563eb); }
+    .ov-card.green { background: linear-gradient(135deg, var(--green-card), #059669); }
+    .ov-card.orange { background: linear-gradient(135deg, var(--orange-card), #d97706); }
+    .ov-card.purple { background: linear-gradient(135deg, var(--purple-card), #7c3aed); }
+    .ov-card .ov-label { font-size: 13px; opacity: .9; margin-bottom: 8px; font-weight: 500; }
+    .ov-card .ov-val { font-size: 32px; font-weight: 700; line-height: 1; }
+    .ov-card .ov-desc { font-size: 12px; opacity: .8; margin-top: 8px; }
+
+    /* ── Content Grid ── */
+    .content-grid {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 16px;
+    }
+    @media (max-width: 1200px) { .content-grid { grid-template-columns: 1fr; } }
+
+    /* ── Table ── */
+    .toolbar {
+      display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 16px;
+    }
+    .toolbar input, .toolbar select {
+      background: var(--bg); color: var(--text);
+      border: 1px solid var(--border); border-radius: 8px;
+      padding: 8px 12px; font-size: 14px;
+    }
+    .toolbar input { flex: 1; min-width: 180px; }
+    .btn {
+      padding: 8px 16px; border-radius: 8px;
+      border: 1px solid var(--border); background: var(--bg);
+      color: var(--text); cursor: pointer; font-size: 14px;
+      transition: all .15s;
+    }
+    .btn:hover { background: var(--border); }
+    .btn-primary { background: var(--primary); border-color: var(--primary); color: #fff; }
+    .btn-primary:hover { background: #1d4ed8; }
+    .btn-danger  { background: #ef4444; border-color: #ef4444; color: #fff; }
+    .btn-danger:hover  { background: #dc2626; }
+
+    .table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 8px; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    thead th {
+      background: var(--bg); color: var(--text-dim);
+      padding: 12px 16px; text-align: left;
+      border-bottom: 2px solid var(--border);
+      white-space: nowrap; font-weight: 600;
+      position: sticky; top: 0;
+    }
+    tbody tr { border-bottom: 1px solid var(--border); transition: background .1s; }
+    tbody tr:hover { background: rgba(37,99,235,.03); }
+    tbody td { padding: 12px 16px; white-space: nowrap; }
+    .pager { display: flex; gap: 8px; align-items: center; margin-top: 16px; justify-content: flex-end; }
+    .pager span { color: var(--text-dim); font-size: 13px; }
+
+    /* ── Toast ── */
+    #toast-box {
+      position: fixed; bottom: 24px; right: 24px;
+      display: flex; flex-direction: column; gap: 8px;
+      z-index: 9999; pointer-events: none;
+    }
+    .toast {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 8px; padding: 12px 18px;
+      font-size: 14px; color: var(--text);
+      box-shadow: var(--shadow);
+      animation: slideIn .25s ease;
+      pointer-events: auto;
+      max-width: 400px;
+    }
+    .toast.ok   { border-color: var(--green-card); border-left-width: 4px; }
+    .toast.fail { border-color: #ef4444; border-left-width: 4px; }
+    .toast.warn { border-color: var(--orange-card); border-left-width: 4px; }
+    @keyframes slideIn { from { transform: translateX(60px); opacity: 0; } to { transform: none; opacity: 1; } }
+
+    /* ── Scrollbar ── */
+    ::-webkit-scrollbar { width: 8px; height: 8px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+    ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+
+    /* ── Status Badge ── */
+    .status-badge {
+      display: inline-flex; align-items: center; gap: 4px;
+      padding: 4px 8px; border-radius: 20px;
+      font-size: 12px; font-weight: 500;
+    }
+    .status-badge.ok { background: rgba(16,185,129,.1); color: var(--green-card); }
+    .status-badge.warn { background: rgba(245,158,11,.1); color: var(--orange-card); }
+    .status-badge.err { background: rgba(239,68,68,.1); color: #ef4444; }
+
+    /* ── Progress Bar ── */
+    .progress-container {
+      padding: 16px;
+      background: var(--bg);
+      border-radius: 8px;
+    }
+    .progress-header {
+      display: flex; justify-content: space-between; align-items: center;
+      margin-bottom: 12px;
+    }
+    .progress-task {
+      font-size: 14px; font-weight: 600; color: var(--text);
+    }
+    .progress-percent {
+      font-size: 14px; font-weight: 700; color: var(--primary);
+    }
+    .progress-bar {
+      height: 12px; background: var(--border); border-radius: 6px;
+      overflow: hidden; margin-bottom: 12px;
+    }
+    .progress-fill {
+      height: 100%; background: linear-gradient(90deg, var(--primary-light), var(--primary));
+      border-radius: 6px; transition: width .3s ease;
+      width: 0%;
+    }
+    .progress-details {
+      display: flex; gap: 16px; font-size: 12px; color: var(--text-dim);
+    }
+    .progress-speed { color: var(--green-card); }
+    .progress-eta { color: var(--orange-card); }
+  </style>
+</head>
+<body>
+
+<!-- ═══════════════ HEADER ═══════════════ -->
+<header>
+  <div class="header-left">
+    <span class="logo">📈 量化数据可视化管理</span>
+    <div class="db-info">
+      <div class="db-dot" id="db-dot"></div>
+      <span id="db-label">连接中…</span>
+    </div>
+  </div>
+  <div class="header-right">
+    <div class="table-selector">
+      <label>当前表：</label>
+      <select id="global-table-select">
+        <option value="stock_daily">股票日线</option>
+        <option value="stock_weekly">股票周线</option>
+        <option value="stock_monthly">股票月线</option>
+        <option value="etf_daily">ETF日线</option>
+        <option value="etf_weekly">ETF周线</option>
+        <option value="etf_monthly">ETF月线</option>
+      </select>
+    </div>
+    <button class="refresh-btn" onclick="refreshAll()">
+      <span>🔄</span> 刷新
+    </button>
+  </div>
+</header>
+
+<!-- ═══════════════ LAYOUT ═══════════════ -->
+<div class="layout">
+
+  <!-- ─── SIDEBAR ─── -->
+  <aside>
+    <div class="nav-group">
+      <div class="nav-group-title">数据浏览</div>
+      <div class="nav-item active" data-panel="overview">
+        <span class="icon">📊</span> 数据概览
+      </div>
+      <div class="nav-item" data-panel="table">
+        <span class="icon">📋</span> 数据查询
+      </div>
+    </div>
+
+    <hr class="sidebar-divider" />
+
+    <!-- ─── 数据更新区 ─── -->
+    <div class="update-section">
+      <div class="update-title">🔄 数据更新</div>
+
+      <button class="update-btn" id="btn-stock-latest"
+              onclick="triggerUpdate(this, '/api/daily_to_latest', {target:'stock'})">
+        <span class="btn-icon">⬇️</span> 股票数据更新
+      </button>
+
+      <button class="update-btn" id="btn-etf-latest"
+              onclick="triggerUpdate(this, '/api/etf_update_latest', {})">
+        <span class="btn-icon">🔄</span> ETF数据更新
+      </button>
+
+      <button class="update-btn" id="btn-weekly"
+              onclick="triggerUpdate(this, '/api/aggregate_weekly', {target:'stock'})">
+        <span class="btn-icon">📅</span> 计算周线数据
+      </button>
+
+      <button class="update-btn" id="btn-monthly"
+              onclick="triggerUpdate(this, '/api/aggregate_monthly', {target:'stock'})">
+        <span class="btn-icon">📆</span> 计算月线数据
+      </button>
+
+      <button class="update-btn" id="btn-stock-download"
+              onclick="triggerUpdate(this, '/api/daily_download', {target:'stock'})">
+        <span class="btn-icon">⬇️</span> 股票全量下载
+      </button>
+
+      <button class="update-btn" id="btn-etf-download"
+              onclick="triggerUpdate(this, '/api/etf_download', {})">
+        <span class="btn-icon">⬇️</span> ETF全量下载
+      </button>
+    </div>
+  </aside>
+
+  <!-- ─── MAIN ─── -->
+  <main>
+
+    <!-- ── Panel: 概览 ── -->
+    <div class="panel active" id="panel-overview">
+      <!-- 进度条 -->
+      <div class="card" id="progress-card" style="display:none;">
+        <div class="card-title">🔄 更新进度</div>
+        <div class="progress-container">
+          <div class="progress-header">
+            <span id="progress-task" class="progress-task">-</span>
+            <span id="progress-percent" class="progress-percent">0%</span>
+          </div>
+          <div class="progress-bar">
+            <div class="progress-fill" id="progress-fill"></div>
+          </div>
+          <div class="progress-details">
+            <span id="progress-detail-main">-</span>
+            <span id="progress-speed" class="progress-speed">-</span>
+            <span id="progress-eta" class="progress-eta">-</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 统计卡片 -->
+      <div class="overview-grid" id="stat-cards">
+        <div class="ov-card blue">
+          <div class="ov-label">总记录数</div>
+          <div class="ov-val" id="stat-count">-</div>
+          <div class="ov-desc">当前表数据总条数</div>
+        </div>
+        <div class="ov-card green">
+          <div class="ov-label">证券数量</div>
+          <div class="ov-val" id="stat-code-count">-</div>
+          <div class="ov-desc">不同代码的证券总数</div>
+        </div>
+        <div class="ov-card orange">
+          <div class="ov-label">最早日期</div>
+          <div class="ov-val" id="stat-min-date">-</div>
+          <div class="ov-desc">数据起始的最早日期</div>
+        </div>
+        <div class="ov-card purple">
+          <div class="ov-label">最新日期</div>
+          <div class="ov-val" id="stat-max-date">-</div>
+          <div class="ov-desc">数据的最新更新日期</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">� 数据统计与更新状态</div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>表名</th><th>总行数</th><th>最早日期</th><th>最新日期</th><th>状态</th></tr></thead>
+            <tbody id="all-tables-tbody">
+              <tr><td colspan="5" style="color:var(--text-dim);text-align:center;padding:40px;">加载中…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Panel: 数据浏览 ── -->
+    <div class="panel" id="panel-table">
+      <div class="card">
+        <div class="card-title">📋 数据查询</div>
+        <div class="toolbar">
+          <input type="text" id="kw-input" placeholder="股票代码 / 关键词…" />
+          <input type="date" id="date-start" />
+          <span style="color:var(--text-dim)">至</span>
+          <input type="date" id="date-end" />
+          <button class="btn btn-primary" onclick="loadTable(1)">🔍 查询</button>
+          <button class="btn" onclick="exportCSV()">⬇️ 导出CSV</button>
+        </div>
+        <div class="table-wrap">
+          <table id="data-table">
+            <thead id="data-thead"></thead>
+            <tbody id="data-tbody"><tr><td colspan="15" style="color:var(--text-dim);text-align:center;padding:40px;">请选择查询条件</td></tr></tbody>
+          </table>
+        </div>
+        <div class="pager">
+          <button class="btn" onclick="loadTable(currentPage-1)" id="prev-btn">‹ 上一页</button>
+          <span id="pager-info">-</span>
+          <button class="btn" onclick="loadTable(currentPage+1)" id="next-btn">下一页 ›</button>
+        </div>
+      </div>
+    </div>
+
+  </main>
+</div>
+
+<!-- ═══════════════ TOAST ═══════════════ -->
+<div id="toast-box"></div>
+
+<!-- ═══════════════ SCRIPT ═══════════════ -->
+<script>
+/* ───────── 全局状态 ───────── */
+let currentTable = 'stock_daily';
+let currentPage  = 1;
+let totalPages   = 1;
+const PAGE_SIZE  = 50;
+
+/* ───────── 工具函数 ───────── */
+function toast(msg, type = 'ok', dur = 4000) {
+  const box = document.getElementById('toast-box');
+  const el = document.createElement('div');
+  el.className = `toast ${type}`;
+  el.textContent = msg;
+  box.appendChild(el);
+  setTimeout(() => el.remove(), dur);
+}
+
+async function api(url, opts = {}) {
+  const res = await fetch(url, opts);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+function fmt(n) {
+  if (n == null) return '-';
+  if (typeof n === 'number') return n.toLocaleString('zh-CN', { maximumFractionDigits: 4 });
+  return n;
+}
+
+/* ───────── 表选择 ───────── */
+document.getElementById('global-table-select').addEventListener('change', function () {
+  currentTable = this.value;
+  currentPage  = 1;
+  if (document.getElementById('panel-overview').classList.contains('active')) {
+    loadOverview();
+  } else if (document.getElementById('panel-table').classList.contains('active')) {
+    loadTable(1);
+  }
+});
+
+/* ───────── 侧边栏导航 ───────── */
+document.querySelectorAll('.nav-item').forEach(item => {
+  item.addEventListener('click', () => {
+    document.querySelectorAll('.nav-item').forEach(i => i.classList.remove('active'));
+    document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+    item.classList.add('active');
+    const panelId = 'panel-' + item.dataset.panel;
+    document.getElementById(panelId)?.classList.add('active');
+    if (item.dataset.panel === 'overview') loadOverview();
+    if (item.dataset.panel === 'table') loadTable(1);
+  });
+});
+
+/* ───────── DB 状态 ───────── */
+async function checkStatus() {
+  try {
+    const d = await api('/api/status');
+    const dot = document.getElementById('db-dot');
+    const lbl = document.getElementById('db-label');
+    if (d.status === 'ok') {
+      dot.className = 'db-dot';
+      lbl.textContent = `已连接 · ${d.db_path?.split(/[\\/]/).pop() || ''}`;
+    } else {
+      dot.className = 'db-dot err';
+      lbl.textContent = '连接失败';
+    }
+  } catch {
+    document.getElementById('db-dot').className = 'db-dot err';
+    document.getElementById('db-label').textContent = '无法连接';
+  }
+}
+
+/* ───────── 加载概览 ───────── */
+async function loadOverview() {
+  try {
+    const tables = ['stock_daily', 'stock_weekly', 'stock_monthly', 'etf_daily', 'etf_weekly', 'etf_monthly'];
+    const tbody = document.getElementById('all-tables-tbody');
+    tbody.innerHTML = '';
+    
+    for (const table of tables) {
+      try {
+        const info = await api(`/api/overview?table=${table}`);
+        const count = info.find(i => i.label === '总记录数')?.value || 0;
+        const minDate = info.find(i => i.label === '最早日期')?.value || '-';
+        const maxDate = info.find(i => i.label === '最新日期')?.value || '-';
+        const status = maxDate === '-' ? 'err' : 'ok';
+        const statusText = status === 'ok' ? '已更新' : '待更新';
+        
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td style="font-weight:500;">${table}</td>
+          <td>${(count || 0).toLocaleString()}</td>
+          <td>${minDate}</td>
+          <td>${maxDate}</td>
+          <td><span class="status-badge ${status}">${statusText}</span></td>
+        `;
+        tbody.appendChild(tr);
+      } catch {}
+    }
+    
+    const currentStats = await api(`/api/overview?table=${currentTable}`);
+    if (Array.isArray(currentStats) && currentStats.length >= 4) {
+      document.getElementById('stat-count').textContent = fmt(currentStats[0]?.value || 0);
+      document.getElementById('stat-code-count').textContent = fmt(currentStats[1]?.value || 0);
+      document.getElementById('stat-min-date').textContent = currentStats[2]?.value || '-';
+      document.getElementById('stat-max-date').textContent = currentStats[3]?.value || '-';
+    } else {
+      document.getElementById('stat-count').textContent = '-';
+      document.getElementById('stat-code-count').textContent = '-';
+      document.getElementById('stat-min-date').textContent = '-';
+      document.getElementById('stat-max-date').textContent = '-';
+    }
+    
+  } catch (e) {
+    toast('加载概览失败', 'fail');
+    console.error(e);
+  }
+}
+
+/* ───────── 加载进度 ───────── */
+async function loadProgress() {
+  try {
+    const progress = await api('/api/progress');
+    const card = document.getElementById('progress-card');
+    
+    if (progress.is_running) {
+      card.style.display = 'block';
+      const percent = progress.total > 0 ? Math.round((progress.processed / progress.total) * 100) : 0;
+      
+      document.getElementById('progress-task').textContent = progress.task_name || '-';
+      document.getElementById('progress-percent').textContent = `${percent}%`;
+      document.getElementById('progress-fill').style.width = `${percent}%`;
+      document.getElementById('progress-detail-main').textContent = `${progress.processed}/${progress.total} (成功: ${progress.success}, 失败: ${progress.error})`;
+      document.getElementById('progress-speed').textContent = progress.speed ? `速度: ${progress.speed} 只/秒` : '-';
+      document.getElementById('progress-eta').textContent = progress.eta ? `剩余: ${progress.eta}` : '-';
+    } else {
+      card.style.display = 'none';
+    }
+  } catch {}
+}
+
+/* ───────── 加载数据表格 ───────── */
+async function loadTable(page = 1) {
+  if (page < 1) page = 1;
+  currentPage = page;
+  
+  const kw = document.getElementById('kw-input').value.trim();
+  const start = document.getElementById('date-start').value;
+  const end = document.getElementById('date-end').value;
+  
+  try {
+    const params = new URLSearchParams({
+      table: currentTable,
+      page: page - 1,
+      page_size: PAGE_SIZE,
+      keyword: kw,
+      start: start || '',
+      end: end || ''
+    });
+    
+    const d = await api(`/api/table?${params}`);
+    const thead = document.getElementById('data-thead');
+    const tbody = document.getElementById('data-tbody');
+    
+    // 渲染表头
+    thead.innerHTML = '';
+    const trh = document.createElement('tr');
+    d.columns.forEach(col => {
+      const th = document.createElement('th');
+      th.textContent = col;
+      trh.appendChild(th);
+    });
+    thead.appendChild(trh);
+    
+    // 渲染表体
+    tbody.innerHTML = '';
+    if (d.rows.length === 0) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td colspan="${d.columns.length}" style="color:var(--text-dim);text-align:center;padding:40px;">暂无数据</td>`;
+      tbody.appendChild(tr);
+    } else {
+      d.rows.forEach(row => {
+        const tr = document.createElement('tr');
+        d.columns.forEach(col => {
+          const td = document.createElement('td');
+          td.textContent = fmt(row[col]);
+          tr.appendChild(td);
+        });
+        tbody.appendChild(tr);
+      });
+    }
+    
+    // 更新分页
+    totalPages = Math.ceil(d.total / PAGE_SIZE);
+    document.getElementById('pager-info').textContent = `第 ${page} 页 / 共 ${totalPages} 页 (总 ${d.total} 条)`;
+    document.getElementById('prev-btn').disabled = page <= 1;
+    document.getElementById('next-btn').disabled = page >= totalPages;
+    
+  } catch (e) {
+    toast('查询失败', 'fail');
+    console.error(e);
+  }
+}
+
+/* ───────── 导出CSV ───────── */
+async function exportCSV() {
+  try {
+    const kw = document.getElementById('kw-input').value.trim();
+    const start = document.getElementById('date-start').value;
+    const end = document.getElementById('date-end').value;
+    
+    const params = new URLSearchParams({
+      table: currentTable,
+      keyword: kw,
+      start: start || '',
+      end: end || ''
+    });
+    
+    window.open(`/api/export?${params}`);
+    toast('导出任务已启动', 'ok');
+  } catch (e) {
+    toast('导出失败', 'fail');
+  }
+}
+
+/* ───────── 数据更新触发 ───────── */
+async function triggerUpdate(btn, url, body = {}) {
+  if (btn.disabled) return;
+  const originalText = btn.innerHTML;
+  btn.disabled = true;
+  btn.classList.add('running');
+  btn.innerHTML = `<span class="btn-icon">⏳</span> 运行中…`;
+  
+  try {
+    const res = await api(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    
+    if (res.success) {
+      btn.classList.remove('running');
+      btn.classList.add('ok');
+      btn.innerHTML = `<span class="btn-icon">✅</span> 成功`;
+      toast('更新成功', 'ok');
+      loadOverview();
+    } else {
+      throw new Error(res.message || '更新失败');
+    }
+  } catch (e) {
+    btn.classList.remove('running');
+    btn.classList.add('fail');
+    btn.innerHTML = `<span class="btn-icon">❌</span> 失败`;
+    toast(`更新失败：${e.message}`, 'fail');
+  } finally {
+    setTimeout(() => {
+      btn.classList.remove('ok', 'fail');
+      btn.innerHTML = originalText;
+      btn.disabled = false;
+    }, 2000);
+  }
+}
+
+/* ───────── 全局刷新 ───────── */
+function refreshAll() {
+  checkStatus();
+  if (document.getElementById('panel-overview').classList.contains('active')) {
+    loadOverview();
+    loadProgress();
+  } else if (document.getElementById('panel-table').classList.contains('active')) {
+    loadTable(currentPage);
+  }
+  toast('已刷新', 'ok');
+}
+
+/* ───────── 初始化 ───────── */
+window.addEventListener('DOMContentLoaded', async () => {
+  await checkStatus();
+  await loadOverview();
+  await loadProgress();
+  setInterval(checkStatus, 30000);
+  setInterval(loadProgress, 1000);
+});
+</script>
+</body>
+</html>

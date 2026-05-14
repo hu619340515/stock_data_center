@@ -2,6 +2,7 @@ import baostock as bs
 import pandas as pd
 import time
 import random
+import akshare as ak
 from datetime import timedelta
 from logger_config import setup_logger
 from config import MAX_RETRIES, INITIAL_RETRY_DELAY, MAX_RETRY_DELAY, RETRY_BACKOFF_FACTOR
@@ -59,34 +60,37 @@ class BaoStockClient(DataSourceInterface):
     @retry_with_backoff
     def get_stock_list(self) -> pd.DataFrame:
         self.login()
-        # 使用昨天作为查询日期
-        yesterday = (pd.Timestamp.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        # 尝试多个日期，避免单日数据问题
+        test_dates = [
+            (pd.Timestamp.now() - timedelta(days=1)).strftime("%Y-%m-%d"),
+            (pd.Timestamp.now() - timedelta(days=2)).strftime("%Y-%m-%d"),
+            (pd.Timestamp.now() - timedelta(days=3)).strftime("%Y-%m-%d"),
+            "2026-04-15",
+            "2024-12-31"
+        ]
         
-        logger.info(f"📅 尝试获取股票列表 (查询日期: {yesterday})...")
-        rs = bs.query_all_stock(day=yesterday)
-        
-        # 如果失败，尝试备用日期
-        if rs.error_code != '0':
-            logger.warning(f"⚠️ 默认日期查询失败，尝试备用日期...")
-            rs = bs.query_all_stock(day="2024-12-31")
-            if rs.error_code != '0':
-                logger.error(f"❌ 备用日期查询失败: {rs.error_msg}")
-                return pd.DataFrame()
-
-        data_list = []
-        while rs.next():
-            data_list.append(rs.get_row_data())
-        
-        if not data_list:
-            logger.warning("⚠️ 未获取到股票列表数据")
-            return pd.DataFrame()
+        for test_date in test_dates:
+            logger.info(f"📅 尝试获取股票列表 (查询日期: {test_date})...")
+            rs = bs.query_all_stock(day=test_date)
             
-        df = pd.DataFrame(data_list, columns=rs.fields)
-        # 过滤A股
-        df = df[df['code'].str.contains(r'sh\.6|sz\.0|sz\.3|bj\.')]
+            if rs.error_code == '0':
+                data_list = []
+                while rs.next():
+                    data_list.append(rs.get_row_data())
+                
+                if len(data_list) > 0:
+                    df = pd.DataFrame(data_list, columns=rs.fields)
+                    # 过滤A股
+                    df = df[df['code'].str.contains(r'sh\.6|sz\.0|sz\.3|bj\.')]
+                    logger.info(f"✅ 获取到 {len(df)} 只A股股票")
+                    return df
+                else:
+                    logger.warning(f"⚠️ 日期 {test_date} 返回数据为空，尝试下一个日期")
+            else:
+                logger.warning(f"⚠️ 日期 {test_date} 查询失败: {rs.error_msg}，尝试下一个日期")
         
-        logger.info(f"✅ 获取到 {len(df)} 只A股股票")
-        return df
+        logger.error("❌ 所有日期均无法获取股票列表数据")
+        return pd.DataFrame()
 
     @retry_with_backoff
     def get_stock_history(self, code: str, start_date: str, end_date: str, frequency: str = "d") -> pd.DataFrame:
@@ -152,8 +156,174 @@ class BaoStockClient(DataSourceInterface):
             
         return pd.DataFrame(data_list, columns=rs.fields)
     
+    @retry_with_backoff
+    def get_etf_list(self) -> pd.DataFrame:
+        """
+        📋 获取ETF基金列表
+        """
+        self.login()
+        # 尝试多个日期，避免单日数据问题
+        test_dates = [
+            (pd.Timestamp.now() - timedelta(days=1)).strftime("%Y-%m-%d"),
+            (pd.Timestamp.now() - timedelta(days=2)).strftime("%Y-%m-%d"),
+            (pd.Timestamp.now() - timedelta(days=3)).strftime("%Y-%m-%d"),
+            "2026-04-15",
+            "2024-12-31"
+        ]
+        
+        for test_date in test_dates:
+            logger.info(f"📅 尝试获取ETF列表 (查询日期: {test_date})...")
+            rs = bs.query_all_stock(day=test_date)
+            
+            if rs.error_code == '0':
+                data_list = []
+                while rs.next():
+                    data_list.append(rs.get_row_data())
+                
+                if len(data_list) > 0:
+                    df = pd.DataFrame(data_list, columns=rs.fields)
+                    # 过滤ETF基金
+                    # 沪市ETF: sh.51/56/58开头
+                    # 深市ETF: sz.15/159开头
+                    df = df[df['code'].str.contains(r'sh\.5[168]|sz\.15[09]')]
+                    logger.info(f"✅ 获取到 {len(df)} 只ETF基金")
+                    return df
+                else:
+                    logger.warning(f"⚠️ 日期 {test_date} 返回数据为空，尝试下一个日期")
+            else:
+                logger.warning(f"⚠️ 日期 {test_date} 查询失败: {rs.error_msg}，尝试下一个日期")
+        
+        logger.error("❌ 所有日期均无法获取ETF列表数据")
+        return pd.DataFrame()
+    
     def get_data_source_name(self) -> str:
         """
         📛 获取数据源名称
         """
         return "Baostock"
+
+
+class AKShareClient(DataSourceInterface):
+    def __init__(self):
+        # AKShare无需登录
+        pass
+    
+    @retry_with_backoff
+    def login(self):
+        # AKShare不需要登录，直接返回
+        logger.info("✅ AKShare无需登录，已就绪")
+        return
+    
+    def logout(self):
+        # AKShare不需要登出
+        logger.info("👋 AKShare已退出")
+        return
+    
+    @retry_with_backoff
+    def get_stock_list(self) -> pd.DataFrame:
+        """
+        📋 获取A股股票列表
+        """
+        logger.info("📅 正在获取A股股票列表...")
+        df = ak.stock_zh_a_spot()
+        # 格式化代码，添加市场前缀
+        df['code'] = df.apply(lambda x: f"sh.{x['代码']}" if x['代码'].startswith('6') else f"sz.{x['代码']}", axis=1)
+        df['code_name'] = df['名称']
+        # 过滤A股
+        df = df[df['code'].str.contains(r'sh\.6|sz\.0|sz\.3|bj\.')]
+        logger.info(f"✅ 获取到 {len(df)} 只A股股票")
+        return df[['code', 'code_name']]
+    
+    @retry_with_backoff
+    def get_etf_list(self) -> pd.DataFrame:
+        """
+        📋 获取ETF基金列表
+        """
+        logger.info("📅 正在获取ETF基金列表...")
+        df = ak.fund_etf_spot_em()  # 适配新版本AKShare接口
+        # 格式化代码，添加市场前缀
+        df['code'] = df.apply(lambda x: f"sh.{x['代码']}" if x['代码'].startswith('5') else f"sz.{x['代码']}", axis=1)
+        df['code_name'] = df['名称']
+        # 过滤所有ETF（51/56/58开头沪市，15/159开头深市）
+        df = df[df['code'].str.contains(r'sh\.5[168]|sz\.15[09]')]
+        
+        logger.info(f"✅ 获取到 {len(df)} 只ETF基金")
+        return df[['code', 'code_name']]
+    
+    @retry_with_backoff
+    def get_stock_history(self, code: str, start_date: str, end_date: str, frequency: str = "d") -> pd.DataFrame:
+        """
+        📈 获取股票/ETF历史数据
+        """
+        # 转换频率参数
+        period_map = {
+            "d": "daily",
+            "w": "weekly",
+            "m": "monthly",
+            "1": "1min",
+            "5": "5min"
+        }
+        period = period_map.get(frequency, "daily")
+        
+        # 去掉代码前缀
+        pure_code = code.split('.')[1]
+        
+        # 处理日期格式，AKShare要求YYYYMMDD格式
+        start_date = start_date.replace('-', '')
+        end_date = end_date.replace('-', '')
+        
+        # 调用接口获取数据
+        df = ak.stock_zh_a_hist(
+            symbol=pure_code,
+            period=period,
+            start_date=start_date,
+            end_date=end_date,
+            adjust="hfq"  # 默认后复权，和Baostock保持一致
+        )
+        
+        if df.empty:
+            logger.warning(f"⚠️ 未获取到 {code} 的历史数据")
+            return pd.DataFrame()
+        
+        # 格式化列名，和Baostock返回格式保持一致
+        df = df.rename(columns={
+            "日期": "date",
+            "开盘": "open",
+            "最高": "high",
+            "最低": "low",
+            "收盘": "close",
+            "前收盘": "preclose",
+            "成交量": "volume",
+            "成交额": "amount",
+            "涨跌幅": "pctChg",
+            "换手率": "turn",
+            "交易状态": "tradestatus",
+            "是否ST": "isST"
+        })
+        
+        # 添加代码列
+        df['code'] = code
+        df['adjustflag'] = "2"  # 后复权标记
+        
+        # 补充缺失的列，和Baostock格式保持一致
+        for col in ['tradestatus', 'isST']:
+            if col not in df.columns:
+                df[col] = "1" if col == 'tradestatus' else "0"
+        
+        # 转换日期格式
+        df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
+        
+        # 转换数值类型
+        numeric_cols = ['open', 'high', 'low', 'close', 'preclose', 'volume', 'amount', 'turn', 'pctChg']
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+        
+        logger.info(f"✅ {code} 下载成功，数据量: {len(df)} 条")
+        return df
+    
+    def get_data_source_name(self) -> str:
+        """
+        📛 获取数据源名称
+        """
+        return "AKShare"

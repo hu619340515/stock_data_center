@@ -32,19 +32,44 @@ def update(frequency):
 
 @cli.command()
 @click.option('--frequency', '-f', default='d', help='数据频率 (d: 日线, w: 周线, m: 月线)')
-def status(frequency):
+@click.option('--type', '-t', default='stock', help='资产类型 (stock: 股票, etf: ETF基金)')
+def status(frequency, type):
     """查看状态"""
     import duckdb
     from config import DATABASE_PATH
     try:
         db = DuckDBManager()
-        table_name = db._get_table_name(frequency)
+        table_name = db._get_table_name(frequency, type)
         res = duckdb.connect(DATABASE_PATH).execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()
-        stock_count = duckdb.connect(DATABASE_PATH).execute(f"SELECT COUNT(DISTINCT code) FROM {table_name}").fetchone()
-        logger.info(f"📊 总记录数: {res[0]}")
-        logger.info(f"📊 股票数量: {stock_count[0]}")
+        count = duckdb.connect(DATABASE_PATH).execute(f"SELECT COUNT(DISTINCT code) FROM {table_name}").fetchone()
+        if type == 'stock':
+            logger.info(f"📊 股票总记录数: {res[0]}")
+            logger.info(f"📊 股票数量: {count[0]}")
+        else:
+            logger.info(f"📊 ETF总记录数: {res[0]}")
+            logger.info(f"📊 ETF数量: {count[0]}")
     except Exception as e:
         logger.error(f"查询失败: {e}")
+
+@cli.command()
+@click.option('--frequency', '-f', default='d', help='数据频率 (d: 日线, w: 周线, m: 月线)')
+def etf_full(frequency):
+    """全量下载ETF数据"""
+    pipeline = StockDataPipeline() # 在这里实例化
+    try:
+        pipeline.etf_download_pipeline(frequency=frequency)
+    except Exception as e:
+        logger.error(f"ETF全量下载失败: {e}")
+
+@cli.command()
+@click.option('--frequency', '-f', default='d', help='数据频率 (d: 日线, w: 周线, m: 月线)')
+def etf_update(frequency):
+    """增量更新ETF数据"""
+    pipeline = StockDataPipeline()
+    try:
+        pipeline.etf_update_pipeline(frequency=frequency)
+    except Exception as e:
+        logger.error(f"ETF增量更新失败: {e}")
 
 @cli.command()
 @click.option('--code', '-c', default='', help='股票代码 (空字符串表示所有股票)')
