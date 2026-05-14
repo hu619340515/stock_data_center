@@ -33,11 +33,12 @@ retry:
 datasource:
   default: "baostock"  # 默认数据源，当前支持baostock，未来可扩展tushare、akshare等
   enable_fallback: true  # 是否启用数据源故障切换，true表示当主数据源失败时自动切换到备用数据源
-  priority: ["baostock"]  # 数据源优先级列表，按顺序尝试，可添加多个数据源实现故障切换
+  priority: ["baostock", "akshare"]  # 数据源优先级列表，按顺序尝试，可添加多个数据源实现故障切换
 
 # 数据范围配置
 data:
-  start_date_full: "1999-01-01"  # 全量下载的起始日期，首次运行时从此日期开始下载
+  start_date_full: "1999-01-01"  # 股票全量下载的起始日期，首次运行时从此日期开始下载
+  start_date_full_etf: "1999-01-04"  # ETF全量下载的起始日期，首次运行时从此日期开始下载
   start_date_incremental: "2026-04-01"  # 增量更新的起始日期，用于每日更新任务
 
 # 错误处理配置

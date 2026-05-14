@@ -1,10 +1,11 @@
 import pandas as pd
-from multiprocessing import Process, Queue, current_process
+import os
+from multiprocessing import Process, Queue, current_process, Event
 import logging # ✅ 单独导入标准 logging 模块
 from typing import List, Tuple, Optional, Set, Any
 from database import DuckDBManager
 from data_source_factory import DataSourceFactory
-from config import MAX_WORKERS, START_DATE_FULL, DYNAMIC_CONCURRENCY, MIN_WORKERS, MAX_WORKERS_LIMIT, ERROR_THRESHOLD, SUCCESS_THRESHOLD, BATCH_SIZE, MAX_BATCH_SIZE, MIN_BATCH_SIZE, MEMORY_THRESHOLD, USE_ARROW, COMPRESS_DATA, ERROR_LOG_FILE, MAX_ERRORS_BEFORE_WARNING, DEFAULT_DATA_SOURCE, ENABLE_DATA_SOURCE_FALLBACK, DATA_SOURCE_PRIORITY
+from config import MAX_WORKERS, START_DATE_FULL, START_DATE_FULL_ETF, DYNAMIC_CONCURRENCY, MIN_WORKERS, MAX_WORKERS_LIMIT, ERROR_THRESHOLD, SUCCESS_THRESHOLD, BATCH_SIZE, MAX_BATCH_SIZE, MIN_BATCH_SIZE, MEMORY_THRESHOLD, USE_ARROW, COMPRESS_DATA, ERROR_LOG_FILE, MAX_ERRORS_BEFORE_WARNING, DEFAULT_DATA_SOURCE, ENABLE_DATA_SOURCE_FALLBACK, DATA_SOURCE_PRIORITY
 import threading
 import time
 
@@ -86,7 +87,7 @@ def safe_print(msg):
     with logging._lock:
         print(msg)
 
-def worker_update(process_id: int, stock_list: pd.DataFrame, result_queue: Queue, frequency: str = "d"):
+def worker_update(process_id: int, stock_list: pd.DataFrame, result_queue: Queue, frequency: str = "d", stop_event=None):
     """
     🚀 增量更新的工作进程
     
@@ -95,6 +96,7 @@ def worker_update(process_id: int, stock_list: pd.DataFrame, result_queue: Queue
         stock_list: 股票列表
         result_queue: 结果队列
         frequency: 数据频率
+        stop_event: 停止事件（跨进程共享）
     """
     from data_source_factory import DataSourceFactory
     from config import DEFAULT_DATA_SOURCE
@@ -109,6 +111,11 @@ def worker_update(process_id: int, stock_list: pd.DataFrame, result_queue: Queue
     try:
         total = len(stock_list)
         for i, (_, row) in enumerate(stock_list.iterrows()):
+            # 检查停止信号
+            if stop_event is not None and stop_event.is_set():
+                safe_print(f"️ [进程 {process_id}] 收到停止信号，退出")
+                break
+            
             code = row['code']
             # 从row中获取开始日期和结束日期
             start_date = row.get('start_date', '1999-01-01')
@@ -125,7 +132,7 @@ def worker_update(process_id: int, stock_list: pd.DataFrame, result_queue: Queue
                         safe_print(f"✅ [进程 {process_id}] {code} 增量更新成功，数据量: {len(df)} 条")
                         result_queue.put((df, True, None))  # (数据, 成功标志, 错误信息)
                     else:
-                        safe_print(f"ℹ️ [进程 {process_id}] {code} 无新数据")
+                        safe_print(f"️ [进程 {process_id}] {code} 无新数据")
                         result_queue.put((None, True, f"{code} 无新数据"))  # (无数据, 成功标志, 信息)
                 else:
                     safe_print(f"ℹ️ [进程 {process_id}] {code} 数据已最新")
@@ -143,7 +150,7 @@ def worker_update(process_id: int, stock_list: pd.DataFrame, result_queue: Queue
         client.logout()
         safe_print(f"🏁 [进程 {process_id}] 任务结束")
 
-def worker_download(process_id: int, stock_list: pd.DataFrame, start_date: str, end_date: str, result_queue: Queue, frequency: str = "d"):
+def worker_download(process_id: int, stock_list: pd.DataFrame, start_date: str, end_date: str, result_queue: Queue, frequency: str = "d", stop_event=None):
     """
     🚀 全量下载的工作进程
     
@@ -154,6 +161,7 @@ def worker_download(process_id: int, stock_list: pd.DataFrame, start_date: str, 
         end_date: 结束日期
         result_queue: 结果队列
         frequency: 数据频率
+        stop_event: 停止事件（跨进程共享）
     """
     from data_source_factory import DataSourceFactory
     from config import DEFAULT_DATA_SOURCE
@@ -168,6 +176,11 @@ def worker_download(process_id: int, stock_list: pd.DataFrame, start_date: str, 
     try:
         total = len(stock_list)
         for i, (_, row) in enumerate(stock_list.iterrows()):
+            # 检查停止信号
+            if stop_event is not None and stop_event.is_set():
+                safe_print(f"⏹️ [进程 {process_id}] 收到停止信号，退出")
+                break
+            
             code = row['code']
             name = row['code_name']
             
@@ -201,6 +214,7 @@ class StockDataPipeline:
         self.use_temp_db = use_temp_db
         self.temp_db_path = None
         self.should_stop = False
+        self.stop_event = Event()
         
         if use_temp_db:
             import tempfile
@@ -230,6 +244,7 @@ class StockDataPipeline:
     def stop(self):
         """停止当前任务"""
         self.should_stop = True
+        self.stop_event.set()
         safe_print("⏹️ 收到停止信号，正在停止任务...")
     
     def merge_to_main_db(self, main_db_path: str, tables: list = None) -> bool:
@@ -447,7 +462,7 @@ class StockDataPipeline:
         end_date = pd.Timestamp.now().strftime("%Y-%m-%d")
 
         for i, chunk in enumerate(chunks):
-            p = Process(target=worker_download, args=(i+1, chunk, START_DATE_FULL, end_date, data_queue, frequency))
+            p = Process(target=worker_download, args=(i+1, chunk, START_DATE_FULL, end_date, data_queue, frequency, self.stop_event))
             p.start()
             processes.append(p)
         
@@ -587,11 +602,17 @@ class StockDataPipeline:
             code = row['code']
             last_date = self.db.get_last_date(code, frequency)
             
+            three_months_ago = (pd.Timestamp.now() - pd.DateOffset(months=3)).strftime("%Y-%m-%d")
+            
             if last_date:
                 last_date_obj = pd.to_datetime(last_date)
                 start_date = (last_date_obj + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+                # 确保起始日期不早于3个月前
+                if start_date < three_months_ago:
+                    start_date = three_months_ago
             else:
-                start_date = "1999-01-01"
+                # 没有历史数据的股票，从3个月前开始
+                start_date = three_months_ago
             
             today = pd.Timestamp.now().date()
             if pd.Timestamp.now().hour < 18:
@@ -631,7 +652,7 @@ class StockDataPipeline:
         processes: List[Process] = []
 
         for i, chunk in enumerate(chunks):
-            p = Process(target=worker_update, args=(i+1, chunk, data_queue, frequency))
+            p = Process(target=worker_update, args=(i+1, chunk, data_queue, frequency, self.stop_event))
             p.start()
             processes.append(p)
         
@@ -778,7 +799,7 @@ class StockDataPipeline:
         end_date = pd.Timestamp.now().strftime("%Y-%m-%d")
 
         for i, chunk in enumerate(chunks):
-            p = Process(target=worker_download, args=(i+1, chunk, START_DATE_FULL, end_date, data_queue, frequency))
+            p = Process(target=worker_download, args=(i+1, chunk, START_DATE_FULL_ETF, end_date, data_queue, frequency, self.stop_event))
             p.start()
             processes.append(p)
         
@@ -902,12 +923,16 @@ class StockDataPipeline:
             code = row['code']
             last_date = self.db.get_last_date(code, frequency, asset_type="etf")
             
+            three_months_ago = (pd.Timestamp.now() - pd.DateOffset(months=3)).strftime("%Y-%m-%d")
+            
             if last_date:
                 last_date_obj = pd.to_datetime(last_date)
                 # 计算开始日期（最后日期的下一天）
                 start_date = (last_date_obj + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+                if start_date < three_months_ago:
+                    start_date = three_months_ago
             else:
-                start_date = "1999-01-01"
+                start_date = three_months_ago
             
             # 计算结束日期，考虑到数据可能还未更新
             today = pd.Timestamp.now().date()
@@ -951,7 +976,7 @@ class StockDataPipeline:
         processes: List[Process] = []
 
         for i, chunk in enumerate(chunks):
-            p = Process(target=worker_update, args=(i+1, chunk, data_queue, frequency))
+            p = Process(target=worker_update, args=(i+1, chunk, data_queue, frequency, self.stop_event))
             p.start()
             processes.append(p)
         
