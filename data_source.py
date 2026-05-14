@@ -284,6 +284,10 @@ class AKShareClient(DataSourceInterface):
             logger.info(f"📥 [新浪财经] 获取ETF {code} 数据: {start_date_fund} ~ {end_date_fund}")
             # 新浪接口需要带市场前缀的代码，如sh513310
             sina_symbol = code.replace('.', '')
+            # 添加随机延迟，避免触发限流
+            import random
+            import time
+            time.sleep(random.uniform(0.5, 1.5))
             df = ak.fund_etf_hist_sina(
                 symbol=sina_symbol
             )
@@ -292,8 +296,12 @@ class AKShareClient(DataSourceInterface):
                 df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
                 df = df[(df['date'] >= start_date_fund) & (df['date'] <= end_date_fund)]
         else:
-            # 股票保留原有的东方财富A股接口
+            # 股票使用东方财富接口，增加更长延迟避免限流
             logger.info(f"📥 [AKShare] 获取股票 {code} 数据: {start_date_stock} ~ {end_date_stock}")
+            # 增加更长的随机延迟，避免东方财富限流
+            import random
+            import time
+            time.sleep(random.uniform(2, 3.5))
             df = ak.stock_zh_a_hist(
                 symbol=pure_code,
                 period=period,
@@ -307,60 +315,48 @@ class AKShareClient(DataSourceInterface):
             return pd.DataFrame()
         
         # 调试信息：返回数据的日期范围
-        if not df.empty and '日期' in df.columns:
-            min_date = pd.to_datetime(df['日期']).min().strftime('%Y-%m-%d')
-            max_date = pd.to_datetime(df['日期']).max().strftime('%Y-%m-%d')
+        if not df.empty:
+            if '日期' in df.columns:
+                min_date = pd.to_datetime(df['日期']).min().strftime('%Y-%m-%d')
+                max_date = pd.to_datetime(df['日期']).max().strftime('%Y-%m-%d')
+            elif 'date' in df.columns:
+                min_date = df['date'].min()
+                max_date = df['date'].max()
+            else:
+                min_date = "未知"
+                max_date = "未知"
             logger.info(f"✅ {code} 返回数据范围: {min_date} ~ {max_date}，共 {len(df)} 条")
         
         # 格式化列名，统一格式
         df['code'] = code
         
-        if is_etf:
-            # 新浪财经ETF字段映射
-            rename_dict = {
-                "date": "date",
-                "open": "open",
-                "high": "high",
-                "low": "low",
-                "close": "close",
-                "volume": "volume",
-                "amount": "amount"
-            }
-            # 新浪接口没有这些字段，补充默认值
-            df['preclose'] = 0.0
-            df['adjustflag'] = ""
-            df['turn'] = 0.0
-            df['tradestatus'] = "1"
-            df['pctChg'] = 0.0
-            df['isST'] = "0"
-        else:
-            # 东方财富股票字段映射
-            rename_dict = {
-                "日期": "date",
-                "开盘": "open",
-                "最高": "high",
-                "最低": "low",
-                "收盘": "close",
-                "前收盘": "preclose",
-                "成交量": "volume",
-                "成交额": "amount",
-                "调整标志": "adjustflag",
-                "换手率": "turn",
-                "交易状态": "tradestatus",
-                "涨跌幅": "pctChg",
-                "是否ST": "isST"
-            }
-            # 处理可能缺少的字段
-            for col in ["preclose", "adjustflag", "turn", "tradestatus", "pctChg", "isST"]:
-                if col not in df.columns:
-                    if col in ["preclose", "turn", "pctChg"]:
-                        df[col] = 0.0
-                    elif col == "adjustflag":
-                        df[col] = ""
-                    elif col == "tradestatus":
-                        df[col] = "1"
-                    elif col == "isST":
-                        df[col] = "0"
+        # 东方财富字段映射
+        rename_dict = {
+            "日期": "date",
+            "开盘": "open",
+            "最高": "high",
+            "最低": "low",
+            "收盘": "close",
+            "前收盘": "preclose",
+            "成交量": "volume",
+            "成交额": "amount",
+            "调整标志": "adjustflag",
+            "换手率": "turn",
+            "交易状态": "tradestatus",
+            "涨跌幅": "pctChg",
+            "是否ST": "isST"
+        }
+        # 处理可能缺少的字段
+        for col in ["preclose", "adjustflag", "turn", "tradestatus", "pctChg", "isST"]:
+            if col not in df.columns:
+                if col in ["preclose", "turn", "pctChg"]:
+                    df[col] = 0.0
+                elif col == "adjustflag":
+                    df[col] = ""
+                elif col == "tradestatus":
+                    df[col] = "1"
+                elif col == "isST":
+                    df[col] = "0"
         
         df.rename(columns=rename_dict, inplace=True)
         logger.info(f"📤 {code} 数据列: {df.columns.tolist()}")

@@ -187,21 +187,40 @@ ALLOWED_TABLES = {
 # ─────────────────────────────────────────────
 # 工具函数
 # ─────────────────────────────────────────────
-def get_conn(read_only=True):
-    try:
-        # 使用 read_only 模式避免与后台写入任务冲突
-        conn = duckdb.connect(DB_PATH, read_only=read_only)
-        return conn
-    except TypeError:
-        return duckdb.connect(DB_PATH)
-    except Exception:
-        # 如果数据库被锁定，尝试只读连接
-        if read_only:
-            try:
-                return duckdb.connect(DB_PATH, read_only=True)
-            except Exception:
+def get_conn(read_only=True, asset_type='stock'):
+    # 根据资产类型选择数据库
+    if asset_type == 'etf':
+        db_path = ETF_DB_PATH
+    else:
+        db_path = STOCK_DB_PATH
+    
+    # 重试机制，最多重试3次
+    max_retries = 3
+    retry_delay = 0.5
+    
+    for attempt in range(max_retries):
+        try:
+            # 使用 read_only 模式避免与后台写入任务冲突
+            conn = duckdb.connect(db_path, read_only=read_only)
+            return conn
+        except TypeError:
+            return duckdb.connect(db_path)
+        except Exception as e:
+            # 如果数据库被锁定，尝试只读连接
+            if read_only and attempt < max_retries -1:
+                try:
+                    conn = duckdb.connect(db_path, read_only=True)
+                    return conn
+                except Exception:
+                    # 等待后重试
+                    import time
+                    time.sleep(retry_delay)
+            elif attempt >= max_retries -1:
                 raise
-        raise
+            else:
+                # 等待后重试
+                import time
+                time.sleep(retry_delay)
 
 def df_to_records(df):
     for col in df.columns:
@@ -257,22 +276,57 @@ def favicon():
 @app.route('/api/status')
 def api_status():
     try:
-        conn = get_conn()
-        tables = conn.execute("SHOW TABLES").fetchall()
-        table_list = [t[0] for t in tables]
-        conn.close()
+        # 同时检查两个数据库的状态
+        stock_status = {'name': 'stock_data.db', 'path': STOCK_DB_PATH, 'status': 'error', 'tables': []}
+        etf_status = {'name': 'etf_data.db', 'path': ETF_DB_PATH, 'status': 'error', 'tables': []}
+        
+        # 检查股票数据库
+        try:
+            conn = get_conn(asset_type='stock')
+            stock_tables = conn.execute("SHOW TABLES").fetchall()
+            stock_status['status'] = 'ok'
+            stock_status['tables'] = [t[0] for t in stock_tables]
+            conn.close()
+        except Exception as e:
+            stock_status['error'] = str(e)
+            # 尝试初始化
+            try:
+                from database import DuckDBManager
+                db = DuckDBManager(db_path=STOCK_DB_PATH)
+                db.close()
+                stock_status['status'] = 'ok'
+            except Exception as init_e:
+                stock_status['init_error'] = str(init_e)
+        
+        # 检查ETF数据库
+        try:
+            conn = get_conn(asset_type='etf')
+            etf_tables = conn.execute("SHOW TABLES").fetchall()
+            etf_status['status'] = 'ok'
+            etf_status['tables'] = [t[0] for t in etf_tables]
+            conn.close()
+        except Exception as e:
+            etf_status['error'] = str(e)
+            # 尝试初始化
+            try:
+                from database import DuckDBManager
+                db = DuckDBManager(db_path=ETF_DB_PATH)
+                db.close()
+                etf_status['status'] = 'ok'
+            except Exception as init_e:
+                etf_status['init_error'] = str(init_e)
+        
         return jsonify({
             'status': 'ok',
-            'db_path': DB_PATH,
-            'db_exists': os.path.exists(DB_PATH),
-            'tables': table_list
+            'databases': {
+                'stock': stock_status,
+                'etf': etf_status
+            }
         })
     except Exception as e:
         return jsonify({
             'status': 'error',
-            'msg': str(e),
-            'db_path': DB_PATH,
-            'db_exists': os.path.exists(DB_PATH)
+            'msg': str(e)
         }), 500
 
 
@@ -305,7 +359,9 @@ def api_progress():
 def api_overview():
     table = request.args.get('table', '').strip()
     try:
-        conn = get_conn()
+        # 根据表名自动选择数据库
+        asset_type = 'etf' if table.startswith('etf_') else 'stock'
+        conn = get_conn(asset_type=asset_type)
         if table and table in ALLOWED_TABLES:
             count      = conn.execute(f"SELECT COUNT(1) FROM {table}").fetchone()[0]
             code_count = conn.execute(f"SELECT COUNT(DISTINCT code) FROM {table}").fetchone()[0]
@@ -338,13 +394,19 @@ def api_overview():
             conn.close()
             return jsonify(cards)
         else:
-            all_tables = conn.execute("SHOW TABLES").fetchall()
+            # 查询两个数据库的所有表
             result = []
-            for t in all_tables:
-                tname = t[0]
-                cnt   = conn.execute(f"SELECT COUNT(1) FROM {tname}").fetchone()[0]
-                result.append({'table': tname, 'count': cnt})
-            conn.close()
+            for atype in ['stock', 'etf']:
+                try:
+                    conn_atype = get_conn(asset_type=atype)
+                    all_tables = conn_atype.execute("SHOW TABLES").fetchall()
+                    for t in all_tables:
+                        tname = t[0]
+                        cnt   = conn_atype.execute(f"SELECT COUNT(1) FROM {tname}").fetchone()[0]
+                        result.append({'table': tname, 'count': cnt})
+                    conn_atype.close()
+                except Exception:
+                    pass
             return jsonify(result)
     except Exception as e:
         return jsonify({'status': 'error', 'msg': str(e)}), 500
@@ -368,7 +430,7 @@ def api_table():
         return err
 
     try:
-        # ① 参数化 WHERE，防注入，同时避免特殊字符（如 sh.600006 中的点）破坏 SQL
+        #  参数化 WHERE，防注入，同时避免特殊字符（如 sh.600006 中的点）破坏 SQL
         where, params = build_where(keyword=keyword, start=start, end=end)
 
         sql_data  = (
@@ -378,7 +440,9 @@ def api_table():
         )
         sql_count = f"SELECT COUNT(1) FROM {table} {where}"
 
-        conn  = get_conn()
+        # 根据表名自动选择数据库
+        asset_type = 'etf' if table.startswith('etf_') else 'stock'
+        conn  = get_conn(asset_type=asset_type)
         # ② 用参数列表执行，DuckDB 支持 ? 占位符
         df    = conn.execute(sql_data,  params).fetchdf()
         total = conn.execute(sql_count, params).fetchone()[0]
@@ -411,7 +475,8 @@ def api_codes():
     tbl, err = check_table(table)
     if err: return err
     try:
-        conn  = get_conn()
+        asset_type = 'etf' if table.startswith('etf_') else 'stock'
+        conn  = get_conn(asset_type=asset_type)
         codes = conn.execute(f"SELECT DISTINCT code FROM {table} ORDER BY code").fetchall()
         conn.close()
         return jsonify([c[0] for c in codes])
@@ -434,7 +499,8 @@ def api_kline():
         return jsonify({'status': 'error', 'msg': '缺少 code 参数'}), 400
     try:
         where, params = build_where(code=code, start=start, end=end)
-        conn = get_conn()
+        asset_type = 'etf' if table.startswith('etf_') else 'stock'
+        conn = get_conn(asset_type=asset_type)
         # 尝试含 amount 字段；若不存在则降级
         try:
             sql = (f"SELECT CAST(date AS VARCHAR) as date, open, high, low, close, "
@@ -503,7 +569,8 @@ def api_stats():
     tbl, err = check_table(table)
     if err: return err
     try:
-        conn   = get_conn()
+        asset_type = 'etf' if table.startswith('etf_') else 'stock'
+        conn   = get_conn(asset_type=asset_type)
         schema = conn.execute(f"DESCRIBE {table}").fetchall()
         num_types = ('INTEGER','DOUBLE','FLOAT','BIGINT','DECIMAL','REAL','HUGEINT','UBIGINT')
         num_cols  = [col[0] for col in schema if col[1].upper().split('(')[0] in num_types]
@@ -538,7 +605,8 @@ def api_top_movers():
     if err: return err
 
     try:
-        conn = get_conn()
+        asset_type = 'etf' if table.startswith('etf_') else 'stock'
+        conn = get_conn(asset_type=asset_type)
         if not date:
             row  = conn.execute(f"SELECT MAX(date) FROM {table}").fetchone()
             date = str(row[0]) if row and row[0] else ''
@@ -587,7 +655,8 @@ def api_distribution():
         if date:
             where  = (where + ' AND date = ?') if where else 'WHERE date = ?'
             params = params + [date]
-        conn = get_conn()
+        asset_type = 'etf' if table.startswith('etf_') else 'stock'
+        conn = get_conn(asset_type=asset_type)
         if where:
             sql = f"SELECT {field} FROM {table} {where} AND {field} IS NOT NULL"
         else:
@@ -639,7 +708,8 @@ def api_trend():
 
     try:
         where, params = build_where(code=code, start=start, end=end)
-        conn  = get_conn()
+        asset_type = 'etf' if table.startswith('etf_') else 'stock'
+        conn  = get_conn(asset_type=asset_type)
         sql   = (f"SELECT CAST(date AS VARCHAR) as date, "
                  f"ROUND(AVG({field}),4) as avg_val, "
                  f"ROUND(MAX({field}),4) as max_val, "
@@ -661,24 +731,28 @@ def api_trend():
 @app.route('/api/refresh_status')
 def api_refresh_status():
     try:
-        conn   = get_conn()
-        tables = conn.execute("SHOW TABLES").fetchall()
         result = []
-        for t in tables:
-            tname = t[0]
+        for atype in ['stock', 'etf']:
             try:
-                row = conn.execute(
-                    f"SELECT MAX(date), MIN(date), COUNT(1) FROM {tname}"
-                ).fetchone()
-                result.append({
-                    'table':    tname,
-                    'max_date': str(row[0]) if row[0] else None,
-                    'min_date': str(row[1]) if row[1] else None,
-                    'count':    int(row[2]),
-                })
+                conn = get_conn(asset_type=atype)
+                tables = conn.execute("SHOW TABLES").fetchall()
+                for t in tables:
+                    tname = t[0]
+                    try:
+                        row = conn.execute(
+                            f"SELECT MAX(date), MIN(date), COUNT(1) FROM {tname}"
+                        ).fetchone()
+                        result.append({
+                            'table':    tname,
+                            'max_date': str(row[0]) if row[0] else None,
+                            'min_date': str(row[1]) if row[1] else None,
+                            'count':    int(row[2]),
+                        })
+                    except Exception:
+                        result.append({'table': tname, 'max_date': None, 'min_date': None, 'count': 0})
+                conn.close()
             except Exception:
-                result.append({'table': tname, 'max_date': None, 'min_date': None, 'count': 0})
-        conn.close()
+                pass
         return jsonify(result)
     except Exception as e:
         return jsonify({'status': 'error', 'msg': str(e)}), 500
@@ -702,7 +776,8 @@ def api_export():
     try:
         where, params = build_where(keyword=keyword, start=start, end=end, code=code)
         sql   = f"SELECT * FROM {table} {where} ORDER BY date DESC, code LIMIT {limit}"
-        conn  = get_conn()
+        asset_type = 'etf' if table.startswith('etf_') else 'stock'
+        conn  = get_conn(asset_type=asset_type)
         df    = conn.execute(sql, params).fetchdf()
         conn.close()
         for col in df.columns:
@@ -744,7 +819,8 @@ def api_delete():
         where = build_where(code=code, start=start, end=end)
         if not where:
             return jsonify({'status': 'error', 'msg': '条件为空，拒绝全表删除'}), 400
-        conn  = get_conn(read_only=False)
+        asset_type = 'etf' if table.startswith('etf_') else 'stock'
+        conn  = get_conn(read_only=False, asset_type=asset_type)
         count = conn.execute(f"SELECT COUNT(1) FROM {table} {where}").fetchone()[0]
         conn.execute(f"DELETE FROM {table} {where}")
         conn.commit()
@@ -763,7 +839,8 @@ def api_schema():
     tbl, err = check_table(table)
     if err: return err
     try:
-        conn   = get_conn()
+        asset_type = 'etf' if table.startswith('etf_') else 'stock'
+        conn   = get_conn(asset_type=asset_type)
         schema = conn.execute(f"DESCRIBE {table}").fetchall()
         conn.close()
         return jsonify([{'column': row[0], 'type': row[1]} for row in schema])
@@ -786,7 +863,8 @@ def api_summary_by_code():
 
     try:
         where = build_where(start=start, end=end)
-        conn  = get_conn()
+        asset_type = 'etf' if table.startswith('etf_') else 'stock'
+        conn  = get_conn(asset_type=asset_type)
         sql   = (f"SELECT code, COUNT(1) as days, "
                  f"ROUND(AVG(close),4) as avg_close, "
                  f"MAX(high) as max_high, MIN(low) as min_low, "

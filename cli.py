@@ -55,7 +55,7 @@ def status(frequency, type):
 @click.option('--frequency', '-f', default='d', help='数据频率 (d: 日线, w: 周线, m: 月线)')
 def etf_full(frequency):
     """全量下载ETF数据"""
-    pipeline = StockDataPipeline() # 在这里实例化
+    pipeline = StockDataPipeline(asset_type='etf')
     try:
         pipeline.etf_download_pipeline(frequency=frequency)
     except Exception as e:
@@ -65,7 +65,7 @@ def etf_full(frequency):
 @click.option('--frequency', '-f', default='d', help='数据频率 (d: 日线, w: 周线, m: 月线)')
 def etf_update(frequency):
     """增量更新ETF数据"""
-    pipeline = StockDataPipeline()
+    pipeline = StockDataPipeline(asset_type='etf')
     try:
         pipeline.etf_update_pipeline(frequency=frequency)
     except Exception as e:

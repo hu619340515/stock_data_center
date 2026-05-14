@@ -44,12 +44,20 @@
     }
     .logo { font-size: 18px; font-weight: 700; }
     .db-info {
-      display: flex; align-items: center; gap: 8px;
+      display: flex; align-items: center; gap: 12px;
       background: rgba(255,255,255,.15);
       border-radius: 20px;
       padding: 4px 12px;
       font-size: 12px;
       backdrop-filter: blur(8px);
+    }
+    .db-info-group {
+      display: flex; align-items: center; gap: 6px;
+    }
+    .db-info-divider {
+      width: 1px;
+      height: 16px;
+      background: rgba(255,255,255,.3);
     }
     .db-dot { width: 8px; height: 8px; border-radius: 50%; background: #4ade80; flex-shrink: 0; animation: pulse 2s infinite; }
     .db-dot.err { background: #f87171; animation: none; }
@@ -317,8 +325,15 @@
   <div class="header-left">
     <span class="logo">📈 量化数据可视化管理</span>
     <div class="db-info">
-      <div class="db-dot" id="db-dot"></div>
-      <span id="db-label">连接中…</span>
+      <div class="db-info-group">
+        <div class="db-dot" id="db-dot-stock"></div>
+        <span id="db-label-stock">stock_data.db</span>
+      </div>
+      <div class="db-info-divider"></div>
+      <div class="db-info-group">
+        <div class="db-dot" id="db-dot-etf"></div>
+        <span id="db-label-etf">etf_data.db</span>
+      </div>
     </div>
   </div>
   <div class="header-right">
@@ -544,18 +559,40 @@ document.querySelectorAll('.nav-item').forEach(item => {
 async function checkStatus() {
   try {
     const d = await api('/api/status');
-    const dot = document.getElementById('db-dot');
-    const lbl = document.getElementById('db-label');
-    if (d.status === 'ok') {
-      dot.className = 'db-dot';
-      lbl.textContent = `已连接 · ${d.db_path?.split(/[\\/]/).pop() || ''}`;
+    
+    if (d.status === 'ok' && d.databases) {
+      // 更新股票数据库状态
+      const stockDot = document.getElementById('db-dot-stock');
+      const stockLbl = document.getElementById('db-label-stock');
+      if (d.databases.stock.status === 'ok') {
+        stockDot.className = 'db-dot';
+        stockLbl.textContent = '已连接 · stock_data.db';
+      } else {
+        stockDot.className = 'db-dot err';
+        stockLbl.textContent = '未连接 · stock_data.db';
+      }
+      
+      // 更新ETF数据库状态
+      const etfDot = document.getElementById('db-dot-etf');
+      const etfLbl = document.getElementById('db-label-etf');
+      if (d.databases.etf.status === 'ok') {
+        etfDot.className = 'db-dot';
+        etfLbl.textContent = '已连接 · etf_data.db';
+      } else {
+        etfDot.className = 'db-dot err';
+        etfLbl.textContent = '未连接 · etf_data.db';
+      }
     } else {
-      dot.className = 'db-dot err';
-      lbl.textContent = '连接失败';
+      document.getElementById('db-dot-stock').className = 'db-dot err';
+      document.getElementById('db-dot-etf').className = 'db-dot err';
+      document.getElementById('db-label-stock').textContent = '连接失败';
+      document.getElementById('db-label-etf').textContent = '连接失败';
     }
   } catch {
-    document.getElementById('db-dot').className = 'db-dot err';
-    document.getElementById('db-label').textContent = '无法连接';
+    document.getElementById('db-dot-stock').className = 'db-dot err';
+    document.getElementById('db-dot-etf').className = 'db-dot err';
+    document.getElementById('db-label-stock').textContent = '无法连接';
+    document.getElementById('db-label-etf').textContent = '无法连接';
   }
 }
 

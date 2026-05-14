@@ -51,12 +51,12 @@ class ConfigLoader:
                 "adjust_flag": "2"
             },
             "concurrency": {
-                "max_workers": 4,
+                "max_workers": 1,
                 "dynamic_concurrency": True,
-                "min_workers": 2,
-                "max_workers_limit": 5,
-                "error_threshold": 3,
-                "success_threshold": 95
+                "min_workers": 1,
+                "max_workers_limit": 2,
+                "error_threshold": 10,
+                "success_threshold": 85
             },
             "batch": {
                 "size": 50,
@@ -80,6 +80,8 @@ class ConfigLoader:
             },
             "datasource": {
                 "default": "baostock",
+                "stock_source": "baostock",
+                "etf_source": "akshare",
                 "enable_fallback": True,
                 "priority": ["baostock", "akshare"]
             },
@@ -142,5 +144,7 @@ MAX_ERRORS_BEFORE_WARNING = config_loader.get("error.max_errors_before_warning",
 
 # 数据源配置
 DEFAULT_DATA_SOURCE = config_loader.get("datasource.default", "baostock")
+STOCK_DATA_SOURCE = config_loader.get("datasource.stock_source", "baostock")
+ETF_DATA_SOURCE = config_loader.get("datasource.etf_source", "akshare")
 ENABLE_DATA_SOURCE_FALLBACK = config_loader.get("datasource.enable_fallback", True)
 DATA_SOURCE_PRIORITY = config_loader.get("datasource.priority", ["baostock"])

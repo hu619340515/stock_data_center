@@ -87,7 +87,7 @@ def safe_print(msg):
     with logging._lock:
         print(msg)
 
-def worker_update(process_id: int, stock_list: pd.DataFrame, result_queue: Queue, frequency: str = "d", stop_event=None):
+def worker_update(process_id: int, stock_list: pd.DataFrame, result_queue: Queue, frequency: str = "d", stop_event=None, asset_type: str = 'stock'):
     """
     🚀 增量更新的工作进程
     
@@ -97,16 +97,23 @@ def worker_update(process_id: int, stock_list: pd.DataFrame, result_queue: Queue
         result_queue: 结果队列
         frequency: 数据频率
         stop_event: 停止事件（跨进程共享）
+        asset_type: 资产类型 (stock 或 etf)
     """
     from data_source_factory import DataSourceFactory
-    from config import DEFAULT_DATA_SOURCE
+    from config import DEFAULT_DATA_SOURCE, ETF_DATA_SOURCE, STOCK_DATA_SOURCE
+    
+    # 根据资产类型选择数据源
+    if asset_type == 'etf':
+        data_source_type = ETF_DATA_SOURCE
+    else:
+        data_source_type = STOCK_DATA_SOURCE
     
     # 使用工厂创建数据源
-    client = DataSourceFactory.create_data_source(DEFAULT_DATA_SOURCE)
+    client = DataSourceFactory.create_data_source(data_source_type)
     client.login()
     
     # 实时显示进程启动
-    safe_print(f"🚀 [进程 {process_id}] 启动，任务量: {len(stock_list)} 只，数据源: {client.get_data_source_name()}，频率: {frequency}")
+    safe_print(f"🚀 [进程 {process_id}] 启动，任务量: {len(stock_list)} 只，资产类型: {asset_type}，数据源: {client.get_data_source_name()}，频率: {frequency}")
     
     try:
         total = len(stock_list)
@@ -150,7 +157,7 @@ def worker_update(process_id: int, stock_list: pd.DataFrame, result_queue: Queue
         client.logout()
         safe_print(f"🏁 [进程 {process_id}] 任务结束")
 
-def worker_download(process_id: int, stock_list: pd.DataFrame, start_date: str, end_date: str, result_queue: Queue, frequency: str = "d", stop_event=None):
+def worker_download(process_id: int, stock_list: pd.DataFrame, start_date: str, end_date: str, result_queue: Queue, frequency: str = "d", stop_event=None, asset_type: str = 'stock'):
     """
     🚀 全量下载的工作进程
     
@@ -162,17 +169,24 @@ def worker_download(process_id: int, stock_list: pd.DataFrame, start_date: str, 
         result_queue: 结果队列
         frequency: 数据频率
         stop_event: 停止事件（跨进程共享）
+        asset_type: 资产类型 (stock 或 etf)
     """
     from data_source_factory import DataSourceFactory
-    from config import DEFAULT_DATA_SOURCE
+    from config import DEFAULT_DATA_SOURCE, ETF_DATA_SOURCE, STOCK_DATA_SOURCE
+    
+    # 根据资产类型选择数据源
+    if asset_type == 'etf':
+        data_source_type = ETF_DATA_SOURCE
+    else:
+        data_source_type = STOCK_DATA_SOURCE
     
     # 使用工厂创建数据源
-    client = DataSourceFactory.create_data_source(DEFAULT_DATA_SOURCE)
+    client = DataSourceFactory.create_data_source(data_source_type)
     client.login()
     
     # 实时显示进程启动
-    safe_print(f"🚀 [进程 {process_id}] 启动，任务量: {len(stock_list)} 只，数据源: {client.get_data_source_name()}，频率: {frequency}")
-    logger.info(f"🚀 [进程 {process_id}] 启动，任务量: {len(stock_list)} 只，数据源: {client.get_data_source_name()}，频率: {frequency}")
+    safe_print(f"🚀 [进程 {process_id}] 启动，任务量: {len(stock_list)} 只，资产类型: {asset_type}，数据源: {client.get_data_source_name()}，频率: {frequency}")
+    logger.info(f"🚀 [进程 {process_id}] 启动，任务量: {len(stock_list)} 只，资产类型: {asset_type}，数据源: {client.get_data_source_name()}，频率: {frequency}")
     
     try:
         total = len(stock_list)
@@ -498,7 +512,7 @@ class StockDataPipeline:
         end_date = pd.Timestamp.now().strftime("%Y-%m-%d")
 
         for i, chunk in enumerate(chunks):
-            p = Process(target=worker_download, args=(i+1, chunk, START_DATE_FULL, end_date, data_queue, frequency, self.stop_event))
+            p = Process(target=worker_download, args=(i+1, chunk, START_DATE_FULL, end_date, data_queue, frequency, self.stop_event, 'stock'))
             p.start()
             processes.append(p)
         
@@ -688,7 +702,7 @@ class StockDataPipeline:
         processes: List[Process] = []
 
         for i, chunk in enumerate(chunks):
-            p = Process(target=worker_update, args=(i+1, chunk, data_queue, frequency, self.stop_event))
+            p = Process(target=worker_update, args=(i+1, chunk, data_queue, frequency, self.stop_event, 'stock'))
             p.start()
             processes.append(p)
         
@@ -840,7 +854,7 @@ class StockDataPipeline:
         end_date = pd.Timestamp.now().strftime("%Y-%m-%d")
 
         for i, chunk in enumerate(chunks):
-            p = Process(target=worker_download, args=(i+1, chunk, START_DATE_FULL_ETF, end_date, data_queue, frequency, self.stop_event))
+            p = Process(target=worker_download, args=(i+1, chunk, START_DATE_FULL_ETF, end_date, data_queue, frequency, self.stop_event, 'etf'))
             p.start()
             processes.append(p)
         
@@ -1046,7 +1060,7 @@ class StockDataPipeline:
         processes: List[Process] = []
 
         for i, chunk in enumerate(chunks):
-            p = Process(target=worker_update, args=(i+1, chunk, data_queue, frequency, self.stop_event))
+            p = Process(target=worker_update, args=(i+1, chunk, data_queue, frequency, self.stop_event, 'etf'))
             p.start()
             processes.append(p)
         
