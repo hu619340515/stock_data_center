@@ -104,6 +104,8 @@ config_loader = ConfigLoader()
 
 # 数据库配置
 DATABASE_PATH = os.path.join(PROJECT_ROOT, config_loader.get("database.path", "quant_data.db"))
+STOCK_DB_PATH = os.path.join(PROJECT_ROOT, config_loader.get("database.stock_path", "stock_data.db"))
+ETF_DB_PATH = os.path.join(PROJECT_ROOT, config_loader.get("database.etf_path", "etf_data.db"))
 
 # Baostock 配置
 BAOSTOCK_ADJUST_FLAG = config_loader.get("baostock.adjust_flag", "2")

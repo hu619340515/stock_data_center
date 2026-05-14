@@ -341,6 +341,66 @@ class DuckDBManager:
             logger.info("✅ 数据库维护完成")
         except Exception as e:
             logger.error(f"维护失败: {e}")
+    
+    def merge_from_db(self, source_db_path: str, tables: list = None) -> bool:
+        """
+        🔗 从源数据库合并数据到当前数据库
+        
+        Args:
+            source_db_path: 源数据库路径
+            tables: 要合并的表列表，None表示合并所有表
+            
+        Returns:
+            是否合并成功
+        """
+        try:
+            if not os.path.exists(source_db_path):
+                logger.error(f"源数据库不存在: {source_db_path}")
+                return False
+            
+            # 连接源数据库（只读）
+            source_con = duckdb.connect(source_db_path, read_only=True)
+            
+            # 获取要合并的表
+            if tables is None:
+                all_tables = source_con.execute("SHOW TABLES").fetchall()
+                tables = [t[0] for t in all_tables]
+            
+            merged_count = 0
+            for table in tables:
+                try:
+                    # 检查源表是否存在
+                    source_tables = source_con.execute("SHOW TABLES").fetchall()
+                    source_table_names = [t[0] for t in source_tables]
+                    if table not in source_table_names:
+                        continue
+                    
+                    # 获取源表数据
+                    source_data = source_con.execute(f"SELECT * FROM {table}").fetchdf()
+                    if source_data.empty:
+                        continue
+                    
+                    # 插入或替换到当前数据库
+                    self.con.execute(f"INSERT OR REPLACE INTO {table} SELECT * FROM source_data")
+                    merged_count += len(source_data)
+                    logger.info(f"✅ 合并表 {table}: {len(source_data)} 条记录")
+                except Exception as e:
+                    logger.warning(f"合并表 {table} 失败: {e}")
+            
+            source_con.close()
+            logger.info(f"✅ 数据库合并完成，共合并 {merged_count} 条记录")
+            return True
+            
+        except Exception as e:
+            logger.error(f"数据库合并失败: {e}")
+            return False
+    
+    def close(self):
+        """关闭数据库连接"""
+        try:
+            self.con.close()
+        except Exception:
+            pass
             
     def export_data(self, code: str, start_date: str, end_date: str, output_file: str, frequency: str = "d", format: str = "csv") -> bool:
         """

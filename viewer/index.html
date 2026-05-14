@@ -283,6 +283,17 @@
     .progress-percent {
       font-size: 14px; font-weight: 700; color: var(--primary);
     }
+    .stop-btn {
+      background: #ef4444;
+      color: white;
+      border: none;
+      padding: 4px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 12px;
+      transition: background .2s;
+    }
+    .stop-btn:hover { background: #dc2626; }
     .progress-bar {
       height: 12px; background: var(--border); border-radius: 6px;
       overflow: hidden; margin-bottom: 12px;
@@ -393,6 +404,7 @@
           <div class="progress-header">
             <span id="progress-task" class="progress-task">-</span>
             <span id="progress-percent" class="progress-percent">0%</span>
+            <button id="btn-stop" class="stop-btn" onclick="stopTask()" style="display:none;">⏹️ 停止</button>
           </div>
           <div class="progress-bar">
             <div class="progress-fill" id="progress-fill"></div>
@@ -599,9 +611,11 @@ async function loadProgress() {
   try {
     const progress = await api('/api/progress');
     const card = document.getElementById('progress-card');
+    const stopBtn = document.getElementById('btn-stop');
     
     if (progress.is_running) {
       card.style.display = 'block';
+      stopBtn.style.display = 'inline-block';
       const percent = progress.total > 0 ? Math.round((progress.processed / progress.total) * 100) : 0;
       
       document.getElementById('progress-task').textContent = progress.task_name || '-';
@@ -612,8 +626,27 @@ async function loadProgress() {
       document.getElementById('progress-eta').textContent = progress.eta ? `剩余: ${progress.eta}` : '-';
     } else {
       card.style.display = 'none';
+      stopBtn.style.display = 'none';
     }
   } catch {}
+}
+
+/* ──────── 停止任务 ───────── */
+async function stopTask() {
+  if (!confirm('确定要停止当前任务吗？停止后已下载的数据将不会合并到主数据库。')) {
+    return;
+  }
+  try {
+    const res = await api('/api/stop_task', { method: 'POST' });
+    if (res.success) {
+      toast('已发送停止信号，等待任务结束...', 'ok');
+    } else {
+      toast(res.message || '停止失败', 'fail');
+    }
+  } catch (e) {
+    toast('停止请求失败', 'fail');
+    console.error(e);
+  }
 }
 
 /* ───────── 加载数据表格 ───────── */

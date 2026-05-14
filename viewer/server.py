@@ -71,6 +71,7 @@ except ImportError as e:
 # 后台任务状态
 _task_lock = threading.Lock()
 _task_running = False
+_current_pipeline = None  # 保存当前正在运行的 pipeline 实例
 
 # ─────────────────────────────────────────────
 # 路径配置
@@ -88,13 +89,9 @@ app = Flask(__name__, static_folder=_VIEWER_DIR)
 CORS(app)
 
 
-# ═══════════════════════════════════════════════════════════
-# 数据更新/计算接口 (POST) - 后台线程执行
-# ═══════════════════════════════════════════════════════════
-
-def _run_task(func, *args):
-    """在后台线程中执行任务，避免阻塞 Flask 服务器和数据库锁定"""
-    global _task_running
+def _run_task(func, *args, use_temp_db=False, asset_type='stock'):
+    """在后台线程中执行任务，使用临时数据库避免锁定"""
+    global _task_running, _current_pipeline
     with _task_lock:
         if _task_running:
             return False, '已有任务正在运行，请等待完成'
@@ -102,13 +99,27 @@ def _run_task(func, *args):
         reset_progress()
     
     def worker():
-        global _task_running
+        global _task_running, _current_pipeline
         try:
-            func(*args)
+            pipeline = StockDataPipeline(use_temp_db=use_temp_db)
+            _current_pipeline = pipeline
+            func(pipeline, *args)
+            
+            # 任务完成，合并到主数据库
+            if use_temp_db and not pipeline.should_stop:
+                tables = None
+                if asset_type == 'stock':
+                    tables = ['stock_daily', 'stock_weekly', 'stock_monthly']
+                elif asset_type == 'etf':
+                    tables = ['etf_daily', 'etf_weekly', 'etf_monthly']
+                pipeline.merge_to_main_db(DB_PATH, tables)
         except Exception as e:
             print(f"后台任务出错: {e}")
             traceback.print_exc()
         finally:
+            if _current_pipeline:
+                _current_pipeline.cleanup_temp_db()
+                _current_pipeline = None
             with _task_lock:
                 _task_running = False
     
@@ -116,38 +127,47 @@ def _run_task(func, *args):
     t.start()
     return True, '任务已启动，请在进度条中查看'
 
+@app.route('/api/stop_task', methods=['POST'])
+def api_stop_task():
+    """停止当前正在运行的任务"""
+    global _current_pipeline
+    if _current_pipeline:
+        _current_pipeline.stop()
+        return jsonify({'success': True, 'message': '已发送停止信号'})
+    return jsonify({'success': False, 'message': '没有正在运行的任务'})
+
 @app.route('/api/daily_download', methods=['POST'])
 def api_daily_download():
     target = request.json.get('target', 'stock')
-    ok, msg = _run_task(lambda: StockDataPipeline().full_download_pipeline(f'{target}_d'))
+    ok, msg = _run_task(lambda p: p.full_download_pipeline(f'{target}_d'), use_temp_db=True, asset_type=target)
     return jsonify({'success': ok, 'message': msg})
 
 @app.route('/api/daily_to_latest', methods=['POST'])
 def api_daily_to_latest():
     target = request.json.get('target', 'stock')
-    ok, msg = _run_task(lambda: StockDataPipeline().daily_update_pipeline(f'{target}_d'))
+    ok, msg = _run_task(lambda p: p.daily_update_pipeline(f'{target}_d'), use_temp_db=True, asset_type=target)
     return jsonify({'success': ok, 'message': msg})
 
 @app.route('/api/aggregate_weekly', methods=['POST'])
 def api_aggregate_weekly():
     target = request.json.get('target', 'stock')
-    ok, msg = _run_task(lambda: StockDataPipeline().full_download_pipeline(f'{target}_w'))
+    ok, msg = _run_task(lambda p: p.full_download_pipeline(f'{target}_w'), use_temp_db=True, asset_type=target)
     return jsonify({'success': ok, 'message': msg})
 
 @app.route('/api/aggregate_monthly', methods=['POST'])
 def api_aggregate_monthly():
     target = request.json.get('target', 'stock')
-    ok, msg = _run_task(lambda: StockDataPipeline().full_download_pipeline(f'{target}_m'))
+    ok, msg = _run_task(lambda p: p.full_download_pipeline(f'{target}_m'), use_temp_db=True, asset_type=target)
     return jsonify({'success': ok, 'message': msg})
 
 @app.route('/api/etf_download', methods=['POST'])
 def api_etf_download():
-    ok, msg = _run_task(lambda: StockDataPipeline().etf_download_pipeline('d'))
+    ok, msg = _run_task(lambda p: p.etf_download_pipeline('d'), use_temp_db=True, asset_type='etf')
     return jsonify({'success': ok, 'message': msg})
 
 @app.route('/api/etf_update_latest', methods=['POST'])
 def api_etf_update_latest():
-    ok, msg = _run_task(lambda: StockDataPipeline().etf_update_pipeline('d'))
+    ok, msg = _run_task(lambda p: p.etf_update_pipeline('d'), use_temp_db=True, asset_type='etf')
     return jsonify({'success': ok, 'message': msg})
 
 

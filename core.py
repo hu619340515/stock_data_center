@@ -197,8 +197,19 @@ def worker_download(process_id: int, stock_list: pd.DataFrame, start_date: str, 
         safe_print(f"🏁 [进程 {process_id}] 任务结束")
 
 class StockDataPipeline:
-    def __init__(self):
-        self.db: DuckDBManager = DuckDBManager()
+    def __init__(self, db_path=None, use_temp_db=False):
+        self.use_temp_db = use_temp_db
+        self.temp_db_path = None
+        self.should_stop = False
+        
+        if use_temp_db:
+            import tempfile
+            self.temp_db_path = os.path.join(tempfile.gettempdir(), f"temp_stock_{int(time.time())}.db")
+            self.db: DuckDBManager = DuckDBManager(db_path=self.temp_db_path)
+            safe_print(f"📁 使用临时数据库: {self.temp_db_path}")
+        else:
+            self.db: DuckDBManager = DuckDBManager(db_path=db_path)
+        
         self.current_workers: int = MAX_WORKERS
         self.error_count: int = 0
         self.success_count: int = 0
@@ -215,6 +226,42 @@ class StockDataPipeline:
         self.data_source_priority = DATA_SOURCE_PRIORITY
         self.current_data_source_idx = 0
         self.current_data_source = self._get_next_data_source()
+    
+    def stop(self):
+        """停止当前任务"""
+        self.should_stop = True
+        safe_print("⏹️ 收到停止信号，正在停止任务...")
+    
+    def merge_to_main_db(self, main_db_path: str, tables: list = None) -> bool:
+        """将临时数据库合并到主数据库"""
+        if not self.use_temp_db or not self.temp_db_path:
+            return False
+        
+        try:
+            safe_print(f" 开始合并临时数据库到主数据库...")
+            main_db = DuckDBManager(db_path=main_db_path)
+            result = main_db.merge_from_db(self.temp_db_path, tables)
+            main_db.close()
+            
+            # 删除临时数据库
+            if os.path.exists(self.temp_db_path):
+                os.remove(self.temp_db_path)
+                safe_print(f"🗑️ 已删除临时数据库: {self.temp_db_path}")
+            
+            return result
+        except Exception as e:
+            safe_print(f"❌ 合并失败: {e}")
+            return False
+    
+    def cleanup_temp_db(self):
+        """清理临时数据库"""
+        if self.temp_db_path and os.path.exists(self.temp_db_path):
+            try:
+                self.db.close()
+                os.remove(self.temp_db_path)
+                safe_print(f"🗑️ 已清理临时数据库: {self.temp_db_path}")
+            except Exception as e:
+                safe_print(f"⚠️ 清理临时数据库失败: {e}")
     
     def _get_next_data_source(self):
         """
@@ -407,7 +454,7 @@ class StockDataPipeline:
         safe_print("👂 主进程正在后台接收数据并入库...")
         batch_buffer: List[pd.DataFrame] = []
         
-        while any(p.is_alive() for p in processes) or not data_queue.empty():
+        while (any(p.is_alive() for p in processes) or not data_queue.empty()) and not self.should_stop:
             try:
                 item = data_queue.get(timeout=0.5)
                 if item:
@@ -470,7 +517,9 @@ class StockDataPipeline:
                     self.log_error("未知", str(e))
 
         for p in processes:
-            p.join()
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=2)
 
         if batch_buffer:
             self.db.upload_batch(batch_buffer, frequency)
@@ -488,16 +537,25 @@ class StockDataPipeline:
         safe_print(f"📈 成功率: {(self.success_count / self.total_count * 100):.1f}%" if self.total_count > 0 else "📈 成功率: 0%")
         safe_print(f"⏰ 结束时间: {self.end_time.strftime('%Y-%m-%d %H:%M:%S')}")
         
-        set_progress(
-            is_running=False,
-            processed=self.total_stocks,
-            success=self.success_count,
-            error=self.error_count,
-            message='下载完成'
-        )
-        
-        safe_print(f"\n✅ 全量流水线结束 (频率: {frequency})")
-        self.db.vacuum()
+        if self.should_stop:
+            set_progress(
+                is_running=False,
+                processed=self.processed_count,
+                success=self.success_count,
+                error=self.error_count,
+                message='任务已停止'
+            )
+            safe_print(f"\n⏹️ 任务已停止 (频率: {frequency})")
+        else:
+            set_progress(
+                is_running=False,
+                processed=self.total_stocks,
+                success=self.success_count,
+                error=self.error_count,
+                message='下载完成'
+            )
+            safe_print(f"\n✅ 全量流水线结束 (频率: {frequency})")
+            self.db.vacuum()
 
     def daily_update_pipeline(self, frequency: str = "d") -> None:
         """
@@ -580,7 +638,7 @@ class StockDataPipeline:
         safe_print("👂 主进程正在后台接收数据并入库...")
         batch_buffer: List[pd.DataFrame] = []
         
-        while any(p.is_alive() for p in processes) or not data_queue.empty():
+        while (any(p.is_alive() for p in processes) or not data_queue.empty()) and not self.should_stop:
             try:
                 item = data_queue.get(timeout=0.5)
                 if item:
@@ -728,7 +786,7 @@ class StockDataPipeline:
         safe_print("👂 主进程正在后台接收数据并入库...")
         batch_buffer: List[pd.DataFrame] = []
         
-        while any(p.is_alive() for p in processes) or not data_queue.empty():
+        while (any(p.is_alive() for p in processes) or not data_queue.empty()) and not self.should_stop:
             try:
                 item = data_queue.get(timeout=0.5)
                 if item:
@@ -788,18 +846,17 @@ class StockDataPipeline:
         
         # 6. 等待所有进程结束
         for p in processes:
-            p.join()
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=2)
 
-        # 7. 写入最后剩余的数据
         if batch_buffer:
             self.db.upload_batch(batch_buffer, frequency, asset_type="etf")
 
-        # 记录结束时间
         self.end_time = pd.Timestamp.now()
         elapsed_time = (self.end_time - self.start_time).total_seconds()
         
-        # 显示统计信息
-        safe_print(f"\n📋 任务统计")
+        safe_print(f"\n 任务统计")
         safe_print(f"✅ 成功: {self.success_count} 只")
         safe_print(f"❌ 失败: {self.error_count} 只")
         safe_print(f"📊 总处理: {self.total_count} 只")
@@ -807,10 +864,13 @@ class StockDataPipeline:
         if elapsed_time > 0:
             safe_print(f"⚡ 平均速度: {self.total_count / elapsed_time:.2f} 只/秒")
         safe_print(f"📈 成功率: {(self.success_count / self.total_count * 100):.1f}%" if self.total_count > 0 else "📈 成功率: 0%")
-        safe_print(f"⏰ 结束时间: {self.end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        safe_print(f" 结束时间: {self.end_time.strftime('%Y-%m-%d %H:%M:%S')}")
         
-        safe_print(f"\n✅ ETF全量流水线结束 (频率: {frequency})")
-        self.db.vacuum()
+        if self.should_stop:
+            safe_print(f"\n⏹️ ETF任务已停止 (频率: {frequency})")
+        else:
+            safe_print(f"\n✅ ETF全量流水线结束 (频率: {frequency})")
+            self.db.vacuum()
 
     def etf_update_pipeline(self, frequency: str = "d") -> None:
         """
