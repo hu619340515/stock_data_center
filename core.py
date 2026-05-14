@@ -172,56 +172,80 @@ def worker_download(process_id: int, stock_list: pd.DataFrame, start_date: str, 
     
     # 实时显示进程启动
     safe_print(f"🚀 [进程 {process_id}] 启动，任务量: {len(stock_list)} 只，数据源: {client.get_data_source_name()}，频率: {frequency}")
+    logger.info(f"🚀 [进程 {process_id}] 启动，任务量: {len(stock_list)} 只，数据源: {client.get_data_source_name()}，频率: {frequency}")
     
     try:
         total = len(stock_list)
+        success_count = 0
+        error_count = 0
+        
         for i, (_, row) in enumerate(stock_list.iterrows()):
             # 检查停止信号
             if stop_event is not None and stop_event.is_set():
                 safe_print(f"⏹️ [进程 {process_id}] 收到停止信号，退出")
+                logger.info(f"⏹️ [进程 {process_id}] 收到停止信号，已处理 {i+1}/{total}")
                 break
             
             code = row['code']
-            name = row['code_name']
+            name = row['code_name'] if 'code_name' in row else '未知'
             
             try:
                 # 1. 直接下载完整日期范围的数据（主进程负责过滤已存在的数据）
-                safe_print(f"📥 [进程 {process_id}] 下载 {code} {start_date} 至 {end_date} 的数据 (频率: {frequency})")
+                safe_print(f"📥 [进程 {process_id}] 下载 {code} ({name}) {start_date} 至 {end_date} 的数据 (频率: {frequency})")
+                logger.info(f"📥 [进程 {process_id}] 开始下载 {code} ({name})，日期范围: {start_date} ~ {end_date}")
+                
                 df = client.get_stock_history(code, start_date, end_date, frequency)
                 
                 # 2. 将数据放入队列（供主进程入库和去重）
                 if not df.empty:
                     safe_print(f"✅ [进程 {process_id}] {code} 下载成功，数据量: {len(df)} 条")
+                    logger.info(f"✅ [进程 {process_id}] {code} 下载成功，数据量: {len(df)} 条")
                     result_queue.put((df, True, None))  # (数据, 成功标志, 错误信息)
-                    
-                    # 实时打印进度（每 10 只打印一次，或者最后一只打印，避免刷屏太快）
-                    if (i + 1) % 10 == 0 or (i + 1) == total:
-                        safe_print(f"✅ [进程 {process_id}] 进度: {i+1}/{total} (当前: {code})")
+                    success_count += 1
                 else:
                     safe_print(f"ℹ️ [进程 {process_id}] {code} 无历史数据")
+                    logger.info(f"ℹ️ [进程 {process_id}] {code} 无历史数据")
                     result_queue.put((None, True, f"{code} 无历史数据"))  # (无数据, 成功标志, 信息)
+                    success_count += 1
+                    
+                # 实时打印进度（每 10 只打印一次，或者最后一只打印，避免刷屏太快）
+                if (i + 1) % 10 == 0 or (i + 1) == total:
+                    progress = (i + 1) / total * 100
+                    safe_print(f"✅ [进程 {process_id}] 进度: {i+1}/{total} ({progress:.1f}%) (当前: {code})")
+                    logger.info(f"📊 [进程 {process_id}] 进度: {i+1}/{total} ({progress:.1f}%)，成功: {success_count}，失败: {error_count}")
                     
             except Exception as e:
                 error_msg = str(e)
                 safe_print(f"❌ [进程 {process_id}] {code} 下载异常: {error_msg}")
+                logger.error(f"❌ [进程 {process_id}] {code} 下载异常: {error_msg}")
                 result_queue.put((None, False, error_msg))  # (异常, 失败标志, 错误信息)
+                error_count += 1
+                
     finally:
         client.logout()
-        safe_print(f"🏁 [进程 {process_id}] 任务结束")
+        safe_print(f"🏁 [进程 {process_id}] 任务结束，成功: {success_count}，失败: {error_count}")
+        logger.info(f"🏁 [进程 {process_id}] 任务结束，成功: {success_count}，失败: {error_count}")
 
 class StockDataPipeline:
-    def __init__(self, db_path=None, use_temp_db=False):
+    def __init__(self, db_path=None, use_temp_db=False, asset_type='stock'):
         self.use_temp_db = use_temp_db
         self.temp_db_path = None
         self.should_stop = False
         self.stop_event = Event()
+        self.asset_type = asset_type
         
         if use_temp_db:
             import tempfile
-            self.temp_db_path = os.path.join(tempfile.gettempdir(), f"temp_stock_{int(time.time())}.db")
+            self.temp_db_path = os.path.join(tempfile.gettempdir(), f"temp_{asset_type}_{int(time.time())}.db")
             self.db: DuckDBManager = DuckDBManager(db_path=self.temp_db_path)
             safe_print(f"📁 使用临时数据库: {self.temp_db_path}")
         else:
+            # 根据资产类型选择数据库路径
+            if not db_path:
+                if asset_type == 'etf':
+                    db_path = ETF_DB_PATH
+                else:
+                    db_path = STOCK_DB_PATH
             self.db: DuckDBManager = DuckDBManager(db_path=db_path)
         
         self.current_workers: int = MAX_WORKERS
@@ -253,19 +277,31 @@ class StockDataPipeline:
             return False
         
         try:
-            safe_print(f" 开始合并临时数据库到主数据库...")
+            safe_print(f"🔄 开始合并临时数据库到主数据库...")
+            logger.info(f"📊 合并源: {self.temp_db_path}")
+            logger.info(f"📊 合并目标: {main_db_path}")
+            logger.info(f"📊 合并表: {tables}")
+            
+            # 首先关闭临时数据库连接，避免连接冲突
+            self.db.close()
+            safe_print(f"✅ 已关闭临时数据库连接")
+            
+            # 连接主数据库进行合并
             main_db = DuckDBManager(db_path=main_db_path)
             result = main_db.merge_from_db(self.temp_db_path, tables)
             main_db.close()
+            safe_print(f"✅ 主数据库合并完成")
             
             # 删除临时数据库
             if os.path.exists(self.temp_db_path):
                 os.remove(self.temp_db_path)
                 safe_print(f"🗑️ 已删除临时数据库: {self.temp_db_path}")
             
+            logger.info(f"✅ 数据库合并成功")
             return result
         except Exception as e:
             safe_print(f"❌ 合并失败: {e}")
+            logger.error(f"❌ 数据库合并失败: {e}")
             return False
     
     def cleanup_temp_db(self):
@@ -773,6 +809,7 @@ class StockDataPipeline:
         all_etfs = self._try_get_etf_list()
 
         self.total_stocks = len(all_etfs)
+        set_progress(total=self.total_stocks)  # 更新进度状态中的总数
         
         # 2. 断点续传 - 不再跳过已有的ETF，而是下载每只ETF的缺失数据
         existing_codes = self.db.get_finished_stocks(frequency, asset_type="etf")
@@ -846,16 +883,26 @@ class StockDataPipeline:
                     if self.error_count % MAX_ERRORS_BEFORE_WARNING == 0 and self.error_count > 0:
                         safe_print(f"⚠️ 已累计 {self.error_count} 个错误，请检查网络连接和API状态")
                     
+                    # 计算进度并更新状态
+                    elapsed = time.time() - _progress_state['start_time'] if _progress_state['start_time'] else 1
+                    speed = self.processed_count / elapsed if elapsed > 0 else 0
+                    remaining = (self.total_stocks - self.processed_count) / speed if speed > 0 else 0
+                    eta_str = f"{int(remaining)}秒" if remaining > 0 else "完成"
+                    
+                    # 更新进度状态（供前端显示）
+                    set_progress(
+                        processed=self.processed_count,
+                        success=self.success_count,
+                        error=self.error_count,
+                        speed=round(speed, 1),
+                        eta=eta_str,
+                        message=f"{self.processed_count}/{self.total_stocks}"
+                    )
+                    
                     # 显示详细进度
                     if self.total_count % 10 == 0 or self.total_count == self.total_stocks:
-                        elapsed_time = (pd.Timestamp.now() - self.start_time).total_seconds()
-                        if elapsed_time > 0:
-                            speed = self.processed_count / elapsed_time  # ETF/秒
-                            estimated_total = self.total_stocks / speed if speed > 0 else 0
-                            remaining = estimated_total - elapsed_time
-                            
-                            progress_percent = (self.processed_count / self.total_stocks) * 100
-                            safe_print(f"📊 进度: {self.processed_count}/{self.total_stocks} ({progress_percent:.1f}%) | 速度: {speed:.2f} 只/秒 | 剩余: {remaining:.0f} 秒")
+                        progress_percent = (self.processed_count / self.total_stocks) * 100
+                        safe_print(f"📊 进度: {self.processed_count}/{self.total_stocks} ({progress_percent:.1f}%) | 速度: {speed:.2f} 只/秒 | 剩余: {remaining:.0f} 秒")
                     
                     # 批量入库
                     if len(batch_buffer) >= self.current_batch_size:
@@ -892,8 +939,22 @@ class StockDataPipeline:
         safe_print(f" 结束时间: {self.end_time.strftime('%Y-%m-%d %H:%M:%S')}")
         
         if self.should_stop:
+            set_progress(
+                is_running=False,
+                processed=self.processed_count,
+                success=self.success_count,
+                error=self.error_count,
+                message='任务已停止'
+            )
             safe_print(f"\n⏹️ ETF任务已停止 (频率: {frequency})")
         else:
+            set_progress(
+                is_running=False,
+                processed=self.total_stocks,
+                success=self.success_count,
+                error=self.error_count,
+                message='下载完成'
+            )
             safe_print(f"\n✅ ETF全量流水线结束 (频率: {frequency})")
             self.db.vacuum()
 
@@ -904,6 +965,10 @@ class StockDataPipeline:
         Args:
             frequency: 数据频率
         """
+        # 初始化进度条
+        reset_progress()
+        set_progress(is_running=True, task_name=f"增量更新ETF({frequency})", start_time=time.time())
+        
         # 记录开始时间
         self.start_time = pd.Timestamp.now()
         self.end_time = None
@@ -957,6 +1022,7 @@ class StockDataPipeline:
         etfs['end_date'] = end_dates
 
         self.total_stocks = len(etfs)
+        set_progress(total=self.total_stocks)  # 更新进度状态中的总数
         safe_print(f"📋 待处理ETF数量: {self.total_stocks} 只")
         
         if self.total_stocks == 0:
@@ -1023,16 +1089,26 @@ class StockDataPipeline:
                     if self.error_count % MAX_ERRORS_BEFORE_WARNING == 0 and self.error_count > 0:
                         safe_print(f"⚠️ 已累计 {self.error_count} 个错误，请检查网络连接和API状态")
                     
+                    # 计算进度并更新状态
+                    elapsed = time.time() - _progress_state['start_time'] if _progress_state['start_time'] else 1
+                    speed = self.processed_count / elapsed if elapsed > 0 else 0
+                    remaining = (self.total_stocks - self.processed_count) / speed if speed > 0 else 0
+                    eta_str = f"{int(remaining)}秒" if remaining > 0 else "完成"
+                    
+                    # 更新进度状态（供前端显示）
+                    set_progress(
+                        processed=self.processed_count,
+                        success=self.success_count,
+                        error=self.error_count,
+                        speed=round(speed, 1),
+                        eta=eta_str,
+                        message=f"{self.processed_count}/{self.total_stocks}"
+                    )
+                    
                     # 显示详细进度
                     if self.total_count % 10 == 0 or self.total_count == self.total_stocks:
-                        elapsed_time = (pd.Timestamp.now() - self.start_time).total_seconds()
-                        if elapsed_time > 0:
-                            speed = self.processed_count / elapsed_time  # ETF/秒
-                            estimated_total = self.total_stocks / speed if speed > 0 else 0
-                            remaining = estimated_total - elapsed_time
-                            
-                            progress_percent = (self.processed_count / self.total_stocks) * 100
-                            safe_print(f"📊 进度: {self.processed_count}/{self.total_stocks} ({progress_percent:.1f}%) | 速度: {speed:.2f} 只/秒 | 剩余: {remaining:.0f} 秒")
+                        progress_percent = (self.processed_count / self.total_stocks) * 100
+                        safe_print(f"📊 进度: {self.processed_count}/{self.total_stocks} ({progress_percent:.1f}%) | 速度: {speed:.2f} 只/秒 | 剩余: {remaining:.0f} 秒")
                     
                     # 批量入库
                     if len(batch_buffer) >= self.current_batch_size:
@@ -1065,5 +1141,14 @@ class StockDataPipeline:
             safe_print(f"⚡ 平均速度: {self.total_count / elapsed_time:.2f} 只/秒")
         safe_print(f"📈 成功率: {(self.success_count / self.total_count * 100):.1f}%" if self.total_count > 0 else "📈 成功率: 0%")
         safe_print(f"⏰ 结束时间: {self.end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        # 更新进度状态为完成
+        set_progress(
+            is_running=False,
+            processed=self.total_stocks,
+            success=self.success_count,
+            error=self.error_count,
+            message='更新完成'
+        )
         
         safe_print(f"\n✅ ETF增量流水线结束 (频率: {frequency})")

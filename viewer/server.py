@@ -79,11 +79,13 @@ _current_pipeline = None  # 保存当前正在运行的 pipeline 实例
 _VIEWER_DIR   = os.path.abspath(os.path.dirname(__file__))
 _PROJECT_ROOT = os.path.abspath(os.path.join(_VIEWER_DIR, '..'))
 
-# 优先读环境变量，其次自动定位项目根目录的 quant_data.db
-DB_PATH = os.environ.get(
-    'DB_PATH',
-    os.path.join(_PROJECT_ROOT, 'quant_data.db')
-)
+# 数据库路径配置
+STOCK_DB_PATH = os.path.join(_PROJECT_ROOT, 'stock_data.db')
+ETF_DB_PATH = os.path.join(_PROJECT_ROOT, 'etf_data.db')
+DEFAULT_DB_PATH = STOCK_DB_PATH  # 默认使用股票数据库
+
+# 优先读环境变量
+DB_PATH = os.environ.get('DB_PATH', DEFAULT_DB_PATH)
 
 app = Flask(__name__, static_folder=_VIEWER_DIR)
 CORS(app)
@@ -98,10 +100,13 @@ def _run_task(func, *args, use_temp_db=False, asset_type='stock'):
         _task_running = True
         reset_progress()
     
+    # 根据资产类型选择目标数据库路径
+    target_db_path = os.path.join(_PROJECT_ROOT, 'stock_data.db') if asset_type == 'stock' else os.path.join(_PROJECT_ROOT, 'etf_data.db')
+    
     def worker():
         global _task_running, _current_pipeline
         try:
-            pipeline = StockDataPipeline(use_temp_db=use_temp_db)
+            pipeline = StockDataPipeline(use_temp_db=use_temp_db, asset_type=asset_type)
             _current_pipeline = pipeline
             func(pipeline, *args)
             
@@ -112,7 +117,7 @@ def _run_task(func, *args, use_temp_db=False, asset_type='stock'):
                     tables = ['stock_daily', 'stock_weekly', 'stock_monthly']
                 elif asset_type == 'etf':
                     tables = ['etf_daily', 'etf_weekly', 'etf_monthly']
-                pipeline.merge_to_main_db(DB_PATH, tables)
+                pipeline.merge_to_main_db(target_db_path, tables)
         except Exception as e:
             print(f"后台任务出错: {e}")
             traceback.print_exc()

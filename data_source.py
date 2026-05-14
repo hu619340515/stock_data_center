@@ -282,12 +282,15 @@ class AKShareClient(DataSourceInterface):
         if is_etf:
             # ETF改用新浪财经数据源，更稳定
             logger.info(f"📥 [新浪财经] 获取ETF {code} 数据: {start_date_fund} ~ {end_date_fund}")
+            # 新浪接口需要带市场前缀的代码，如sh513310
+            sina_symbol = code.replace('.', '')
             df = ak.fund_etf_hist_sina(
-                symbol=pure_code,
-                start_date=start_date_fund,
-                end_date=end_date_fund,
-                adjust="hfq"
+                symbol=sina_symbol
             )
+            # 新浪接口不支持日期参数，获取全部数据后过滤
+            if not df.empty:
+                df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
+                df = df[(df['date'] >= start_date_fund) & (df['date'] <= end_date_fund)]
         else:
             # 股票保留原有的东方财富A股接口
             logger.info(f"📥 [AKShare] 获取股票 {code} 数据: {start_date_stock} ~ {end_date_stock}")
@@ -324,9 +327,12 @@ class AKShareClient(DataSourceInterface):
                 "amount": "amount"
             }
             # 新浪接口没有这些字段，补充默认值
-            df['pct_chg'] = 0.0
-            df['chg'] = 0.0
-            df['turnover'] = 0.0
+            df['preclose'] = 0.0
+            df['adjustflag'] = ""
+            df['turn'] = 0.0
+            df['tradestatus'] = "1"
+            df['pctChg'] = 0.0
+            df['isST'] = "0"
         else:
             # 东方财富股票字段映射
             rename_dict = {
@@ -338,17 +344,27 @@ class AKShareClient(DataSourceInterface):
                 "前收盘": "preclose",
                 "成交量": "volume",
                 "成交额": "amount",
-                "涨跌幅": "pct_chg",
-                "涨跌额": "chg",
-                "换手率": "turnover"
+                "调整标志": "adjustflag",
+                "换手率": "turn",
+                "交易状态": "tradestatus",
+                "涨跌幅": "pctChg",
+                "是否ST": "isST"
             }
             # 处理可能缺少的字段
-            for col in ["preclose", "turnover"]:
+            for col in ["preclose", "adjustflag", "turn", "tradestatus", "pctChg", "isST"]:
                 if col not in df.columns:
-                    df[col] = 0.0
+                    if col in ["preclose", "turn", "pctChg"]:
+                        df[col] = 0.0
+                    elif col == "adjustflag":
+                        df[col] = ""
+                    elif col == "tradestatus":
+                        df[col] = "1"
+                    elif col == "isST":
+                        df[col] = "0"
         
         df.rename(columns=rename_dict, inplace=True)
-        return df[['code', 'date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg', 'chg', 'turnover']]
+        logger.info(f"📤 {code} 数据列: {df.columns.tolist()}")
+        return df[['code', 'date', 'open', 'high', 'low', 'close', 'preclose', 'volume', 'amount', 'adjustflag', 'turn', 'tradestatus', 'pctChg', 'isST']]
     
     def get_data_source_name(self) -> str:
         """
