@@ -8,9 +8,9 @@ baostock:
 
 # 并发与性能配置
 concurrency:
-  max_workers: 3  # 新浪接口请求频繁会被限制，调小并发数
+  max_workers: 10  # 新浪接口请求频繁会被限制，调小并发数
   dynamic_concurrency: true  # 是否启用动态并发控制，true表示根据错误率和成功率自动调整进程数
-  min_workers: 1  # 最小并发进程数，当错误率过高时会减少到此值
+  min_workers: 3  # 最小并发进程数，当错误率过高时会减少到此值
   max_workers_limit: 10  # 最大并发进程数限制，动态调整时不会超过此值
   error_threshold: 3  # 错误率阈值(%)，当错误率超过此值时自动减少进程数
   success_threshold: 95  # 成功率阈值(%)，当成功率超过此值时自动增加进程数
