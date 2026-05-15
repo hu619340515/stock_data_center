@@ -143,7 +143,9 @@ def worker_update(process_id: int, stock_list: pd.DataFrame, result_queue: Queue
                     
                     # 5. 将数据放入队列（供主进程入库和去重）
                     if not df.empty:
-                        safe_print(f"✅ [进程 {process_id}] {code} 增量更新成功，数据量: {len(df)} 条")
+                        # 添加名称字段
+                        df['name'] = row['code_name']
+                        safe_print(f"✅ [进程 {process_id}] {code} ({row['code_name']}) 增量更新成功，数据量: {len(df)} 条")
                         result_queue.put((df, True, None))  # (数据, 成功标志, 错误信息)
                     else:
                         safe_print(f"️ [进程 {process_id}] {code} 无新数据")
@@ -226,8 +228,10 @@ def worker_download(process_id: int, stock_list: pd.DataFrame, start_date: str, 
                 
                 # 2. 将数据放入队列（供主进程入库和去重）
                 if not df.empty:
-                    safe_print(f"✅ [进程 {process_id}] {code} 下载成功，数据量: {len(df)} 条")
-                    logger.info(f"✅ [进程 {process_id}] {code} 下载成功，数据量: {len(df)} 条")
+                    # 添加名称字段
+                    df['name'] = row['code_name']
+                    safe_print(f"✅ [进程 {process_id}] {code} ({row['code_name']}) 下载成功，数据量: {len(df)} 条")
+                    logger.info(f"✅ [进程 {process_id}] {code} ({row['code_name']}) 下载成功，数据量: {len(df)} 条")
                     result_queue.put((df, True, None))  # (数据, 成功标志, 错误信息)
                     success_count += 1
                 else:
@@ -499,6 +503,9 @@ class StockDataPipeline:
         self.total_stocks = len(all_stocks)
         set_progress(total=self.total_stocks)
         
+        # 保存股票名称到数据库
+        self.db.save_asset_info(all_stocks, asset_type="stock")
+        
         existing_codes = self.db.get_finished_stocks(frequency)
         safe_print(f"ℹ️ 数据库中已有 {len(existing_codes)} 只股票，将检查每只股票的缺失数据。")
         
@@ -767,6 +774,9 @@ class StockDataPipeline:
         safe_print(f"⏰ 开始时间: {self.start_time.strftime('%Y-%m-%d %H:%M:%S')}")
         
         stocks = self._try_get_stock_list()
+        
+        # 保存股票名称到数据库
+        self.db.save_asset_info(stocks, asset_type="stock")
 
         safe_print("📅 计算每只股票的更新日期范围...")
         start_dates = []
@@ -1047,6 +1057,9 @@ class StockDataPipeline:
         self.total_stocks = len(all_etfs)
         set_progress(total=self.total_stocks)  # 更新进度状态中的总数
         
+        # 保存ETF名称到数据库
+        self.db.save_asset_info(all_etfs, asset_type="etf")
+        
         # 2. 断点续传 - 不再跳过已有的ETF，而是下载每只ETF的缺失数据
         existing_codes = self.db.get_finished_stocks(frequency, asset_type="etf")
         safe_print(f"ℹ️ 数据库中已有 {len(existing_codes)} 只ETF，将检查每只ETF的缺失数据。")
@@ -1075,8 +1088,9 @@ class StockDataPipeline:
         processes: List[Process] = []
         end_date = pd.Timestamp.now().strftime("%Y-%m-%d")
 
+        heartbeat_queue: Optional[Queue] = Queue() if ENABLE_PROCESS_REVIVE else None
         for i, chunk in enumerate(chunks):
-            p = Process(target=worker_download, args=(i+1, chunk, START_DATE_FULL_ETF, end_date, data_queue, frequency, self.stop_event, 'etf'))
+            p = Process(target=worker_download, args=(i+1, chunk, START_DATE_FULL_ETF, end_date, data_queue, heartbeat_queue, frequency, self.stop_event, 'etf'))
             p.start()
             processes.append(p)
         
@@ -1218,6 +1232,9 @@ class StockDataPipeline:
         
         # 1. 获取ETF列表（自动尝试所有数据源）
         etfs = self._try_get_etf_list()
+        
+        # 保存ETF名称到数据库
+        self.db.save_asset_info(etfs, asset_type="etf")
 
         # 2. 计算每只ETF的开始日期和结束日期
         safe_print("📅 计算每只ETF的更新日期范围...")

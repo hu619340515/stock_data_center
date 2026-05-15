@@ -22,6 +22,7 @@ class DuckDBManager:
         daily_sql = """
         CREATE TABLE IF NOT EXISTS stock_daily (
             code VARCHAR,
+            name VARCHAR,
             date DATE,
             open DOUBLE,
             high DOUBLE,
@@ -39,11 +40,14 @@ class DuckDBManager:
         )
         """
         self.con.execute(daily_sql)
+        # 兼容已有表，添加name字段（如果不存在）
+        self.con.execute("ALTER TABLE stock_daily ADD COLUMN IF NOT EXISTS name VARCHAR")
         
         # 创建周线表
         weekly_sql = """
         CREATE TABLE IF NOT EXISTS stock_weekly (
             code VARCHAR,
+            name VARCHAR,
             date DATE,
             open DOUBLE,
             high DOUBLE,
@@ -61,11 +65,14 @@ class DuckDBManager:
         )
         """
         self.con.execute(weekly_sql)
+        # 兼容已有表，添加name字段（如果不存在）
+        self.con.execute("ALTER TABLE stock_weekly ADD COLUMN IF NOT EXISTS name VARCHAR")
         
         # 创建月线表
         monthly_sql = """
         CREATE TABLE IF NOT EXISTS stock_monthly (
             code VARCHAR,
+            name VARCHAR,
             date DATE,
             open DOUBLE,
             high DOUBLE,
@@ -83,6 +90,28 @@ class DuckDBManager:
         )
         """
         self.con.execute(monthly_sql)
+        # 兼容已有表，添加name字段（如果不存在）
+        self.con.execute("ALTER TABLE stock_monthly ADD COLUMN IF NOT EXISTS name VARCHAR")
+        
+        # 创建股票基本信息表
+        stock_info_sql = """
+        CREATE TABLE IF NOT EXISTS stock_info (
+            code VARCHAR PRIMARY KEY,
+            name VARCHAR,
+            update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+        self.con.execute(stock_info_sql)
+        
+        # 创建ETF基本信息表
+        etf_info_sql = """
+        CREATE TABLE IF NOT EXISTS etf_info (
+            code VARCHAR PRIMARY KEY,
+            name VARCHAR,
+            update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+        self.con.execute(etf_info_sql)
         
         # ✅ 优化：手动创建索引以加速查询
         # 如果索引已存在，IGNORE 会避免报错
@@ -90,6 +119,7 @@ class DuckDBManager:
         etf_daily_sql = """
         CREATE TABLE IF NOT EXISTS etf_daily (
             code VARCHAR,
+            name VARCHAR,
             date DATE,
             open DOUBLE,
             high DOUBLE,
@@ -107,11 +137,14 @@ class DuckDBManager:
         )
         """
         self.con.execute(etf_daily_sql)
+        # 兼容已有表，添加name字段（如果不存在）
+        self.con.execute("ALTER TABLE etf_daily ADD COLUMN IF NOT EXISTS name VARCHAR")
         
         # 创建ETF周线表
         etf_weekly_sql = """
         CREATE TABLE IF NOT EXISTS etf_weekly (
             code VARCHAR,
+            name VARCHAR,
             date DATE,
             open DOUBLE,
             high DOUBLE,
@@ -129,11 +162,14 @@ class DuckDBManager:
         )
         """
         self.con.execute(etf_weekly_sql)
+        # 兼容已有表，添加name字段（如果不存在）
+        self.con.execute("ALTER TABLE etf_weekly ADD COLUMN IF NOT EXISTS name VARCHAR")
         
         # 创建ETF月线表
         etf_monthly_sql = """
         CREATE TABLE IF NOT EXISTS etf_monthly (
             code VARCHAR,
+            name VARCHAR,
             date DATE,
             open DOUBLE,
             high DOUBLE,
@@ -151,6 +187,8 @@ class DuckDBManager:
         )
         """
         self.con.execute(etf_monthly_sql)
+        # 兼容已有表，添加name字段（如果不存在）
+        self.con.execute("ALTER TABLE etf_monthly ADD COLUMN IF NOT EXISTS name VARCHAR")
         
         # ✅ 优化：手动创建索引以加速查询
         # 如果索引已存在，IGNORE 会避免报错
@@ -342,6 +380,28 @@ class DuckDBManager:
         except Exception as e:
             logger.error(f"维护失败: {e}")
     
+    def save_asset_info(self, df: pd.DataFrame, asset_type: str = "stock") -> bool:
+        """
+        保存股票/ETF基本信息（代码和名称）
+        """
+        if df.empty or 'code' not in df.columns or 'code_name' not in df.columns:
+            return False
+        
+        try:
+            table_name = "stock_info" if asset_type == "stock" else "etf_info"
+            # 准备数据
+            df_save = df[['code', 'code_name']].copy()
+            df_save = df_save.rename(columns={'code_name': 'name'})
+            df_save['update_time'] = pd.Timestamp.now()
+            
+            # 插入或替换
+            self.con.execute(f"INSERT OR REPLACE INTO {table_name} SELECT * FROM df_save")
+            logger.info(f"✅ 保存{len(df_save)}条{asset_type}基本信息成功")
+            return True
+        except Exception as e:
+            logger.error(f"❌ 保存{asset_type}基本信息失败: {e}")
+            return False
+            
     def merge_from_db(self, source_db_path: str, tables: list = None) -> bool:
         """
         🔗 从源数据库合并数据到当前数据库
