@@ -142,6 +142,11 @@ RETRY_BACKOFF_FACTOR = config_loader.get("retry.retry_backoff_factor", 2)
 ERROR_LOG_FILE = config_loader.get("error.log_file", "error_log.txt")
 MAX_ERRORS_BEFORE_WARNING = config_loader.get("error.max_errors_before_warning", 10)
 
+# 进程监控与复活配置
+ENABLE_PROCESS_REVIVE = config_loader.get("process_monitor.enable_revive", True)
+PROCESS_HEARTBEAT_TIMEOUT = config_loader.get("process_monitor.heartbeat_timeout", 120)  # 进程心跳超时时间(秒)，超过则认为进程卡住
+PROCESS_MAX_REVIVE_TIMES = config_loader.get("process_monitor.max_revive_times", 3)  # 单个进程最大复活次数
+
 # 数据源配置
 DEFAULT_DATA_SOURCE = config_loader.get("datasource.default", "baostock")
 STOCK_DATA_SOURCE = config_loader.get("datasource.stock_source", "baostock")

@@ -5,7 +5,7 @@ import logging # ✅ 单独导入标准 logging 模块
 from typing import List, Tuple, Optional, Set, Any
 from database import DuckDBManager
 from data_source_factory import DataSourceFactory
-from config import MAX_WORKERS, START_DATE_FULL, START_DATE_FULL_ETF, DYNAMIC_CONCURRENCY, MIN_WORKERS, MAX_WORKERS_LIMIT, ERROR_THRESHOLD, SUCCESS_THRESHOLD, BATCH_SIZE, MAX_BATCH_SIZE, MIN_BATCH_SIZE, MEMORY_THRESHOLD, USE_ARROW, COMPRESS_DATA, ERROR_LOG_FILE, MAX_ERRORS_BEFORE_WARNING, DEFAULT_DATA_SOURCE, ENABLE_DATA_SOURCE_FALLBACK, DATA_SOURCE_PRIORITY
+from config import MAX_WORKERS, START_DATE_FULL, START_DATE_FULL_ETF, DYNAMIC_CONCURRENCY, MIN_WORKERS, MAX_WORKERS_LIMIT, ERROR_THRESHOLD, SUCCESS_THRESHOLD, BATCH_SIZE, MAX_BATCH_SIZE, MIN_BATCH_SIZE, MEMORY_THRESHOLD, USE_ARROW, COMPRESS_DATA, ERROR_LOG_FILE, MAX_ERRORS_BEFORE_WARNING, DEFAULT_DATA_SOURCE, ENABLE_DATA_SOURCE_FALLBACK, DATA_SOURCE_PRIORITY, ENABLE_PROCESS_REVIVE, PROCESS_HEARTBEAT_TIMEOUT, PROCESS_MAX_REVIVE_TIMES
 import threading
 import time
 
@@ -87,7 +87,7 @@ def safe_print(msg):
     with logging._lock:
         print(msg)
 
-def worker_update(process_id: int, stock_list: pd.DataFrame, result_queue: Queue, frequency: str = "d", stop_event=None, asset_type: str = 'stock'):
+def worker_update(process_id: int, stock_list: pd.DataFrame, result_queue: Queue, heartbeat_queue: Optional[Queue] = None, frequency: str = "d", stop_event=None, asset_type: str = 'stock'):
     """
     🚀 增量更新的工作进程
     
@@ -123,6 +123,13 @@ def worker_update(process_id: int, stock_list: pd.DataFrame, result_queue: Queue
                 safe_print(f"️ [进程 {process_id}] 收到停止信号，退出")
                 break
             
+            # 发送心跳
+            if heartbeat_queue is not None:
+                try:
+                    heartbeat_queue.put((process_id, time.time(), i+1, len(stock_list)))
+                except:
+                    pass  # 心跳发送失败不影响主流程
+            
             code = row['code']
             # 从row中获取开始日期和结束日期
             start_date = row.get('start_date', '1999-01-01')
@@ -157,7 +164,7 @@ def worker_update(process_id: int, stock_list: pd.DataFrame, result_queue: Queue
         client.logout()
         safe_print(f"🏁 [进程 {process_id}] 任务结束")
 
-def worker_download(process_id: int, stock_list: pd.DataFrame, start_date: str, end_date: str, result_queue: Queue, frequency: str = "d", stop_event=None, asset_type: str = 'stock'):
+def worker_download(process_id: int, stock_list: pd.DataFrame, start_date: str, end_date: str, result_queue: Queue, heartbeat_queue: Optional[Queue] = None, frequency: str = "d", stop_event=None, asset_type: str = 'stock'):
     """
     🚀 全量下载的工作进程
     
@@ -199,6 +206,13 @@ def worker_download(process_id: int, stock_list: pd.DataFrame, start_date: str, 
                 safe_print(f"⏹️ [进程 {process_id}] 收到停止信号，退出")
                 logger.info(f"⏹️ [进程 {process_id}] 收到停止信号，已处理 {i+1}/{total}")
                 break
+            
+            # 发送心跳
+            if heartbeat_queue is not None:
+                try:
+                    heartbeat_queue.put((process_id, time.time(), i+1, total))
+                except:
+                    pass  # 心跳发送失败不影响主流程
             
             code = row['code']
             name = row['code_name'] if 'code_name' in row else '未知'
@@ -508,20 +522,113 @@ class StockDataPipeline:
         chunks = [c for c in chunks if not c.empty]
         
         data_queue: Queue = Queue()
+        heartbeat_queue: Optional[Queue] = Queue() if ENABLE_PROCESS_REVIVE else None
         processes: List[Process] = []
+        process_chunks: List[pd.DataFrame] = chunks.copy()  # 保存每个进程对应的任务块
+        process_revive_counts: List[int] = [0] * len(chunks)  # 记录每个进程的复活次数
+        process_last_heartbeat: List[float] = [time.time()] * len(chunks)  # 记录每个进程最后心跳时间
+        process_current_progress: List[Tuple[int, int]] = [(0, len(c)) for c in chunks]  # 记录每个进程当前进度(已处理, 总数)
         end_date = pd.Timestamp.now().strftime("%Y-%m-%d")
 
         for i, chunk in enumerate(chunks):
-            p = Process(target=worker_download, args=(i+1, chunk, START_DATE_FULL, end_date, data_queue, frequency, self.stop_event, 'stock'))
+            p = Process(target=worker_download, args=(i+1, chunk, START_DATE_FULL, end_date, data_queue, heartbeat_queue, frequency, self.stop_event, 'stock'))
             p.start()
             processes.append(p)
         
         safe_print("👂 主进程正在后台接收数据并入库...")
         batch_buffer: List[pd.DataFrame] = []
         
-        while (any(p.is_alive() for p in processes) or not data_queue.empty()) and not self.should_stop:
+        # 使用更可靠的退出条件：所有进程结束 + 队列处理完毕 + 进度达标
+        while not self.should_stop:
+            # 检查是否所有进程都已结束
+            all_processes_done = not any(p.is_alive() for p in processes)
+            
+            # 进度达标判断：如果已经处理的数量 >= 总任务数，说明所有任务都完成了
+            progress_reached = self.processed_count >= self.total_stocks
+            
+            # 如果所有进程都结束了 或者 进度已经达标，再等待队列清空
+            if (all_processes_done or progress_reached) and data_queue.empty():
+                # 再等待一小段时间，确保没有遗漏的数据
+                time.sleep(0.5)
+                if data_queue.empty():
+                    safe_print("\n✅ 所有任务已完成，队列已清空")
+                    # 强制终止所有还活着的进程
+                    for p in processes:
+                        if p.is_alive():
+                            p.terminate()
+                            p.join(timeout=2)
+                    break
+            
+            # 进程监控与复活逻辑
+            if ENABLE_PROCESS_REVIVE and heartbeat_queue is not None:
+                # 处理心跳队列
+                while not heartbeat_queue.empty():
+                    try:
+                        process_id, heartbeat_time, processed, total = heartbeat_queue.get_nowait()
+                        idx = process_id - 1
+                        if 0 <= idx < len(processes):
+                            process_last_heartbeat[idx] = heartbeat_time
+                            process_current_progress[idx] = (processed, total)
+                    except:
+                        pass
+                
+                # 检查每个进程的状态
+                current_time = time.time()
+                for idx, p in enumerate(processes):
+                    process_id = idx + 1
+                    
+                    # 检查进程是否还活着
+                    if not p.is_alive():
+                        exit_code = p.exitcode
+                        if exit_code != 0 and process_revive_counts[idx] < PROCESS_MAX_REVIVE_TIMES:
+                            # 进程异常退出，尝试复活
+                            process_revive_counts[idx] += 1
+                            safe_print(f"🔄 [进程 {process_id}] 异常退出(退出码: {exit_code})，尝试第 {process_revive_counts[idx]} 次复活...")
+                            logger.warning(f"进程 {process_id} 异常退出，正在复活 (第 {process_revive_counts[idx]} 次)")
+                            
+                            # 获取剩余未处理的任务
+                            processed, total = process_current_progress[idx]
+                            remaining_chunk = process_chunks[idx].iloc[processed:]
+                            
+                            if not remaining_chunk.empty:
+                                # 重启进程，只处理剩余的任务
+                                new_p = Process(target=worker_download, args=(process_id, remaining_chunk, START_DATE_FULL, end_date, data_queue, heartbeat_queue, frequency, self.stop_event, 'stock'))
+                                new_p.start()
+                                processes[idx] = new_p
+                                process_last_heartbeat[idx] = current_time
+                                safe_print(f"✅ [进程 {process_id}] 复活成功，剩余任务: {len(remaining_chunk)} 只")
+                            else:
+                                safe_print(f"ℹ️ [进程 {process_id}] 没有剩余任务，无需复活")
+                        continue
+                    
+                    # 检查心跳是否超时
+                    time_since_last_heartbeat = current_time - process_last_heartbeat[idx]
+                    if time_since_last_heartbeat > PROCESS_HEARTBEAT_TIMEOUT and process_revive_counts[idx] < PROCESS_MAX_REVIVE_TIMES:
+                        # 进程心跳超时，认为卡住，强制终止并复活
+                        process_revive_counts[idx] += 1
+                        safe_print(f"⚠️ [进程 {process_id}] 心跳超时({time_since_last_heartbeat:.0f}秒)，已卡住，尝试第 {process_revive_counts[idx]} 次复活...")
+                        logger.warning(f"进程 {process_id} 心跳超时，正在复活 (第 {process_revive_counts[idx]} 次)")
+                        
+                        # 强制终止进程
+                        p.terminate()
+                        p.join(timeout=2)
+                        
+                        # 获取剩余未处理的任务
+                        processed, total = process_current_progress[idx]
+                        remaining_chunk = process_chunks[idx].iloc[processed:]
+                        
+                        if not remaining_chunk.empty:
+                            # 重启进程，只处理剩余的任务
+                            new_p = Process(target=worker_download, args=(process_id, remaining_chunk, START_DATE_FULL, end_date, data_queue, heartbeat_queue, frequency, self.stop_event, 'stock'))
+                            new_p.start()
+                            processes[idx] = new_p
+                            process_last_heartbeat[idx] = current_time
+                            safe_print(f"✅ [进程 {process_id}] 复活成功，剩余任务: {len(remaining_chunk)} 只")
+                        else:
+                            safe_print(f"ℹ️ [进程 {process_id}] 没有剩余任务，无需复活")
+            
             try:
-                item = data_queue.get(timeout=0.5)
+                item = data_queue.get(timeout=0.2)  # 缩短超时时间，让心跳检测更及时
                 if item:
                     df, success, error_msg = item
                     self.total_count += 1
@@ -545,7 +652,7 @@ class StockDataPipeline:
                         self._adjust_batch_size()
                     
                     if self.error_count % MAX_ERRORS_BEFORE_WARNING == 0 and self.error_count > 0:
-                        safe_print(f"⚠️ 已累计 {self.error_count} 个错误，请检查网络连接和API状态")
+                        safe_print(f"️ 已累计 {self.error_count} 个错误，请检查网络连接和API状态")
                     
                     elapsed = time.time() - _progress_state['start_time'] if _progress_state['start_time'] else 1
                     speed = self.processed_count / elapsed if elapsed > 0 else 0
@@ -581,10 +688,27 @@ class StockDataPipeline:
                     self.error_count += 1
                     self.log_error("未知", str(e))
 
-        for p in processes:
+        # 等待所有进程结束，并检查进程状态
+        safe_print("\n🔍 检查所有进程状态...")
+        for idx, p in enumerate(processes):
             if p.is_alive():
-                p.terminate()
-                p.join(timeout=2)
+                safe_print(f"⏳ [进程 {idx+1}] 仍在运行，等待结束...")
+                p.join(timeout=10)
+                if p.is_alive():
+                    safe_print(f"⚠️ [进程 {idx+1}] 超时未结束，强制终止")
+                    p.terminate()
+                    p.join(timeout=2)
+            else:
+                exit_code = p.exitcode
+                if exit_code != 0:
+                    safe_print(f"❌ [进程 {idx+1}] 异常退出，退出码: {exit_code}")
+                else:
+                    safe_print(f"✅ [进程 {idx+1}] 正常结束")
+        
+        # 检查是否有未完成的任务
+        if self.processed_count < self.total_stocks:
+            safe_print(f"\n⚠️ 警告：任务未完成！已处理 {self.processed_count}/{self.total_stocks}，缺失 {self.total_stocks - self.processed_count} 只")
+            logger.warning(f"任务未完成：已处理 {self.processed_count}/{self.total_stocks}")
 
         if batch_buffer:
             self.db.upload_batch(batch_buffer, frequency)
@@ -699,19 +823,111 @@ class StockDataPipeline:
         chunks = [c for c in chunks if not c.empty]
         
         data_queue: Queue = Queue()
+        heartbeat_queue: Optional[Queue] = Queue() if ENABLE_PROCESS_REVIVE else None
         processes: List[Process] = []
+        process_chunks: List[pd.DataFrame] = chunks.copy()  # 保存每个进程对应的任务块
+        process_revive_counts: List[int] = [0] * len(chunks)  # 记录每个进程的复活次数
+        process_last_heartbeat: List[float] = [time.time()] * len(chunks)  # 记录每个进程最后心跳时间
+        process_current_progress: List[Tuple[int, int]] = [(0, len(c)) for c in chunks]  # 记录每个进程当前进度(已处理, 总数)
 
         for i, chunk in enumerate(chunks):
-            p = Process(target=worker_update, args=(i+1, chunk, data_queue, frequency, self.stop_event, 'stock'))
+            p = Process(target=worker_update, args=(i+1, chunk, data_queue, heartbeat_queue, frequency, self.stop_event, 'stock'))
             p.start()
             processes.append(p)
         
         safe_print("👂 主进程正在后台接收数据并入库...")
         batch_buffer: List[pd.DataFrame] = []
         
-        while (any(p.is_alive() for p in processes) or not data_queue.empty()) and not self.should_stop:
+        # 使用更可靠的退出条件：所有进程结束 + 队列处理完毕 + 进度达标
+        while not self.should_stop:
+            # 检查是否所有进程都已结束
+            all_processes_done = not any(p.is_alive() for p in processes)
+            
+            # 进度达标判断：如果已经处理的数量 >= 总任务数，说明所有任务都完成了
+            progress_reached = self.processed_count >= self.total_stocks
+            
+            # 如果所有进程都结束了 或者 进度已经达标，并且队列已空，就退出
+            if (all_processes_done or progress_reached) and data_queue.empty():
+                # 再等待一小段时间，确保没有遗漏的数据
+                time.sleep(0.5)
+                if data_queue.empty():
+                    safe_print("\n✅ 所有任务已完成，队列已清空")
+                    # 强制终止所有还活着的进程
+                    for p in processes:
+                        if p.is_alive():
+                            p.terminate()
+                            p.join(timeout=2)
+                    break
+            # 进程监控与复活逻辑
+            if ENABLE_PROCESS_REVIVE and heartbeat_queue is not None:
+                # 处理心跳队列
+                while not heartbeat_queue.empty():
+                    try:
+                        process_id, heartbeat_time, processed, total = heartbeat_queue.get_nowait()
+                        idx = process_id - 1
+                        if 0 <= idx < len(processes):
+                            process_last_heartbeat[idx] = heartbeat_time
+                            process_current_progress[idx] = (processed, total)
+                    except:
+                        pass
+                
+                # 检查每个进程的状态
+                current_time = time.time()
+                for idx, p in enumerate(processes):
+                    process_id = idx + 1
+                    
+                    # 检查进程是否还活着
+                    if not p.is_alive():
+                        exit_code = p.exitcode
+                        if exit_code != 0 and process_revive_counts[idx] < PROCESS_MAX_REVIVE_TIMES:
+                            # 进程异常退出，尝试复活
+                            process_revive_counts[idx] += 1
+                            safe_print(f"🔄 [进程 {process_id}] 异常退出(退出码: {exit_code})，尝试第 {process_revive_counts[idx]} 次复活...")
+                            logger.warning(f"进程 {process_id} 异常退出，正在复活 (第 {process_revive_counts[idx]} 次)")
+                            
+                            # 获取剩余未处理的任务
+                            processed, total = process_current_progress[idx]
+                            remaining_chunk = process_chunks[idx].iloc[processed:]
+                            
+                            if not remaining_chunk.empty:
+                                # 重启进程，只处理剩余的任务
+                                new_p = Process(target=worker_update, args=(process_id, remaining_chunk, data_queue, heartbeat_queue, frequency, self.stop_event, 'stock'))
+                                new_p.start()
+                                processes[idx] = new_p
+                                process_last_heartbeat[idx] = current_time
+                                safe_print(f"✅ [进程 {process_id}] 复活成功，剩余任务: {len(remaining_chunk)} 只")
+                            else:
+                                safe_print(f"ℹ️ [进程 {process_id}] 没有剩余任务，无需复活")
+                        continue
+                    
+                    # 检查心跳是否超时
+                    time_since_last_heartbeat = current_time - process_last_heartbeat[idx]
+                    if time_since_last_heartbeat > PROCESS_HEARTBEAT_TIMEOUT and process_revive_counts[idx] < PROCESS_MAX_REVIVE_TIMES:
+                        # 进程心跳超时，认为卡住，强制终止并复活
+                        process_revive_counts[idx] += 1
+                        safe_print(f"⚠️ [进程 {process_id}] 心跳超时({time_since_last_heartbeat:.0f}秒)，已卡住，尝试第 {process_revive_counts[idx]} 次复活...")
+                        logger.warning(f"进程 {process_id} 心跳超时，正在复活 (第 {process_revive_counts[idx]} 次)")
+                        
+                        # 强制终止进程
+                        p.terminate()
+                        p.join(timeout=2)
+                        
+                        # 获取剩余未处理的任务
+                        processed, total = process_current_progress[idx]
+                        remaining_chunk = process_chunks[idx].iloc[processed:]
+                        
+                        if not remaining_chunk.empty:
+                            # 重启进程，只处理剩余的任务
+                            new_p = Process(target=worker_update, args=(process_id, remaining_chunk, data_queue, heartbeat_queue, frequency, self.stop_event, 'stock'))
+                            new_p.start()
+                            processes[idx] = new_p
+                            process_last_heartbeat[idx] = current_time
+                            safe_print(f"✅ [进程 {process_id}] 复活成功，剩余任务: {len(remaining_chunk)} 只")
+                        else:
+                            safe_print(f"ℹ️ [进程 {process_id}] 没有剩余任务，无需复活")
+            
             try:
-                item = data_queue.get(timeout=0.5)
+                item = data_queue.get(timeout=0.2)  # 缩短超时时间，让心跳检测更及时
                 if item:
                     df, success, error_msg = item
                     self.total_count += 1
@@ -1057,10 +1273,15 @@ class StockDataPipeline:
         
         # 4. 启动多进程
         data_queue: Queue = Queue()
+        heartbeat_queue: Optional[Queue] = Queue() if ENABLE_PROCESS_REVIVE else None
         processes: List[Process] = []
+        process_chunks: List[pd.DataFrame] = chunks.copy()  # 保存每个进程对应的任务块
+        process_revive_counts: List[int] = [0] * len(chunks)  # 记录每个进程的复活次数
+        process_last_heartbeat: List[float] = [time.time()] * len(chunks)  # 记录每个进程最后心跳时间
+        process_current_progress: List[Tuple[int, int]] = [(0, len(c)) for c in chunks]  # 记录每个进程当前进度(已处理, 总数)
 
         for i, chunk in enumerate(chunks):
-            p = Process(target=worker_update, args=(i+1, chunk, data_queue, frequency, self.stop_event, 'etf'))
+            p = Process(target=worker_update, args=(i+1, chunk, data_queue, heartbeat_queue, frequency, self.stop_event, 'etf'))
             p.start()
             processes.append(p)
         
@@ -1068,9 +1289,97 @@ class StockDataPipeline:
         safe_print("👂 主进程正在后台接收数据并入库...")
         batch_buffer: List[pd.DataFrame] = []
         
-        while any(p.is_alive() for p in processes) or not data_queue.empty():
+        # 使用更可靠的退出条件：所有进程结束 + 队列处理完毕 + 进度达标
+        while not self.should_stop:
+            # 检查是否所有进程都已结束
+            all_processes_done = not any(p.is_alive() for p in processes)
+            
+            # 进度达标判断：如果已经处理的数量 >= 总任务数，说明所有任务都完成了
+            progress_reached = self.processed_count >= self.total_stocks
+            
+            # 如果所有进程都结束了 或者 进度已经达标，并且队列已空，就退出
+            if (all_processes_done or progress_reached) and data_queue.empty():
+                # 再等待一小段时间，确保没有遗漏的数据
+                time.sleep(0.5)
+                if data_queue.empty():
+                    safe_print("\n✅ 所有任务已完成，队列已清空")
+                    # 强制终止所有还活着的进程
+                    for p in processes:
+                        if p.is_alive():
+                            p.terminate()
+                            p.join(timeout=2)
+                    break
+            
+            # 进程监控与复活逻辑
+            if ENABLE_PROCESS_REVIVE and heartbeat_queue is not None:
+                # 处理心跳队列
+                while not heartbeat_queue.empty():
+                    try:
+                        process_id, heartbeat_time, processed, total = heartbeat_queue.get_nowait()
+                        idx = process_id - 1
+                        if 0 <= idx < len(processes):
+                            process_last_heartbeat[idx] = heartbeat_time
+                            process_current_progress[idx] = (processed, total)
+                    except:
+                        pass
+                
+                # 检查每个进程的状态
+                current_time = time.time()
+                for idx, p in enumerate(processes):
+                    process_id = idx + 1
+                    
+                    # 检查进程是否还活着
+                    if not p.is_alive():
+                        exit_code = p.exitcode
+                        if exit_code != 0 and process_revive_counts[idx] < PROCESS_MAX_REVIVE_TIMES:
+                            # 进程异常退出，尝试复活
+                            process_revive_counts[idx] += 1
+                            safe_print(f"🔄 [进程 {process_id}] 异常退出(退出码: {exit_code})，尝试第 {process_revive_counts[idx]} 次复活...")
+                            logger.warning(f"进程 {process_id} 异常退出，正在复活 (第 {process_revive_counts[idx]} 次)")
+                            
+                            # 获取剩余未处理的任务
+                            processed, total = process_current_progress[idx]
+                            remaining_chunk = process_chunks[idx].iloc[processed:]
+                            
+                            if not remaining_chunk.empty():
+                                # 重启进程，只处理剩余的任务
+                                new_p = Process(target=worker_update, args=(process_id, remaining_chunk, data_queue, heartbeat_queue, frequency, self.stop_event, 'etf'))
+                                new_p.start()
+                                processes[idx] = new_p
+                                process_last_heartbeat[idx] = current_time
+                                safe_print(f"✅ [进程 {process_id}] 复活成功，剩余任务: {len(remaining_chunk)} 只")
+                            else:
+                                safe_print(f"ℹ️ [进程 {process_id}] 没有剩余任务，无需复活")
+                        continue
+                    
+                    # 检查心跳是否超时
+                    time_since_last_heartbeat = current_time - process_last_heartbeat[idx]
+                    if time_since_last_heartbeat > PROCESS_HEARTBEAT_TIMEOUT and process_revive_counts[idx] < PROCESS_MAX_REVIVE_TIMES:
+                        # 进程心跳超时，认为卡住，强制终止并复活
+                        process_revive_counts[idx] += 1
+                        safe_print(f"⚠️ [进程 {process_id}] 心跳超时({time_since_last_heartbeat:.0f}秒)，已卡住，尝试第 {process_revive_counts[idx]} 次复活...")
+                        logger.warning(f"进程 {process_id} 心跳超时，正在复活 (第 {process_revive_counts[idx]} 次)")
+                        
+                        # 强制终止进程
+                        p.terminate()
+                        p.join(timeout=2)
+                        
+                        # 获取剩余未处理的任务
+                        processed, total = process_current_progress[idx]
+                        remaining_chunk = process_chunks[idx].iloc[processed:]
+                        
+                        if not remaining_chunk.empty():
+                            # 重启进程，只处理剩余的任务
+                            new_p = Process(target=worker_update, args=(process_id, remaining_chunk, data_queue, heartbeat_queue, frequency, self.stop_event, 'etf'))
+                            new_p.start()
+                            processes[idx] = new_p
+                            process_last_heartbeat[idx] = current_time
+                            safe_print(f"✅ [进程 {process_id}] 复活成功，剩余任务: {len(remaining_chunk)} 只")
+                        else:
+                            safe_print(f"ℹ️ [进程 {process_id}] 没有剩余任务，无需复活")
+            
             try:
-                item = data_queue.get(timeout=0.5)
+                item = data_queue.get(timeout=0.2)  # 缩短超时时间，让心跳检测更及时
                 if item:
                     df, success, error_msg = item
                     self.total_count += 1

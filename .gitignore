@@ -1,4 +1,4 @@
-﻿__pycache__/
+__pycache__/
 *.pyc
 *.pyo
 logs/
@@ -9,3 +9,11 @@ venv/
 env/
 .env
 quant_data*
+
+# 数据库文件
+*.db
+*.db-wal
+*.db-shm
+temp_*.db
+stock_data*
+etf_data*

@@ -8,10 +8,10 @@ baostock:
 
 # 并发与性能配置
 concurrency:
-  max_workers: 10  # 新浪接口请求频繁会被限制，调小并发数
+  max_workers: 20  # 新浪接口请求频繁会被限制，调小并发数
   dynamic_concurrency: true  # 是否启用动态并发控制，true表示根据错误率和成功率自动调整进程数
   min_workers: 3  # 最小并发进程数，当错误率过高时会减少到此值
-  max_workers_limit: 10  # 最大并发进程数限制，动态调整时不会超过此值
+  max_workers_limit: 20  # 最大并发进程数限制，动态调整时不会超过此值
   error_threshold: 3  # 错误率阈值(%)，当错误率超过此值时自动减少进程数
   success_threshold: 95  # 成功率阈值(%)，当成功率超过此值时自动增加进程数
 
@@ -47,6 +47,12 @@ data:
 error:
   log_file: "error_log.txt"  # 错误日志文件路径，记录所有下载失败的股票和错误信息
   max_errors_before_warning: 10  # 累计错误数警告阈值，每累计10个错误时在控制台显示警告信息
+
+# 进程监控与复活配置
+process_monitor:
+  enable_revive: true  # 是否启用进程自动复活功能，true表示当进程卡住或异常退出时自动重启
+  heartbeat_timeout: 30  # 进程心跳超时时间(秒)，如果进程超过此时间没有输出任何日志/进度，则认为已卡住
+  max_revive_times: 3  # 单个进程最大复活次数，超过此次数后不再重启，避免无限循环
 
 # 数据处理配置
 processing:
