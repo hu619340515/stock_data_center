@@ -5,7 +5,7 @@ import logging # ✅ 单独导入标准 logging 模块
 from typing import List, Tuple, Optional, Set, Any
 from database import DuckDBManager
 from data_source_factory import DataSourceFactory
-from config import MAX_WORKERS, START_DATE_FULL, START_DATE_FULL_ETF, DYNAMIC_CONCURRENCY, MIN_WORKERS, MAX_WORKERS_LIMIT, ERROR_THRESHOLD, SUCCESS_THRESHOLD, BATCH_SIZE, MAX_BATCH_SIZE, MIN_BATCH_SIZE, MEMORY_THRESHOLD, USE_ARROW, COMPRESS_DATA, ERROR_LOG_FILE, MAX_ERRORS_BEFORE_WARNING, DEFAULT_DATA_SOURCE, ENABLE_DATA_SOURCE_FALLBACK, DATA_SOURCE_PRIORITY, ENABLE_PROCESS_REVIVE, PROCESS_HEARTBEAT_TIMEOUT, PROCESS_MAX_REVIVE_TIMES
+from config import MAX_WORKERS, START_DATE_FULL, START_DATE_FULL_ETF, DYNAMIC_CONCURRENCY, MIN_WORKERS, MAX_WORKERS_LIMIT, ERROR_THRESHOLD, SUCCESS_THRESHOLD, BATCH_SIZE, MAX_BATCH_SIZE, MIN_BATCH_SIZE, MEMORY_THRESHOLD, USE_ARROW, COMPRESS_DATA, ERROR_LOG_FILE, MAX_ERRORS_BEFORE_WARNING, DEFAULT_DATA_SOURCE, ENABLE_DATA_SOURCE_FALLBACK, DATA_SOURCE_PRIORITY, ENABLE_PROCESS_REVIVE, PROCESS_HEARTBEAT_TIMEOUT, PROCESS_MAX_REVIVE_TIMES, END_DATE
 import threading
 import time
 
@@ -772,11 +772,20 @@ class StockDataPipeline:
         start_dates = []
         end_dates = []
         
+        # 计算结束日期
+        if END_DATE:
+            end_date_global = END_DATE
+        else:
+            today = pd.Timestamp.now().date()
+            if pd.Timestamp.now().hour < 18:
+                end_date_global = (today - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+            else:
+                end_date_global = today.strftime("%Y-%m-%d")
+        
+        three_months_ago = (pd.Timestamp.now() - pd.DateOffset(months=3)).strftime("%Y-%m-%d")
         for _, row in stocks.iterrows():
             code = row['code']
             last_date = self.db.get_last_date(code, frequency)
-            
-            three_months_ago = (pd.Timestamp.now() - pd.DateOffset(months=3)).strftime("%Y-%m-%d")
             
             if last_date:
                 last_date_obj = pd.to_datetime(last_date)
@@ -788,13 +797,10 @@ class StockDataPipeline:
                 # 没有历史数据的股票，从3个月前开始
                 start_date = three_months_ago
             
-            today = pd.Timestamp.now().date()
-            if pd.Timestamp.now().hour < 18:
-                end_date = (today - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-                if start_date > end_date:
-                    start_date = end_date
-            else:
-                end_date = today.strftime("%Y-%m-%d")
+            # 确保起始日期不晚于结束日期
+            if start_date > end_date_global:
+                start_date = end_date_global
+            end_date = end_date_global
             
             start_dates.append(start_date)
             end_dates.append(end_date)
@@ -1218,31 +1224,36 @@ class StockDataPipeline:
         start_dates = []
         end_dates = []
         
+        # 计算结束日期
+        if END_DATE:
+            end_date_global = END_DATE
+        else:
+            today = pd.Timestamp.now().date()
+            if pd.Timestamp.now().hour < 18:
+                end_date_global = (today - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+            else:
+                end_date_global = today.strftime("%Y-%m-%d")
+        
+        three_months_ago = (pd.Timestamp.now() - pd.DateOffset(months=3)).strftime("%Y-%m-%d")
         for _, row in etfs.iterrows():
             code = row['code']
             last_date = self.db.get_last_date(code, frequency, asset_type="etf")
-            
-            three_months_ago = (pd.Timestamp.now() - pd.DateOffset(months=3)).strftime("%Y-%m-%d")
             
             if last_date:
                 last_date_obj = pd.to_datetime(last_date)
                 # 计算开始日期（最后日期的下一天）
                 start_date = (last_date_obj + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+                # 确保起始日期不早于3个月前
                 if start_date < three_months_ago:
                     start_date = three_months_ago
             else:
+                # 没有历史数据的ETF，从3个月前开始
                 start_date = three_months_ago
             
-            # 计算结束日期，考虑到数据可能还未更新
-            today = pd.Timestamp.now().date()
-            # 如果当前时间早于 18:00，使用昨天作为结束日期
-            if pd.Timestamp.now().hour < 18:
-                end_date = (today - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-                # 如果开始日期大于结束日期，使用开始日期作为结束日期
-                if start_date > end_date:
-                    start_date = end_date
-            else:
-                end_date = today.strftime("%Y-%m-%d")
+            # 确保起始日期不晚于结束日期
+            if start_date > end_date_global:
+                start_date = end_date_global
+            end_date = end_date_global
             
             start_dates.append(start_date)
             end_dates.append(end_date)

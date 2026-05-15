@@ -24,7 +24,7 @@ batch:
 
 # 重试机制配置
 retry:
-  max_retries: 3  # 最大重试次数，网络错误时会自动重试此次数
+  max_retries: 5  # 最大重试次数，网络错误时会自动重试此次数
   initial_retry_delay: 1  # 初始重试延迟时间(秒)，第一次重试等待1秒
   max_retry_delay: 30  # 最大重试延迟时间(秒)，重试延迟不会超过此值
   retry_backoff_factor: 2  # 重试退避因子，每次重试延迟时间乘以此因子(1秒、2秒、4秒...)
@@ -40,8 +40,8 @@ datasource:
 # 数据范围配置
 data:
   start_date_full: "1999-01-01"  # 股票全量下载的起始日期，首次运行时从此日期开始下载
-  start_date_full_etf: "1999-01-04"  # ETF全量下载的起始日期，首次运行时从此日期开始下载
-  start_date_incremental: "2026-04-01"  # 增量更新的起始日期，用于每日更新任务
+  start_date_full_etf: "1999-01-01"  # ETF全量下载的起始日期，首次运行时从此日期开始下载
+  # end_date: ""  # 可选拉取结束日期，不配置则自动使用当前日期（18点前用前一天，18点后用当天）
 
 # 错误处理配置
 error:

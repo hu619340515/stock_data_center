@@ -86,7 +86,9 @@ class ConfigLoader:
                 "priority": ["baostock", "akshare"]
             },
             "data": {
-                "start_date_full": "1999-01-01"
+                "start_date_full": "1999-01-01",
+                "start_date_full_etf": "1999-01-04",
+                "end_date": None
             }
         }
     
@@ -113,6 +115,7 @@ ETF_DB_PATH = os.path.join(PROJECT_ROOT, config_loader.get("database.etf_path", 
 BAOSTOCK_ADJUST_FLAG = config_loader.get("baostock.adjust_flag", "2")
 START_DATE_FULL = config_loader.get("data.start_date_full", "1999-01-01")
 START_DATE_FULL_ETF = config_loader.get("data.start_date_full_etf", "1999-01-04")
+END_DATE = config_loader.get("data.end_date", None)  # 拉取结束日期，None则自动使用当前日期（18点前用前一天，18点后用当天）
 
 # 并发与性能
 MAX_WORKERS = config_loader.get("concurrency.max_workers", 4)
