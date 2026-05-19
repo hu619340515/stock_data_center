@@ -6,6 +6,10 @@ from logger_config import setup_logger
 
 logger = setup_logger("Database")
 
+def safe_print(msg):
+    """安全打印函数"""
+    print(msg)
+
 class DuckDBManager:
     def __init__(self, db_path=None):
         db_path = db_path or DATABASE_PATH
@@ -218,15 +222,20 @@ class DuckDBManager:
         """
         🚀 批量写入优化（支持不同时间粒度和资产类型）
         """
-        if not df_list: return 0
+        if not df_list: 
+            safe_print(f"⚠️ upload_batch 空列表 - frequency={frequency}, asset_type={asset_type}")
+            return 0
         
         try:
             combined_df = pd.concat(df_list, ignore_index=True)
-            if combined_df.empty: return 0
+            if combined_df.empty: 
+                safe_print(f"⚠️ upload_batch 空数据框 - frequency={frequency}, asset_type={asset_type}")
+                return 0
 
             df_clean = self._clean_data(combined_df)
             count = len(df_clean)
             table_name = self._get_table_name(frequency, asset_type)
+            safe_print(f"📥 upload_batch - 准备写入 {count} 条记录到 {table_name}")
             
             # 优化：使用DuckDB的COPY命令进行更高效的批量导入
             # 对于大型DataFrame，COPY命令比INSERT更高效
@@ -418,40 +427,68 @@ class DuckDBManager:
                 logger.error(f"源数据库不存在: {source_db_path}")
                 return False
             
+            safe_print(f"🔍 开始合并 - 源数据库: {source_db_path}, 要合并的表: {tables}")
+            
             # 连接源数据库（只读）
             source_con = duckdb.connect(source_db_path, read_only=True)
             
+            # 获取源数据库中所有表
+            all_source_tables = source_con.execute("SHOW TABLES").fetchall()
+            source_table_names = [t[0] for t in all_source_tables]
+            safe_print(f"📋 源数据库中的表: {source_table_names}")
+            
             # 获取要合并的表
             if tables is None:
-                all_tables = source_con.execute("SHOW TABLES").fetchall()
-                tables = [t[0] for t in all_tables]
+                tables = source_table_names
+            
+            safe_print(f"🔄 准备合并的表: {tables}")
             
             merged_count = 0
             for table in tables:
                 try:
                     # 检查源表是否存在
-                    source_tables = source_con.execute("SHOW TABLES").fetchall()
-                    source_table_names = [t[0] for t in source_tables]
                     if table not in source_table_names:
+                        safe_print(f"⚠️ 源表 {table} 不存在于源数据库中")
                         continue
                     
                     # 获取源表数据
                     source_data = source_con.execute(f"SELECT * FROM {table}").fetchdf()
+                    safe_print(f"📊 表 {table} 的数据量: {len(source_data)} 条")
+                    
                     if source_data.empty:
                         continue
                     
-                    # 插入或替换到当前数据库
-                    self.con.execute(f"INSERT OR REPLACE INTO {table} SELECT * FROM source_data")
+                    # 检查目标表是否存在
+                    target_tables = self.con.execute("SHOW TABLES").fetchall()
+                    target_table_names = [t[0] for t in target_tables]
+                    if table not in target_table_names:
+                        safe_print(f"⚠️ 目标表 {table} 不存在于目标数据库中")
+                        continue
+                    
+                    # 数据清洗和类型转换，确保和目标表类型一致
+                    try:
+                        source_data_clean = self._clean_data(source_data)
+                        safe_print(f"✅ 数据清洗完成，列数: {len(source_data_clean.columns)}")
+                    except Exception as e:
+                        safe_print(f"❌ 数据清洗失败: {e}，尝试直接插入")
+                        source_data_clean = source_data
+                    
+                    # 插入或替换到当前数据库，显式指定列名，按列名匹配避免错位
+                    columns = ', '.join(source_data_clean.columns)
+                    self.con.execute(f"INSERT OR REPLACE INTO {table} ({columns}) SELECT {columns} FROM source_data_clean")
                     merged_count += len(source_data)
-                    logger.info(f"✅ 合并表 {table}: {len(source_data)} 条记录")
+                    safe_print(f"✅ 合并表 {table}: {len(source_data)} 条记录")
                 except Exception as e:
+                    safe_print(f"❌ 合并表 {table} 失败: {e}")
                     logger.warning(f"合并表 {table} 失败: {e}")
             
             source_con.close()
+            safe_print(f"✅ 数据库合并完成，共合并 {merged_count} 条记录")
             logger.info(f"✅ 数据库合并完成，共合并 {merged_count} 条记录")
             return True
             
         except Exception as e:
+            safe_print(f"❌ 数据库合并失败: {e}")
             logger.error(f"数据库合并失败: {e}")
             return False
     
@@ -524,7 +561,7 @@ class DuckDBManager:
                 df_copy[col] = pd.to_numeric(df_copy[col], errors='coerce').fillna(0)
         
         target_columns = [
-            'code', 'date', 'open', 'high', 'low', 'close', 'preclose', 
+            'code', 'name', 'date', 'open', 'high', 'low', 'close', 'preclose', 
             'volume', 'amount', 'adjustflag', 'turn', 'tradestatus', 'pctChg', 'isST'
         ]
         return df_copy[target_columns]

@@ -665,7 +665,9 @@ async function loadProgress() {
       card.style.display = 'none';
       stopBtn.style.display = 'none';
     }
-  } catch {}
+  } catch (e) {
+    console.error('加载进度失败:', e);
+  }
 }
 
 /* ──────── 停止任务 ───────── */

@@ -8,10 +8,10 @@ baostock:
 
 # 并发与性能配置
 concurrency:
-  max_workers: 30  # 新浪接口请求频繁会被限制，调小并发数
+  max_workers: 10  # 新浪接口请求频繁会被限制，调小并发数
   dynamic_concurrency: true  # 是否启用动态并发控制，true表示根据错误率和成功率自动调整进程数
   min_workers: 3  # 最小并发进程数，当错误率过高时会减少到此值
-  max_workers_limit: 30  # 最大并发进程数限制，动态调整时不会超过此值
+  max_workers_limit: 10  # 最大并发进程数限制，动态调整时不会超过此值
   error_threshold: 3  # 错误率阈值(%)，当错误率超过此值时自动减少进程数
   success_threshold: 95  # 成功率阈值(%)，当成功率超过此值时自动增加进程数
 
@@ -39,8 +39,8 @@ datasource:
 
 # 数据范围配置
 data:
-  start_date_full: "2025-05-01"  # 股票全量下载的起始日期，首次运行时从此日期开始下载
-  start_date_full_etf: "2025-05-01"  # ETF全量下载的起始日期，首次运行时从此日期开始下载
+  start_date_full: "2000-01-01"  # 股票全量下载的起始日期，首次运行时从此日期开始下载
+  start_date_full_etf: "2000-01-01"  # ETF全量下载的起始日期，首次运行时从此日期开始下载
   # end_date: ""  # 可选拉取结束日期，不配置则自动使用当前日期（18点前用前一天，18点后用当天）
 
 # 错误处理配置

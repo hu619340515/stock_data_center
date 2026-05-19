@@ -305,7 +305,9 @@ class StockDataPipeline:
     
     def merge_to_main_db(self, main_db_path: str, tables: list = None) -> bool:
         """将临时数据库合并到主数据库"""
+        safe_print(f"🔍 merge_to_main_db 调用 - use_temp_db={self.use_temp_db}, temp_db_path={self.temp_db_path}, should_stop={self.should_stop}")
         if not self.use_temp_db or not self.temp_db_path:
+            safe_print(f"❌ 跳过合并: use_temp_db={self.use_temp_db}, temp_db_path={self.temp_db_path}")
             return False
         
         try:
@@ -547,6 +549,21 @@ class StockDataPipeline:
         
         # 使用更可靠的退出条件：所有进程结束 + 队列处理完毕 + 进度达标
         while not self.should_stop:
+            # 每次循环都更新进度状态（即使队列是空的，也能让前端看到实时状态）
+            elapsed = time.time() - _progress_state['start_time'] if _progress_state['start_time'] else 1
+            speed = self.processed_count / elapsed if elapsed > 0 else 0
+            remaining = (self.total_stocks - self.processed_count) / speed if speed > 0 else 0
+            eta_str = f"{int(remaining)}秒" if remaining > 0 else "完成"
+            
+            set_progress(
+                processed=self.processed_count,
+                success=self.success_count,
+                error=self.error_count,
+                speed=round(speed, 1),
+                eta=eta_str,
+                message=f"{self.processed_count}/{self.total_stocks}"
+            )
+            
             # 检查是否所有进程都已结束
             all_processes_done = not any(p.is_alive() for p in processes)
             
@@ -856,6 +873,21 @@ class StockDataPipeline:
         
         # 使用更可靠的退出条件：所有进程结束 + 队列处理完毕 + 进度达标
         while not self.should_stop:
+            # 每次循环都更新进度状态（即使队列是空的，也能让前端看到实时状态）
+            elapsed = time.time() - _progress_state['start_time'] if _progress_state['start_time'] else 1
+            speed = self.processed_count / elapsed if elapsed > 0 else 0
+            remaining = (self.total_stocks - self.processed_count) / speed if speed > 0 else 0
+            eta_str = f"{int(remaining)}秒" if remaining > 0 else "完成"
+            
+            set_progress(
+                processed=self.processed_count,
+                success=self.success_count,
+                error=self.error_count,
+                speed=round(speed, 1),
+                eta=eta_str,
+                message=f"{self.processed_count}/{self.total_stocks}"
+            )
+            
             # 检查是否所有进程都已结束
             all_processes_done = not any(p.is_alive() for p in processes)
             
@@ -1097,8 +1129,55 @@ class StockDataPipeline:
         # 5. 主进程：监听队列并入库
         safe_print("👂 主进程正在后台接收数据并入库...")
         batch_buffer: List[pd.DataFrame] = []
+        loop_count = 0
+        
+        # 添加超时机制：所有进程结束后最多等待300秒
+        max_wait_time = 300  # 最大等待时间（秒）
+        wait_start_time = time.time()
+        all_processes_done = False
         
         while (any(p.is_alive() for p in processes) or not data_queue.empty()) and not self.should_stop:
+            loop_count += 1
+            alive_count = sum(1 for p in processes if p.is_alive())
+            queue_size = data_queue.qsize()
+            
+            # 检查是否所有任务都已经处理完成，如果是，强制退出循环（解决僵尸进程问题）
+            if self.processed_count >= self.total_stocks and queue_size == 0:
+                safe_print(f"✅ 所有任务已处理完成（{self.processed_count}/{self.total_stocks}），强制退出队列循环")
+                break
+            
+            # 检查是否所有进程都已完成
+            if alive_count == 0 and not all_processes_done:
+                all_processes_done = True
+                wait_start_time = time.time()
+                safe_print(f"⏰ 所有工作进程已完成，开始等待队列清空...")
+            
+            # 超时检查
+            if all_processes_done:
+                elapsed_wait = time.time() - wait_start_time
+                if elapsed_wait > max_wait_time:
+                    safe_print(f"⏰ 超时警告：队列等待超过 {max_wait_time} 秒，强制退出循环")
+                    break
+            
+            if loop_count % 50 == 0:
+                elapsed_wait = time.time() - wait_start_time if all_processes_done else 0
+                safe_print(f"🔄 循环状态 - 存活进程: {alive_count}, 队列大小: {queue_size}, should_stop: {self.should_stop}, 等待时间: {elapsed_wait:.2f}秒")
+            
+            # 每次循环都更新进度状态（即使队列是空的，也能让前端看到实时状态）
+            elapsed = time.time() - _progress_state['start_time'] if _progress_state['start_time'] else 1
+            speed = self.processed_count / elapsed if elapsed > 0 else 0
+            remaining = (self.total_stocks - self.processed_count) / speed if speed > 0 else 0
+            eta_str = f"{int(remaining)}秒" if remaining > 0 else "完成"
+            
+            set_progress(
+                processed=self.processed_count,
+                success=self.success_count,
+                error=self.error_count,
+                speed=round(speed, 1),
+                eta=eta_str,
+                message=f"{self.processed_count}/{self.total_stocks}"
+            )
+            
             try:
                 item = data_queue.get(timeout=0.5)
                 if item:
@@ -1166,7 +1245,13 @@ class StockDataPipeline:
                     self.error_count += 1
                     self.log_error("未知", str(e))
         
+        # 循环结束检查
+        final_alive = sum(1 for p in processes if p.is_alive())
+        final_queue_size = data_queue.qsize() if not data_queue.empty() else 0
+        safe_print(f"✅ 队列处理循环结束 - 总循环次数: {loop_count}, 剩余存活进程: {final_alive}, 队列剩余: {final_queue_size}, should_stop: {self.should_stop}")
+        
         # 6. 等待所有进程结束
+        safe_print("⏳ 等待所有进程结束...")
         for p in processes:
             if p.is_alive():
                 p.terminate()

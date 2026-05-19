@@ -111,22 +111,30 @@ def _run_task(func, *args, use_temp_db=False, asset_type='stock'):
             func(pipeline, *args)
             
             # 任务完成，合并到主数据库
+            print(f"🔍 检查合并条件 - use_temp_db={use_temp_db}, should_stop={pipeline.should_stop}")
             if use_temp_db and not pipeline.should_stop:
+                print(f"🔄 开始合并到主数据库: {target_db_path}")
                 tables = None
                 if asset_type == 'stock':
                     tables = ['stock_daily', 'stock_weekly', 'stock_monthly']
                 elif asset_type == 'etf':
                     tables = ['etf_daily', 'etf_weekly', 'etf_monthly']
                 pipeline.merge_to_main_db(target_db_path, tables)
+            else:
+                print(f"❌ 跳过合并 - use_temp_db={use_temp_db}, should_stop={pipeline.should_stop}")
         except Exception as e:
-            print(f"后台任务出错: {e}")
+            print(f"❌ 后台任务出错: {e}")
+            import traceback
             traceback.print_exc()
         finally:
+            print(f"🔍 finally 块执行 - _current_pipeline={_current_pipeline}")
             if _current_pipeline:
+                print(f"🧹 清理临时数据库")
                 _current_pipeline.cleanup_temp_db()
                 _current_pipeline = None
             with _task_lock:
                 _task_running = False
+            print(f"✅ 任务完成，_task_running={_task_running}")
     
     t = threading.Thread(target=worker, daemon=True)
     t.start()
