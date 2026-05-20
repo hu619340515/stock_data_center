@@ -40,6 +40,10 @@ def retry_with_backoff(func):
 class BaoStockClient(DataSourceInterface):
     def __init__(self):
         self.lg = None
+        # 设置 socket 默认超时，防止 HTTP 请求无限挂起
+        import socket
+        socket.setdefaulttimeout(180)
+        logger.info("⏱️ 已设置网络请求超时: 180秒")
 
     @retry_with_backoff
     def login(self):
@@ -207,7 +211,9 @@ class BaoStockClient(DataSourceInterface):
 class AKShareClient(DataSourceInterface):
     def __init__(self):
         # AKShare无需登录
-        pass
+        import socket
+        socket.setdefaulttimeout(180)
+        logger.info("⏱️ 已设置网络请求超时: 180秒")
     
     @retry_with_backoff
     def login(self):

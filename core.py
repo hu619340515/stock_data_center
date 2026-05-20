@@ -87,6 +87,30 @@ def safe_print(msg):
     with logging._lock:
         print(msg)
 
+def _safe_queue_put(q: Queue, item, process_id: int, max_retries: int = 5, timeout: float = 10.0):
+    """
+    🛡️ 安全队列写入：带超时和重试，防止队列满导致进程死锁
+    
+    Args:
+        q: 目标队列
+        item: 要发送的数据
+        process_id: 进程ID（用于日志）
+        max_retries: 最大重试次数
+        timeout: 每次 put 的超时时间（秒）
+    """
+    from queue import Full
+    for attempt in range(max_retries):
+        try:
+            q.put(item, timeout=timeout)
+            return
+        except Full:
+            if attempt < max_retries - 1:
+                safe_print(f"⚠️ [进程 {process_id}] 队列已满，第 {attempt + 1} 次重试...")
+                time.sleep(1)
+            else:
+                safe_print(f"❌ [进程 {process_id}] 队列持续已满，放弃写入（{max_retries}次重试后）")
+                logger.error(f"❌ [进程 {process_id}] 队列写入失败: 队列满")
+
 def worker_update(process_id: int, stock_list: pd.DataFrame, result_queue: Queue, heartbeat_queue: Optional[Queue] = None, frequency: str = "d", stop_event=None, asset_type: str = 'stock'):
     """
     🚀 增量更新的工作进程
@@ -146,13 +170,13 @@ def worker_update(process_id: int, stock_list: pd.DataFrame, result_queue: Queue
                         # 添加名称字段
                         df['name'] = row['code_name']
                         safe_print(f"✅ [进程 {process_id}] {code} ({row['code_name']}) 增量更新成功，数据量: {len(df)} 条")
-                        result_queue.put((df, True, None))  # (数据, 成功标志, 错误信息)
+                        _safe_queue_put(result_queue, (df, True, None), process_id)
                     else:
                         safe_print(f"️ [进程 {process_id}] {code} 无新数据")
-                        result_queue.put((None, True, f"{code} 无新数据"))  # (无数据, 成功标志, 信息)
+                        _safe_queue_put(result_queue, (None, True, f"{code} 无新数据"), process_id)
                 else:
                     safe_print(f"ℹ️ [进程 {process_id}] {code} 数据已最新")
-                    result_queue.put((None, True, f"{code} 数据已最新"))  # (无数据, 成功标志, 信息)
+                    _safe_queue_put(result_queue, (None, True, f"{code} 数据已最新"), process_id)
                 
                 # 实时打印进度（每 10 只打印一次，或者最后一只打印，避免刷屏太快）
                 if (i + 1) % 10 == 0 or (i + 1) == total:
@@ -161,7 +185,7 @@ def worker_update(process_id: int, stock_list: pd.DataFrame, result_queue: Queue
             except Exception as e:
                 error_msg = str(e)
                 safe_print(f"❌ [进程 {process_id}] {code} 更新异常: {error_msg}")
-                result_queue.put((None, False, error_msg))  # (异常, 失败标志, 错误信息)
+                _safe_queue_put(result_queue, (None, False, error_msg), process_id)
     finally:
         client.logout()
         safe_print(f"🏁 [进程 {process_id}] 任务结束")
@@ -232,12 +256,12 @@ def worker_download(process_id: int, stock_list: pd.DataFrame, start_date: str, 
                     df['name'] = row['code_name']
                     safe_print(f"✅ [进程 {process_id}] {code} ({row['code_name']}) 下载成功，数据量: {len(df)} 条")
                     logger.info(f"✅ [进程 {process_id}] {code} ({row['code_name']}) 下载成功，数据量: {len(df)} 条")
-                    result_queue.put((df, True, None))  # (数据, 成功标志, 错误信息)
+                    _safe_queue_put(result_queue, (df, True, None), process_id)
                     success_count += 1
                 else:
                     safe_print(f"ℹ️ [进程 {process_id}] {code} 无历史数据")
                     logger.info(f"ℹ️ [进程 {process_id}] {code} 无历史数据")
-                    result_queue.put((None, True, f"{code} 无历史数据"))  # (无数据, 成功标志, 信息)
+                    _safe_queue_put(result_queue, (None, True, f"{code} 无历史数据"), process_id)
                     success_count += 1
                     
                 # 实时打印进度（每 10 只打印一次，或者最后一只打印，避免刷屏太快）
@@ -250,7 +274,7 @@ def worker_download(process_id: int, stock_list: pd.DataFrame, start_date: str, 
                 error_msg = str(e)
                 safe_print(f"❌ [进程 {process_id}] {code} 下载异常: {error_msg}")
                 logger.error(f"❌ [进程 {process_id}] {code} 下载异常: {error_msg}")
-                result_queue.put((None, False, error_msg))  # (异常, 失败标志, 错误信息)
+                _safe_queue_put(result_queue, (None, False, error_msg), process_id)
                 error_count += 1
                 
     finally:
@@ -546,13 +570,27 @@ class StockDataPipeline:
         
         safe_print("👂 主进程正在后台接收数据并入库...")
         batch_buffer: List[pd.DataFrame] = []
+        loop_count = 0  # 循环计数器，用于定期输出状态日志
         
         # 使用更可靠的退出条件：所有进程结束 + 队列处理完毕 + 进度达标
         while not self.should_stop:
+            loop_count += 1
+            
+            # 每 100 次循环输出一次状态（约每 20 秒，因为 queue.get(timeout=0.2)）
+            if loop_count % 100 == 0:
+                alive_count = sum(1 for p in processes if p.is_alive())
+                try:
+                    queue_size = data_queue.qsize() if not data_queue.empty() else 0
+                except Exception:
+                    queue_size = -1
+                safe_print(f"🔄 循环状态 - 存活进程: {alive_count}, 队列大小: {queue_size}, should_stop: {self.should_stop}, 循环次数: {loop_count}")
+            
             # 每次循环都更新进度状态（即使队列是空的，也能让前端看到实时状态）
             elapsed = time.time() - _progress_state['start_time'] if _progress_state['start_time'] else 1
             speed = self.processed_count / elapsed if elapsed > 0 else 0
             remaining = (self.total_stocks - self.processed_count) / speed if speed > 0 else 0
+            
+            # 全量下载专用退出条件
             eta_str = f"{int(remaining)}秒" if remaining > 0 else "完成"
             
             set_progress(
