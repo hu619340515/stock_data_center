@@ -1,15 +1,31 @@
-import baostock as bs
 import pandas as pd
 import time
 import random
 import re
-import akshare as ak
 from datetime import timedelta
 from logger_config import setup_logger
 from config import MAX_RETRIES, INITIAL_RETRY_DELAY, MAX_RETRY_DELAY, RETRY_BACKOFF_FACTOR
 from data_source_interface import DataSourceInterface
 
 logger = setup_logger("DataFetcher")
+
+_BS = None
+
+def _bs():
+    global _BS
+    if _BS is None:
+        import baostock as _mod
+        _BS = _mod
+    return _BS
+
+_AK = None
+
+def _ak():
+    global _AK
+    if _AK is None:
+        import akshare as _mod
+        _AK = _mod
+    return _AK
 
 def retry_with_backoff(func):
     """
@@ -49,7 +65,7 @@ class BaoStockClient(DataSourceInterface):
     def login(self):
         if self.lg is None:
             logger.info("🚀 正在登录 Baostock...")
-            self.lg = bs.login()
+            self.lg = _bs().login()
             if self.lg.error_code != '0':
                 raise Exception(f"Login Failed: {self.lg.error_msg}")
             logger.info("✅ Baostock 登录成功")
@@ -57,7 +73,7 @@ class BaoStockClient(DataSourceInterface):
     def logout(self):
         if self.lg:
             try:
-                bs.logout()
+                _bs().logout()
                 logger.info("👋 Baostock 登出")
             except Exception as e:
                 logger.warning(f"⚠️ 登出失败: {e}")
@@ -76,7 +92,7 @@ class BaoStockClient(DataSourceInterface):
         
         for test_date in test_dates:
             logger.info(f"📅 尝试获取股票列表 (查询日期: {test_date})...")
-            rs = bs.query_all_stock(day=test_date)
+            rs = _bs().query_all_stock(day=test_date)
             
             if rs.error_code == '0':
                 data_list = []
@@ -118,7 +134,7 @@ class BaoStockClient(DataSourceInterface):
             # 日线和分钟线支持所有字段
             fields = "date,code,open,high,low,close,preclose,volume,amount,adjustflag,turn,tradestatus,pctChg,isST"
         
-        rs = bs.query_history_k_data_plus(
+        rs = _bs().query_history_k_data_plus(
             code,
             fields,
             start_date=start_date,
@@ -136,7 +152,7 @@ class BaoStockClient(DataSourceInterface):
                 # 重新登录
                 self.login()
                 # 重新尝试获取数据
-                rs = bs.query_history_k_data_plus(
+                rs = _bs().query_history_k_data_plus(
                     code,
                     fields,
                     start_date=start_date,
@@ -178,7 +194,7 @@ class BaoStockClient(DataSourceInterface):
         
         for test_date in test_dates:
             logger.info(f"📅 尝试获取ETF列表 (查询日期: {test_date})...")
-            rs = bs.query_all_stock(day=test_date)
+            rs = _bs().query_all_stock(day=test_date)
             
             if rs.error_code == '0':
                 data_list = []
@@ -232,7 +248,7 @@ class AKShareClient(DataSourceInterface):
         📋 获取A股股票列表
         """
         logger.info("📅 正在获取A股股票列表...")
-        df = ak.stock_zh_a_spot()
+        df = _ak().stock_zh_a_spot()
         # 格式化代码，添加市场前缀
         df['code'] = df.apply(lambda x: f"sh.{x['代码']}" if x['代码'].startswith('6') else f"sz.{x['代码']}", axis=1)
         df['code_name'] = df['名称']
@@ -247,7 +263,7 @@ class AKShareClient(DataSourceInterface):
         📋 获取ETF基金列表
         """
         logger.info("📅 正在获取ETF基金列表...")
-        df = ak.fund_etf_spot_em()  # 适配新版本AKShare接口
+        df = _ak().fund_etf_spot_em()  # 适配新版本AKShare接口
         # 格式化代码，添加市场前缀
         df['code'] = df.apply(lambda x: f"sh.{x['代码']}" if x['代码'].startswith('5') else f"sz.{x['代码']}", axis=1)
         df['code_name'] = df['名称']
@@ -294,7 +310,7 @@ class AKShareClient(DataSourceInterface):
             import random
             import time
             time.sleep(random.uniform(0.5, 1.5))
-            df = ak.fund_etf_hist_sina(
+            df = _ak().fund_etf_hist_sina(
                 symbol=sina_symbol
             )
             # 新浪接口不支持日期参数，获取全部数据后过滤
@@ -308,7 +324,7 @@ class AKShareClient(DataSourceInterface):
             import random
             import time
             time.sleep(random.uniform(2, 3.5))
-            df = ak.stock_zh_a_hist(
+            df = _ak().stock_zh_a_hist(
                 symbol=pure_code,
                 period=period,
                 start_date=start_date_stock,

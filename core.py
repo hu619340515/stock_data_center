@@ -2,6 +2,8 @@ import pandas as pd
 import os
 from multiprocessing import Process, Queue, current_process, Event
 import logging # ✅ 单独导入标准 logging 模块
+import queue
+import traceback
 from typing import List, Tuple, Optional, Set, Any
 from database import DuckDBManager
 from data_source_factory import DataSourceFactory
@@ -111,7 +113,7 @@ def _safe_queue_put(q: Queue, item, process_id: int, max_retries: int = 5, timeo
                 safe_print(f"❌ [进程 {process_id}] 队列持续已满，放弃写入（{max_retries}次重试后）")
                 logger.error(f"❌ [进程 {process_id}] 队列写入失败: 队列满")
 
-def worker_update(process_id: int, stock_list: pd.DataFrame, result_queue: Queue, heartbeat_queue: Optional[Queue] = None, frequency: str = "d", stop_event=None, asset_type: str = 'stock'):
+def worker_update(process_id: int, stock_list: pd.DataFrame, result_queue: Queue, heartbeat_queue: Optional[Queue] = None, frequency: str = "d", stop_event=None, asset_type: str = 'stock', log_queue=None):
     """
     🚀 增量更新的工作进程
     
@@ -122,7 +124,12 @@ def worker_update(process_id: int, stock_list: pd.DataFrame, result_queue: Queue
         frequency: 数据频率
         stop_event: 停止事件（跨进程共享）
         asset_type: 资产类型 (stock 或 etf)
+        log_queue: 多进程日志队列
     """
+    if log_queue is not None:
+        from logger_config import attach_queue_handler
+        attach_queue_handler(log_queue)
+    
     from data_source_factory import DataSourceFactory
     from config import DEFAULT_DATA_SOURCE, ETF_DATA_SOURCE, STOCK_DATA_SOURCE
     
@@ -190,7 +197,7 @@ def worker_update(process_id: int, stock_list: pd.DataFrame, result_queue: Queue
         client.logout()
         safe_print(f"🏁 [进程 {process_id}] 任务结束")
 
-def worker_download(process_id: int, stock_list: pd.DataFrame, start_date: str, end_date: str, result_queue: Queue, heartbeat_queue: Optional[Queue] = None, frequency: str = "d", stop_event=None, asset_type: str = 'stock'):
+def worker_download(process_id: int, stock_list: pd.DataFrame, start_date: str, end_date: str, result_queue: Queue, heartbeat_queue: Optional[Queue] = None, frequency: str = "d", stop_event=None, asset_type: str = 'stock', log_queue=None):
     """
     🚀 全量下载的工作进程
     
@@ -203,7 +210,12 @@ def worker_download(process_id: int, stock_list: pd.DataFrame, start_date: str, 
         frequency: 数据频率
         stop_event: 停止事件（跨进程共享）
         asset_type: 资产类型 (stock 或 etf)
+        log_queue: 多进程日志队列
     """
+    if log_queue is not None:
+        from logger_config import attach_queue_handler
+        attach_queue_handler(log_queue)
+    
     from data_source_factory import DataSourceFactory
     from config import DEFAULT_DATA_SOURCE, ETF_DATA_SOURCE, STOCK_DATA_SOURCE
     
@@ -440,18 +452,21 @@ class StockDataPipeline:
         except Exception as e:
             logger.warning(f"⚠️ 初始化错误日志文件失败: {e}")
 
-    def log_error(self, code: str, error_msg: str) -> None:
+    def log_error(self, code: str, error_msg: str, traceback_str: str = None) -> None:
         """
         📝 记录错误信息到日志文件
         
         Args:
             code: 股票代码
             error_msg: 错误信息
+            traceback_str: 完整堆栈信息（可选）
         """
         try:
             with open(self.error_log_file, 'a', encoding='utf-8') as f:
                 timestamp = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
                 f.write(f"{timestamp},{code},{error_msg}\n")
+                if traceback_str:
+                    f.write(f"--- TRACEBACK ---\n{traceback_str}\n--- END TRACEBACK ---\n")
         except Exception as e:
             logger.warning(f"⚠️ 写入错误日志失败: {e}")
 
@@ -515,6 +530,10 @@ class StockDataPipeline:
         reset_progress()
         set_progress(is_running=True, task_name=f'全量下载{frequency}', start_time=time.time())
         
+        from logger_config import create_mp_log_queue, attach_queue_handler
+        log_queue, log_listener = create_mp_log_queue()
+        attach_queue_handler(log_queue)
+        
         self.start_time = pd.Timestamp.now()
         self.end_time = None
         self.error_count = 0
@@ -564,7 +583,7 @@ class StockDataPipeline:
         end_date = pd.Timestamp.now().strftime("%Y-%m-%d")
 
         for i, chunk in enumerate(chunks):
-            p = Process(target=worker_download, args=(i+1, chunk, START_DATE_FULL, end_date, data_queue, heartbeat_queue, frequency, self.stop_event, 'stock'))
+            p = Process(target=worker_download, args=(i+1, chunk, START_DATE_FULL, end_date, data_queue, heartbeat_queue, frequency, self.stop_event, 'stock', log_queue))
             p.start()
             processes.append(p)
         
@@ -654,7 +673,7 @@ class StockDataPipeline:
                             
                             if not remaining_chunk.empty:
                                 # 重启进程，只处理剩余的任务
-                                new_p = Process(target=worker_download, args=(process_id, remaining_chunk, START_DATE_FULL, end_date, data_queue, heartbeat_queue, frequency, self.stop_event, 'stock'))
+                                new_p = Process(target=worker_download, args=(process_id, remaining_chunk, START_DATE_FULL, end_date, data_queue, heartbeat_queue, frequency, self.stop_event, 'stock', log_queue))
                                 new_p.start()
                                 processes[idx] = new_p
                                 process_last_heartbeat[idx] = current_time
@@ -681,7 +700,7 @@ class StockDataPipeline:
                         
                         if not remaining_chunk.empty:
                             # 重启进程，只处理剩余的任务
-                            new_p = Process(target=worker_download, args=(process_id, remaining_chunk, START_DATE_FULL, end_date, data_queue, heartbeat_queue, frequency, self.stop_event, 'stock'))
+                            new_p = Process(target=worker_download, args=(process_id, remaining_chunk, START_DATE_FULL, end_date, data_queue, heartbeat_queue, frequency, self.stop_event, 'stock', log_queue))
                             new_p.start()
                             processes[idx] = new_p
                             process_last_heartbeat[idx] = current_time
@@ -689,33 +708,62 @@ class StockDataPipeline:
                         else:
                             safe_print(f"ℹ️ [进程 {process_id}] 没有剩余任务，无需复活")
             
+            last_code = "未知"
             try:
-                item = data_queue.get(timeout=0.2)  # 缩短超时时间，让心跳检测更及时
-                if item:
+                item = data_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            except Exception as e:
+                tb_str = traceback.format_exc()
+                logger.error(f"❌ 主进程从队列取数据时出错: {e}")
+                self.error_count += 1
+                self.log_error(last_code, str(e), tb_str)
+                continue
+
+            if item:
+                try:
                     df, success, error_msg = item
-                    self.total_count += 1
-                    self.processed_count += 1
-                    
-                    if success and df is not None:
-                        batch_buffer.append(df)
-                        self.success_count += 1
-                    else:
-                        self.error_count += 1
-                        if error_msg:
-                            code = "未知"  
-                            if df is not None and hasattr(df, 'code') and not df.empty:
-                                code = df['code'].iloc[0] if 'code' in df.columns else "未知"
-                            elif error_msg.startswith('sh.') or error_msg.startswith('sz.') or error_msg.startswith('bj.'):
-                                code = error_msg.split(' ')[0]
-                            self.log_error(code, error_msg)
-                    
-                    if self.total_count % 50 == 0:
+                except Exception as e:
+                    tb_str = traceback.format_exc()
+                    logger.error(f"❌ 主进程解包队列数据时出错: {e}")
+                    self.error_count += 1
+                    self.log_error(last_code, str(e), tb_str)
+                    continue
+
+                self.total_count += 1
+                self.processed_count += 1
+
+                if success and df is not None:
+                    batch_buffer.append(df)
+                    self.success_count += 1
+                else:
+                    self.error_count += 1
+                    if error_msg:
+                        code = "未知"
+                        if df is not None and hasattr(df, 'code') and not df.empty:
+                            code = df['code'].iloc[0] if 'code' in df.columns else "未知"
+                        elif error_msg.startswith('sh.') or error_msg.startswith('sz.') or error_msg.startswith('bj.'):
+                            code = error_msg.split(' ')[0]
+                        self.log_error(code, error_msg)
+
+                if df is not None and not df.empty:
+                    if 'code' in df.columns:
+                        last_code = str(df['code'].iloc[0])
+
+                if self.total_count % 50 == 0:
+                    try:
                         self._adjust_concurrency()
+                    except Exception as e:
+                        logger.warning(f"⚠️ 调整并发数失败: {e}")
+                    try:
                         self._adjust_batch_size()
-                    
-                    if self.error_count % MAX_ERRORS_BEFORE_WARNING == 0 and self.error_count > 0:
-                        safe_print(f"️ 已累计 {self.error_count} 个错误，请检查网络连接和API状态")
-                    
+                    except Exception as e:
+                        logger.warning(f"⚠️ 调整批大小失败: {e}")
+
+                if self.error_count % MAX_ERRORS_BEFORE_WARNING == 0 and self.error_count > 0:
+                    safe_print(f"⚠️ 已累计 {self.error_count} 个错误，请检查网络连接和API状态")
+
+                try:
                     elapsed = time.time() - _progress_state['start_time'] if _progress_state['start_time'] else 1
                     speed = self.processed_count / elapsed if elapsed > 0 else 0
                     remaining = (self.total_stocks - self.processed_count) / speed if speed > 0 else 0
@@ -728,8 +776,11 @@ class StockDataPipeline:
                         eta=eta_str,
                         message=f"{self.processed_count}/{self.total_stocks}"
                     )
-                    
-                    if self.total_count % 10 == 0 or self.total_count == self.total_stocks:
+                except Exception as e:
+                    logger.warning(f"⚠️ 更新进度状态失败: {e}")
+
+                if self.total_count % 10 == 0 or self.total_count == self.total_stocks:
+                    try:
                         elapsed_time = (pd.Timestamp.now() - self.start_time).total_seconds()
                         if elapsed_time > 0:
                             speed = self.processed_count / elapsed_time
@@ -737,18 +788,19 @@ class StockDataPipeline:
                             remaining = estimated_total - elapsed_time
                             progress_percent = (self.processed_count / self.total_stocks) * 100
                             safe_print(f"📊 进度: {self.processed_count}/{self.total_stocks} ({progress_percent:.1f}%) | 速度: {speed:.2f} 只/秒 | 剩余: {remaining:.0f} 秒")
-                
-                if len(batch_buffer) >= self.current_batch_size:
+                    except Exception as e:
+                        logger.warning(f"⚠️ 打印进度失败: {e}")
+
+            if len(batch_buffer) >= self.current_batch_size:
+                try:
                     self.db.upload_batch(batch_buffer, frequency)
-                    batch_buffer = []
                     safe_print(f"💾 [主进程] 完成一批入库 (批大小: {self.current_batch_size}, 频率: {frequency})")
-                    
-            except Exception as e:
-                import queue
-                if not isinstance(e, queue.Empty):
-                    logger.error(f"❌ 主进程处理队列数据时出错: {e}")
+                except Exception as e:
+                    tb_str = traceback.format_exc()
+                    logger.error(f"❌ 批量入库失败 (最后处理代码: {last_code}): {e}")
                     self.error_count += 1
-                    self.log_error("未知", str(e))
+                    self.log_error(last_code, str(e), tb_str)
+                batch_buffer = []
 
         # 等待所有进程结束，并检查进程状态
         safe_print("\n🔍 检查所有进程状态...")
@@ -776,6 +828,7 @@ class StockDataPipeline:
             self.db.upload_batch(batch_buffer, frequency)
 
         self.end_time = pd.Timestamp.now()
+        log_listener.stop()
         elapsed_time = (self.end_time - self.start_time).total_seconds()
         
         safe_print(f"\n📋 任务统计")
@@ -818,11 +871,14 @@ class StockDataPipeline:
         reset_progress()
         set_progress(is_running=True, task_name=f'增量更新{frequency}', start_time=time.time())
         
+        from logger_config import create_mp_log_queue, attach_queue_handler
+        log_queue, log_listener = create_mp_log_queue()
+        attach_queue_handler(log_queue)
+        
         self.start_time = pd.Timestamp.now()
         self.end_time = None
         self.error_count = 0
         self.success_count = 0
-        self.total_count = 0
         self.processed_count = 0
         
         safe_print(f"🔄 启动多进程增量更新 (进程数: {self.current_workers}, 频率: {frequency})...")
@@ -902,7 +958,7 @@ class StockDataPipeline:
         process_current_progress: List[Tuple[int, int]] = [(0, len(c)) for c in chunks]  # 记录每个进程当前进度(已处理, 总数)
 
         for i, chunk in enumerate(chunks):
-            p = Process(target=worker_update, args=(i+1, chunk, data_queue, heartbeat_queue, frequency, self.stop_event, 'stock'))
+            p = Process(target=worker_update, args=(i+1, chunk, data_queue, heartbeat_queue, frequency, self.stop_event, 'stock', log_queue))
             p.start()
             processes.append(p)
         
@@ -977,7 +1033,7 @@ class StockDataPipeline:
                             
                             if not remaining_chunk.empty:
                                 # 重启进程，只处理剩余的任务
-                                new_p = Process(target=worker_update, args=(process_id, remaining_chunk, data_queue, heartbeat_queue, frequency, self.stop_event, 'stock'))
+                                new_p = Process(target=worker_update, args=(process_id, remaining_chunk, data_queue, heartbeat_queue, frequency, self.stop_event, 'stock', log_queue))
                                 new_p.start()
                                 processes[idx] = new_p
                                 process_last_heartbeat[idx] = current_time
@@ -1004,7 +1060,7 @@ class StockDataPipeline:
                         
                         if not remaining_chunk.empty:
                             # 重启进程，只处理剩余的任务
-                            new_p = Process(target=worker_update, args=(process_id, remaining_chunk, data_queue, heartbeat_queue, frequency, self.stop_event, 'stock'))
+                            new_p = Process(target=worker_update, args=(process_id, remaining_chunk, data_queue, heartbeat_queue, frequency, self.stop_event, 'stock', log_queue))
                             new_p.start()
                             processes[idx] = new_p
                             process_last_heartbeat[idx] = current_time
@@ -1012,33 +1068,62 @@ class StockDataPipeline:
                         else:
                             safe_print(f"ℹ️ [进程 {process_id}] 没有剩余任务，无需复活")
             
+            last_code = "未知"
             try:
-                item = data_queue.get(timeout=0.2)  # 缩短超时时间，让心跳检测更及时
-                if item:
+                item = data_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            except Exception as e:
+                tb_str = traceback.format_exc()
+                logger.error(f"❌ 主进程从队列取数据时出错: {e}")
+                self.error_count += 1
+                self.log_error(last_code, str(e), tb_str)
+                continue
+
+            if item:
+                try:
                     df, success, error_msg = item
-                    self.total_count += 1
-                    self.processed_count += 1
-                    
-                    if success and df is not None:
-                        batch_buffer.append(df)
-                        self.success_count += 1
-                    else:
-                        self.error_count += 1
-                        if error_msg:
-                            code = "未知"  
-                            if df is not None and hasattr(df, 'code') and not df.empty:
-                                code = df['code'].iloc[0] if 'code' in df.columns else "未知"
-                            elif error_msg.startswith('sh.') or error_msg.startswith('sz.') or error_msg.startswith('bj.'):
-                                code = error_msg.split(' ')[0]
-                            self.log_error(code, error_msg)
-                    
-                    if self.total_count % 50 == 0:
+                except Exception as e:
+                    tb_str = traceback.format_exc()
+                    logger.error(f"❌ 主进程解包队列数据时出错: {e}")
+                    self.error_count += 1
+                    self.log_error(last_code, str(e), tb_str)
+                    continue
+
+                self.total_count += 1
+                self.processed_count += 1
+
+                if success and df is not None:
+                    batch_buffer.append(df)
+                    self.success_count += 1
+                else:
+                    self.error_count += 1
+                    if error_msg:
+                        code = "未知"
+                        if df is not None and hasattr(df, 'code') and not df.empty:
+                            code = df['code'].iloc[0] if 'code' in df.columns else "未知"
+                        elif error_msg.startswith('sh.') or error_msg.startswith('sz.') or error_msg.startswith('bj.'):
+                            code = error_msg.split(' ')[0]
+                        self.log_error(code, error_msg)
+
+                if df is not None and not df.empty:
+                    if 'code' in df.columns:
+                        last_code = str(df['code'].iloc[0])
+
+                if self.total_count % 50 == 0:
+                    try:
                         self._adjust_concurrency()
+                    except Exception as e:
+                        logger.warning(f"⚠️ 调整并发数失败: {e}")
+                    try:
                         self._adjust_batch_size()
-                    
-                    if self.error_count % MAX_ERRORS_BEFORE_WARNING == 0 and self.error_count > 0:
-                        safe_print(f"⚠️ 已累计 {self.error_count} 个错误，请检查网络连接和API状态")
-                    
+                    except Exception as e:
+                        logger.warning(f"⚠️ 调整批大小失败: {e}")
+
+                if self.error_count % MAX_ERRORS_BEFORE_WARNING == 0 and self.error_count > 0:
+                    safe_print(f"⚠️ 已累计 {self.error_count} 个错误，请检查网络连接和API状态")
+
+                try:
                     elapsed = time.time() - _progress_state['start_time'] if _progress_state['start_time'] else 1
                     speed = self.processed_count / elapsed if elapsed > 0 else 0
                     remaining = (self.total_stocks - self.processed_count) / speed if speed > 0 else 0
@@ -1051,8 +1136,11 @@ class StockDataPipeline:
                         eta=eta_str,
                         message=f"{self.processed_count}/{self.total_stocks}"
                     )
-                    
-                    if self.total_count % 10 == 0 or self.total_count == self.total_stocks:
+                except Exception as e:
+                    logger.warning(f"⚠️ 更新进度状态失败: {e}")
+
+                if self.total_count % 10 == 0 or self.total_count == self.total_stocks:
+                    try:
                         elapsed_time = (pd.Timestamp.now() - self.start_time).total_seconds()
                         if elapsed_time > 0:
                             speed = self.processed_count / elapsed_time
@@ -1060,23 +1148,26 @@ class StockDataPipeline:
                             remaining = estimated_total - elapsed_time
                             progress_percent = (self.processed_count / self.total_stocks) * 100
                             safe_print(f"📊 进度: {self.processed_count}/{self.total_stocks} ({progress_percent:.1f}%) | 速度: {speed:.2f} 只/秒 | 剩余: {remaining:.0f} 秒")
-                    
-                    if len(batch_buffer) >= self.current_batch_size:
-                        self.db.upload_batch(batch_buffer, frequency)
-                        safe_print(f"💾 批量写入完成: {len(batch_buffer)} 条记录 (表: {self.db._get_table_name(frequency)})")
-                        batch_buffer = []
-            except Exception as e:
-                import queue
-                if not isinstance(e, queue.Empty):
-                    logger.error(f"❌ 主进程处理队列数据时出错: {e}")
+                    except Exception as e:
+                        logger.warning(f"⚠️ 打印进度失败: {e}")
+
+            if len(batch_buffer) >= self.current_batch_size:
+                try:
+                    self.db.upload_batch(batch_buffer, frequency)
+                    safe_print(f"💾 批量写入完成: {len(batch_buffer)} 条记录 (表: {self.db._get_table_name(frequency)})")
+                except Exception as e:
+                    tb_str = traceback.format_exc()
+                    logger.error(f"❌ 批量入库失败 (最后处理代码: {last_code}): {e}")
                     self.error_count += 1
-                    self.log_error("未知", str(e))
+                    self.log_error(last_code, str(e), tb_str)
+                batch_buffer = []
         
         if batch_buffer:
             self.db.upload_batch(batch_buffer, frequency)
             safe_print(f"💾 最终批量写入完成: {len(batch_buffer)} 条记录 (表: {self.db._get_table_name(frequency)})")
         
         self.end_time = pd.Timestamp.now()
+        log_listener.stop()
         elapsed_time = (self.end_time - self.start_time).total_seconds()
         
         safe_print(f"\n📋 任务统计")
@@ -1109,6 +1200,10 @@ class StockDataPipeline:
         # 初始化进度条
         reset_progress()
         set_progress(is_running=True, task_name=f"全量下载ETF({frequency})", start_time=time.time())
+        
+        from logger_config import create_mp_log_queue, attach_queue_handler
+        log_queue, log_listener = create_mp_log_queue()
+        attach_queue_handler(log_queue)
         
         # 记录开始时间
         self.start_time = pd.Timestamp.now()
@@ -1160,7 +1255,7 @@ class StockDataPipeline:
 
         heartbeat_queue: Optional[Queue] = Queue() if ENABLE_PROCESS_REVIVE else None
         for i, chunk in enumerate(chunks):
-            p = Process(target=worker_download, args=(i+1, chunk, START_DATE_FULL_ETF, end_date, data_queue, heartbeat_queue, frequency, self.stop_event, 'etf'))
+            p = Process(target=worker_download, args=(i+1, chunk, START_DATE_FULL_ETF, end_date, data_queue, heartbeat_queue, frequency, self.stop_event, 'etf', log_queue))
             p.start()
             processes.append(p)
         
@@ -1216,47 +1311,68 @@ class StockDataPipeline:
                 message=f"{self.processed_count}/{self.total_stocks}"
             )
             
+            last_code = "未知"
             try:
                 item = data_queue.get(timeout=0.5)
-                if item:
+            except queue.Empty:
+                continue
+            except Exception as e:
+                tb_str = traceback.format_exc()
+                logger.error(f"❌ 主进程从队列取数据时出错: {e}")
+                self.error_count += 1
+                self.log_error(last_code, str(e), tb_str)
+                continue
+
+            if item:
+                try:
                     df, success, error_msg = item
-                    self.total_count += 1
-                    self.processed_count += 1
-                    
-                    if success and df is not None:
-                        batch_buffer.append(df)
-                        self.success_count += 1
-                        # 添加调试信息
-                        if self.total_count <= 5:  # 只显示前5次
-                            safe_print(f"📥 [主进程] 接收到ETF数据，批次大小: {len(df)} 条，缓冲区: {len(batch_buffer)}/{self.current_batch_size}")
-                    else:
-                        self.error_count += 1
-                        # 记录错误信息
-                        if error_msg:
-                            # 从df中提取ETF代码，如果df为None则从错误信息中提取
-                            code = "未知"  
-                            if df is not None and hasattr(df, 'code') and not df.empty:
-                                code = df['code'].iloc[0] if 'code' in df.columns else "未知"
-                            elif error_msg.startswith('sh.') or error_msg.startswith('sz.') or error_msg.startswith('bj.'):
-                                code = error_msg.split(' ')[0]
-                            self.log_error(code, error_msg)
-                    
-                    # 动态调整并发数和批处理大小
-                    if self.total_count % 50 == 0:  # 每处理50只ETF调整一次
+                except Exception as e:
+                    tb_str = traceback.format_exc()
+                    logger.error(f"❌ 主进程解包队列数据时出错: {e}")
+                    self.error_count += 1
+                    self.log_error(last_code, str(e), tb_str)
+                    continue
+
+                self.total_count += 1
+                self.processed_count += 1
+
+                if success and df is not None:
+                    batch_buffer.append(df)
+                    self.success_count += 1
+                    if self.total_count <= 5:
+                        safe_print(f"📥 [主进程] 接收到ETF数据，批次大小: {len(df)} 条，缓冲区: {len(batch_buffer)}/{self.current_batch_size}")
+                else:
+                    self.error_count += 1
+                    if error_msg:
+                        code = "未知"
+                        if df is not None and hasattr(df, 'code') and not df.empty:
+                            code = df['code'].iloc[0] if 'code' in df.columns else "未知"
+                        elif error_msg.startswith('sh.') or error_msg.startswith('sz.') or error_msg.startswith('bj.'):
+                            code = error_msg.split(' ')[0]
+                        self.log_error(code, error_msg)
+
+                if df is not None and not df.empty:
+                    if 'code' in df.columns:
+                        last_code = str(df['code'].iloc[0])
+
+                if self.total_count % 50 == 0:
+                    try:
                         self._adjust_concurrency()
+                    except Exception as e:
+                        logger.warning(f"⚠️ 调整并发数失败: {e}")
+                    try:
                         self._adjust_batch_size()
-                    
-                    # 错误数达到阈值时发出警告
-                    if self.error_count % MAX_ERRORS_BEFORE_WARNING == 0 and self.error_count > 0:
-                        safe_print(f"⚠️ 已累计 {self.error_count} 个错误，请检查网络连接和API状态")
-                    
-                    # 计算进度并更新状态
+                    except Exception as e:
+                        logger.warning(f"⚠️ 调整批大小失败: {e}")
+
+                if self.error_count % MAX_ERRORS_BEFORE_WARNING == 0 and self.error_count > 0:
+                    safe_print(f"⚠️ 已累计 {self.error_count} 个错误，请检查网络连接和API状态")
+
+                try:
                     elapsed = time.time() - _progress_state['start_time'] if _progress_state['start_time'] else 1
                     speed = self.processed_count / elapsed if elapsed > 0 else 0
                     remaining = (self.total_stocks - self.processed_count) / speed if speed > 0 else 0
                     eta_str = f"{int(remaining)}秒" if remaining > 0 else "完成"
-                    
-                    # 更新进度状态（供前端显示）
                     set_progress(
                         processed=self.processed_count,
                         success=self.success_count,
@@ -1265,24 +1381,27 @@ class StockDataPipeline:
                         eta=eta_str,
                         message=f"{self.processed_count}/{self.total_stocks}"
                     )
-                    
-                    # 显示详细进度
-                    if self.total_count % 10 == 0 or self.total_count == self.total_stocks:
+                except Exception as e:
+                    logger.warning(f"⚠️ 更新进度状态失败: {e}")
+
+                if self.total_count % 10 == 0 or self.total_count == self.total_stocks:
+                    try:
                         progress_percent = (self.processed_count / self.total_stocks) * 100
                         safe_print(f"📊 进度: {self.processed_count}/{self.total_stocks} ({progress_percent:.1f}%) | 速度: {speed:.2f} 只/秒 | 剩余: {remaining:.0f} 秒")
-                    
-                    # 批量入库
-                    if len(batch_buffer) >= self.current_batch_size:
-                        self.db.upload_batch(batch_buffer, frequency, asset_type="etf")
-                        safe_print(f"💾 批量写入完成: {len(batch_buffer)} 条记录 (表: {self.db._get_table_name(frequency, 'etf')})")
-                        batch_buffer = []
-            except Exception as e:
-                import queue
-                if not isinstance(e, queue.Empty):
-                    logger.error(f"❌ 主进程处理队列数据时出错: {e}")
+                    except Exception as e:
+                        logger.warning(f"⚠️ 打印进度失败: {e}")
+
+            if len(batch_buffer) >= self.current_batch_size:
+                try:
+                    self.db.upload_batch(batch_buffer, frequency, asset_type="etf")
+                    safe_print(f"💾 批量写入完成: {len(batch_buffer)} 条记录 (表: {self.db._get_table_name(frequency, 'etf')})")
+                except Exception as e:
+                    tb_str = traceback.format_exc()
+                    logger.error(f"❌ 批量入库失败 (最后处理代码: {last_code}): {e}")
                     self.error_count += 1
-                    self.log_error("未知", str(e))
-        
+                    self.log_error(last_code, str(e), tb_str)
+                batch_buffer = []
+
         # 循环结束检查
         final_alive = sum(1 for p in processes if p.is_alive())
         final_queue_size = data_queue.qsize() if not data_queue.empty() else 0
@@ -1299,6 +1418,7 @@ class StockDataPipeline:
             self.db.upload_batch(batch_buffer, frequency, asset_type="etf")
 
         self.end_time = pd.Timestamp.now()
+        log_listener.stop()
         elapsed_time = (self.end_time - self.start_time).total_seconds()
         
         safe_print(f"\n 任务统计")
@@ -1341,6 +1461,10 @@ class StockDataPipeline:
         # 初始化进度条
         reset_progress()
         set_progress(is_running=True, task_name=f"增量更新ETF({frequency})", start_time=time.time())
+        
+        from logger_config import create_mp_log_queue, attach_queue_handler
+        log_queue, log_listener = create_mp_log_queue()
+        attach_queue_handler(log_queue)
         
         # 记录开始时间
         self.start_time = pd.Timestamp.now()
@@ -1432,7 +1556,7 @@ class StockDataPipeline:
         process_current_progress: List[Tuple[int, int]] = [(0, len(c)) for c in chunks]  # 记录每个进程当前进度(已处理, 总数)
 
         for i, chunk in enumerate(chunks):
-            p = Process(target=worker_update, args=(i+1, chunk, data_queue, heartbeat_queue, frequency, self.stop_event, 'etf'))
+            p = Process(target=worker_update, args=(i+1, chunk, data_queue, heartbeat_queue, frequency, self.stop_event, 'etf', log_queue))
             p.start()
             processes.append(p)
         
@@ -1494,7 +1618,7 @@ class StockDataPipeline:
                             
                             if not remaining_chunk.empty():
                                 # 重启进程，只处理剩余的任务
-                                new_p = Process(target=worker_update, args=(process_id, remaining_chunk, data_queue, heartbeat_queue, frequency, self.stop_event, 'etf'))
+                                new_p = Process(target=worker_update, args=(process_id, remaining_chunk, data_queue, heartbeat_queue, frequency, self.stop_event, 'etf', log_queue))
                                 new_p.start()
                                 processes[idx] = new_p
                                 process_last_heartbeat[idx] = current_time
@@ -1521,7 +1645,7 @@ class StockDataPipeline:
                         
                         if not remaining_chunk.empty():
                             # 重启进程，只处理剩余的任务
-                            new_p = Process(target=worker_update, args=(process_id, remaining_chunk, data_queue, heartbeat_queue, frequency, self.stop_event, 'etf'))
+                            new_p = Process(target=worker_update, args=(process_id, remaining_chunk, data_queue, heartbeat_queue, frequency, self.stop_event, 'etf', log_queue))
                             new_p.start()
                             processes[idx] = new_p
                             process_last_heartbeat[idx] = current_time
@@ -1529,47 +1653,68 @@ class StockDataPipeline:
                         else:
                             safe_print(f"ℹ️ [进程 {process_id}] 没有剩余任务，无需复活")
             
+            last_code = "未知"
             try:
-                item = data_queue.get(timeout=0.2)  # 缩短超时时间，让心跳检测更及时
-                if item:
+                item = data_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            except Exception as e:
+                tb_str = traceback.format_exc()
+                logger.error(f"❌ 主进程从队列取数据时出错: {e}")
+                self.error_count += 1
+                self.log_error(last_code, str(e), tb_str)
+                continue
+
+            if item:
+                try:
                     df, success, error_msg = item
-                    self.total_count += 1
-                    self.processed_count += 1
-                    
-                    if success and df is not None:
-                        batch_buffer.append(df)
-                        self.success_count += 1
-                        # 添加调试信息
-                        if self.total_count <= 5:  # 只显示前5次
-                            safe_print(f"📥 [主进程] 接收到ETF数据，批次大小: {len(df)} 条，缓冲区: {len(batch_buffer)}/{self.current_batch_size}")
-                    else:
-                        self.error_count += 1
-                        # 记录错误信息
-                        if error_msg:
-                            # 从df中提取ETF代码，如果df为None则从错误信息中提取
-                            code = "未知"  
-                            if df is not None and hasattr(df, 'code') and not df.empty:
-                                code = df['code'].iloc[0] if 'code' in df.columns else "未知"
-                            elif error_msg.startswith('sh.') or error_msg.startswith('sz.') or error_msg.startswith('bj.'):
-                                code = error_msg.split(' ')[0]
-                            self.log_error(code, error_msg)
-                    
-                    # 动态调整并发数和批处理大小
-                    if self.total_count % 50 == 0:  # 每处理50只ETF调整一次
+                except Exception as e:
+                    tb_str = traceback.format_exc()
+                    logger.error(f"❌ 主进程解包队列数据时出错: {e}")
+                    self.error_count += 1
+                    self.log_error(last_code, str(e), tb_str)
+                    continue
+
+                self.total_count += 1
+                self.processed_count += 1
+
+                if success and df is not None:
+                    batch_buffer.append(df)
+                    self.success_count += 1
+                    if self.total_count <= 5:
+                        safe_print(f"📥 [主进程] 接收到ETF数据，批次大小: {len(df)} 条，缓冲区: {len(batch_buffer)}/{self.current_batch_size}")
+                else:
+                    self.error_count += 1
+                    if error_msg:
+                        code = "未知"
+                        if df is not None and hasattr(df, 'code') and not df.empty:
+                            code = df['code'].iloc[0] if 'code' in df.columns else "未知"
+                        elif error_msg.startswith('sh.') or error_msg.startswith('sz.') or error_msg.startswith('bj.'):
+                            code = error_msg.split(' ')[0]
+                        self.log_error(code, error_msg)
+
+                if df is not None and not df.empty:
+                    if 'code' in df.columns:
+                        last_code = str(df['code'].iloc[0])
+
+                if self.total_count % 50 == 0:
+                    try:
                         self._adjust_concurrency()
+                    except Exception as e:
+                        logger.warning(f"⚠️ 调整并发数失败: {e}")
+                    try:
                         self._adjust_batch_size()
-                    
-                    # 错误数达到阈值时发出警告
-                    if self.error_count % MAX_ERRORS_BEFORE_WARNING == 0 and self.error_count > 0:
-                        safe_print(f"⚠️ 已累计 {self.error_count} 个错误，请检查网络连接和API状态")
-                    
-                    # 计算进度并更新状态
+                    except Exception as e:
+                        logger.warning(f"⚠️ 调整批大小失败: {e}")
+
+                if self.error_count % MAX_ERRORS_BEFORE_WARNING == 0 and self.error_count > 0:
+                    safe_print(f"⚠️ 已累计 {self.error_count} 个错误，请检查网络连接和API状态")
+
+                try:
                     elapsed = time.time() - _progress_state['start_time'] if _progress_state['start_time'] else 1
                     speed = self.processed_count / elapsed if elapsed > 0 else 0
                     remaining = (self.total_stocks - self.processed_count) / speed if speed > 0 else 0
                     eta_str = f"{int(remaining)}秒" if remaining > 0 else "完成"
-                    
-                    # 更新进度状态（供前端显示）
                     set_progress(
                         processed=self.processed_count,
                         success=self.success_count,
@@ -1578,24 +1723,27 @@ class StockDataPipeline:
                         eta=eta_str,
                         message=f"{self.processed_count}/{self.total_stocks}"
                     )
-                    
-                    # 显示详细进度
-                    if self.total_count % 10 == 0 or self.total_count == self.total_stocks:
+                except Exception as e:
+                    logger.warning(f"⚠️ 更新进度状态失败: {e}")
+
+                if self.total_count % 10 == 0 or self.total_count == self.total_stocks:
+                    try:
                         progress_percent = (self.processed_count / self.total_stocks) * 100
                         safe_print(f"📊 进度: {self.processed_count}/{self.total_stocks} ({progress_percent:.1f}%) | 速度: {speed:.2f} 只/秒 | 剩余: {remaining:.0f} 秒")
-                    
-                    # 批量入库
-                    if len(batch_buffer) >= self.current_batch_size:
-                        self.db.upload_batch(batch_buffer, frequency, asset_type="etf")
-                        safe_print(f"💾 批量写入完成: {len(batch_buffer)} 条记录 (表: {self.db._get_table_name(frequency, 'etf')})")
-                        batch_buffer = []
-            except Exception as e:
-                import queue
-                if not isinstance(e, queue.Empty):
-                    logger.error(f"❌ 主进程处理队列数据时出错: {e}")
+                    except Exception as e:
+                        logger.warning(f"⚠️ 打印进度失败: {e}")
+
+            if len(batch_buffer) >= self.current_batch_size:
+                try:
+                    self.db.upload_batch(batch_buffer, frequency, asset_type="etf")
+                    safe_print(f"💾 批量写入完成: {len(batch_buffer)} 条记录 (表: {self.db._get_table_name(frequency, 'etf')})")
+                except Exception as e:
+                    tb_str = traceback.format_exc()
+                    logger.error(f"❌ 批量入库失败 (最后处理代码: {last_code}): {e}")
                     self.error_count += 1
-                    self.log_error("未知", str(e))
-        
+                    self.log_error(last_code, str(e), tb_str)
+                batch_buffer = []
+
         # 处理剩余数据
         if batch_buffer:
             self.db.upload_batch(batch_buffer, frequency, asset_type="etf")
@@ -1603,6 +1751,7 @@ class StockDataPipeline:
         
         # 记录结束时间
         self.end_time = pd.Timestamp.now()
+        log_listener.stop()
         elapsed_time = (self.end_time - self.start_time).total_seconds()
         
         # 显示统计信息

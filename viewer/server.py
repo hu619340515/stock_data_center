@@ -25,48 +25,71 @@ import json
 import datetime
 import traceback
 import threading
-import numpy as np
+import socketserver
 import duckdb
 from flask import Flask, request, jsonify, send_from_directory, make_response, Response
 from flask_cors import CORS
 
-# 尝试导入数据管道，如果失败则使用 Mock 类
-try:
-    # 假设 core.py 在项目根目录，与 viewer/ 平级
-    import sys
-    _PROJECT_ROOT_FOR_IMPORT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-    if _PROJECT_ROOT_FOR_IMPORT not in sys.path:
-        sys.path.append(_PROJECT_ROOT_FOR_IMPORT)
-    from core import StockDataPipeline, get_progress, reset_progress
-except ImportError as e:
-    print(f"WARNING: 'core.StockDataPipeline' not found: {e}. Using a mock class for server startup.")
-    # 定义一个 mock 类, 避免因缺少 core.py 而启动失败
-    class StockDataPipeline:
-        def __init__(self, db_path):
-            print(f"[MOCK] Initialized StockDataPipeline with db_path: {db_path}")
-        def daily_update_pipeline(self, data_type, mode=None):
-            print(f"[MOCK] Running daily_update_pipeline for data_type={data_type}, mode={mode}")
-            import time
-            time.sleep(2) # 模拟耗时
-            if 'fail' in str(data_type):
-                return False, f"Mock failure for {data_type}"
-            return True, f"Mock success for {data_type} (mode: {mode})"
-        def etf_download_pipeline(self, frequency):
-            print(f"[MOCK] Running etf_download_pipeline for frequency={frequency}")
-            import time
-            time.sleep(2)
-            return True, f"Mock success"
-        def etf_update_pipeline(self, frequency):
-            print(f"[MOCK] Running etf_update_pipeline for frequency={frequency}")
-            import time
-            time.sleep(2)
-            return True, f"Mock success"
+# ── 延迟加载 core 模块（避免启动时就导入 pandas/multiprocessing/config 等整条链）──
+_CORE_MODULE = None
+_MOCK_PIPELINE_CLASS = None
+_MOCK_GET_PROGRESS = None
+_MOCK_RESET_PROGRESS = None
+
+def _get_core():
+    """延迟加载 core 模块，失败时返回备用 mock"""
+    global _CORE_MODULE, _MOCK_PIPELINE_CLASS, _MOCK_GET_PROGRESS, _MOCK_RESET_PROGRESS
+    if _CORE_MODULE is not None or _MOCK_PIPELINE_CLASS is not None:
+        return _CORE_MODULE
     
-    def get_progress():
-        return {'is_running': False}
+    try:
+        import sys as _sys
+        _PROJECT_ROOT_FOR_IMPORT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+        if _PROJECT_ROOT_FOR_IMPORT not in _sys.path:
+            _sys.path.append(_PROJECT_ROOT_FOR_IMPORT)
+        from core import StockDataPipeline, get_progress, reset_progress
+        _CORE_MODULE = (StockDataPipeline, get_progress, reset_progress)
+    except ImportError as e:
+        print(f"WARNING: 'core.StockDataPipeline' not found: {e}. Using a mock class for server startup.")
+        # 定义 mock 类作为备用
+        class _MockPipeline:
+            def __init__(self, db_path=None, use_temp_db=False, asset_type='stock'):
+                self.should_stop = False
+                print(f"[MOCK] Initialized StockDataPipeline with use_temp_db={use_temp_db}, asset_type={asset_type}")
+            def stop(self):
+                self.should_stop = True
+            def cleanup_temp_db(self):
+                pass
+            def merge_to_main_db(self, target_db_path, tables):
+                pass
+            def daily_update_pipeline(self, data_type, mode=None):
+                print(f"[MOCK] Running daily_update_pipeline for data_type={data_type}, mode={mode}")
+                import time
+                time.sleep(2)
+                if 'fail' in str(data_type):
+                    return False, f"Mock failure for {data_type}"
+                return True, f"Mock success for {data_type} (mode: {mode})"
+            def full_download_pipeline(self, data_type):
+                print(f"[MOCK] Running full_download_pipeline for data_type={data_type}")
+                import time
+                time.sleep(2)
+                return True, f"Mock success"
+            def etf_download_pipeline(self, frequency):
+                print(f"[MOCK] Running etf_download_pipeline for frequency={frequency}")
+                import time
+                time.sleep(2)
+                return True, f"Mock success"
+            def etf_update_pipeline(self, frequency):
+                print(f"[MOCK] Running etf_update_pipeline for frequency={frequency}")
+                import time
+                time.sleep(2)
+                return True, f"Mock success"
+        _MOCK_PIPELINE_CLASS = _MockPipeline
+        _MOCK_GET_PROGRESS = lambda: {'is_running': False}
+        _MOCK_RESET_PROGRESS = lambda: None
+        _CORE_MODULE = (_MOCK_PIPELINE_CLASS, _MOCK_GET_PROGRESS, _MOCK_RESET_PROGRESS)
     
-    def reset_progress():
-        pass
+    return _CORE_MODULE
 
 # 后台任务状态
 _task_lock = threading.Lock()
@@ -98,6 +121,7 @@ def _run_task(func, *args, use_temp_db=False, asset_type='stock'):
         if _task_running:
             return False, '已有任务正在运行，请等待完成'
         _task_running = True
+        reset_progress = _get_core()[2]
         reset_progress()
     
     # 根据资产类型选择目标数据库路径
@@ -106,6 +130,7 @@ def _run_task(func, *args, use_temp_db=False, asset_type='stock'):
     def worker():
         global _task_running, _current_pipeline
         try:
+            StockDataPipeline = _get_core()[0]
             pipeline = StockDataPipeline(use_temp_db=use_temp_db, asset_type=asset_type)
             _current_pipeline = pipeline
             func(pipeline, *args)
@@ -344,6 +369,7 @@ def api_status():
 @app.route('/api/progress')
 def api_progress():
     try:
+        get_progress = _get_core()[1]
         progress = get_progress()
         return jsonify(progress)
     except Exception as e:
@@ -659,6 +685,7 @@ def api_distribution():
         return jsonify({'status': 'error', 'msg': f'不支持的字段: {field}'}), 400
 
     try:
+        import numpy as np
         where, params = build_where(start=start, end=end)
         if date:
             where  = (where + ' AND date = ?') if where else 'WHERE date = ?'
@@ -890,6 +917,7 @@ def api_summary_by_code():
 # 启动入口
 # ═══════════════════════════════════════════════════════════
 if __name__ == '__main__':
+    socketserver.TCPServer.allow_reuse_address = True
     print(f"[Server] DB_PATH   = {DB_PATH}")
     print(f"[Server] DB exists = {os.path.exists(DB_PATH)}")
-    app.run(host='0.0.0.0', port=5678, debug=True)
+    app.run(host='127.0.0.1', port=5678, debug=False, threaded=True)
