@@ -454,6 +454,11 @@
           <div class="ov-val" id="stat-max-date">-</div>
           <div class="ov-desc">数据的最新更新日期</div>
         </div>
+        <div class="ov-card" style="background: linear-gradient(135deg, #ec4899, #db2777);">
+          <div class="ov-label">ETF数量</div>
+          <div class="ov-val" id="stat-etf-count">-</div>
+          <div class="ov-desc">ETF基金总数量</div>
+        </div>
       </div>
 
       <div class="card">
@@ -625,16 +630,24 @@ async function loadOverview() {
     }
     
     const currentStats = await api(`/api/overview?table=${currentTable}`);
+    let etfCount = '-';
+    try {
+      const etfStats = await api(`/api/overview?table=etf_daily`);
+      etfCount = etfStats[1]?.value || '-';
+    } catch {}
+
     if (Array.isArray(currentStats) && currentStats.length >= 4) {
       document.getElementById('stat-count').textContent = fmt(currentStats[0]?.value || 0);
       document.getElementById('stat-code-count').textContent = fmt(currentStats[1]?.value || 0);
       document.getElementById('stat-min-date').textContent = currentStats[2]?.value || '-';
       document.getElementById('stat-max-date').textContent = currentStats[3]?.value || '-';
+      document.getElementById('stat-etf-count').textContent = fmt(etfCount);
     } else {
       document.getElementById('stat-count').textContent = '-';
       document.getElementById('stat-code-count').textContent = '-';
       document.getElementById('stat-min-date').textContent = '-';
       document.getElementById('stat-max-date').textContent = '-';
+      document.getElementById('stat-etf-count').textContent = '-';
     }
     
   } catch (e) {
