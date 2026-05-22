@@ -7,7 +7,7 @@ import traceback
 from typing import List, Tuple, Optional, Set, Any
 from database import DuckDBManager
 from data_source_factory import DataSourceFactory
-from config import MAX_WORKERS, START_DATE_FULL, START_DATE_FULL_ETF, DYNAMIC_CONCURRENCY, MIN_WORKERS, MAX_WORKERS_LIMIT, ERROR_THRESHOLD, SUCCESS_THRESHOLD, BATCH_SIZE, MAX_BATCH_SIZE, MIN_BATCH_SIZE, MEMORY_THRESHOLD, USE_ARROW, COMPRESS_DATA, ERROR_LOG_FILE, MAX_ERRORS_BEFORE_WARNING, DEFAULT_DATA_SOURCE, ENABLE_DATA_SOURCE_FALLBACK, DATA_SOURCE_PRIORITY, ENABLE_PROCESS_REVIVE, PROCESS_HEARTBEAT_TIMEOUT, PROCESS_MAX_REVIVE_TIMES, END_DATE
+from config import MAX_WORKERS, START_DATE_FULL, START_DATE_FULL_ETF, DYNAMIC_CONCURRENCY, MIN_WORKERS, MAX_WORKERS_LIMIT, ERROR_THRESHOLD, SUCCESS_THRESHOLD, BATCH_SIZE, MAX_BATCH_SIZE, MIN_BATCH_SIZE, MEMORY_THRESHOLD, USE_ARROW, COMPRESS_DATA, ERROR_LOG_FILE, MAX_ERRORS_BEFORE_WARNING, DEFAULT_DATA_SOURCE, ENABLE_DATA_SOURCE_FALLBACK, DATA_SOURCE_PRIORITY, ENABLE_PROCESS_REVIVE, PROCESS_HEARTBEAT_TIMEOUT, PROCESS_MAX_REVIVE_TIMES, END_DATE, STOCK_DB_PATH, ETF_DB_PATH
 import threading
 import time
 
@@ -1775,3 +1775,129 @@ class StockDataPipeline:
         )
         
         safe_print(f"\n✅ ETF增量流水线结束 (频率: {frequency})")
+
+    def download_all_cycles(self, asset_type: str = 'stock'):
+        """
+        🚀 自动下载指定品类的所有周期数据（日/周/月线）
+        自动判断每个周期是全量下载还是增量更新，串行执行
+        Args:
+            asset_type: 'stock' 或 'etf'
+        """
+        # 初始化多进程日志队列
+        from logger_config import create_mp_log_queue, attach_queue_handler
+        log_queue, log_listener = create_mp_log_queue()
+        attach_queue_handler(log_queue)
+        
+        self.asset_type = asset_type
+        cycles = [
+            ('d', '日线'),
+            ('w', '周线'),
+            ('m', '月线')
+        ]
+        results = []
+        three_month_days = 90
+
+        safe_print(f"\n🚀 开始{asset_type}全周期数据自动下载...")
+        logger.info(f"🚀 启动{asset_type}全周期自动下载任务")
+
+        # 自动清理所有残留的临时表，避免表已存在错误
+        try:
+            safe_print("🧹 清理残留临时表...")
+            # 获取所有以temp_开头的表
+            tables = self.db.con.execute("SELECT table_name FROM information_schema.tables WHERE table_name LIKE 'temp_%'").fetchall()
+            for (table_name,) in tables:
+                self.db.con.execute(f"DROP TABLE IF EXISTS {table_name}")
+                logger.info(f"🧹 清理临时表: {table_name}")
+            safe_print("✅ 临时表清理完成")
+        except Exception as e:
+            logger.warning(f"⚠️ 清理临时表失败: {str(e)}，不影响继续执行")
+
+        for freq, freq_name in cycles:
+            if self.stop_event.is_set():
+                safe_print(f"⏹️ 收到停止信号，中断下载任务")
+                break
+
+            try:
+                start_time = time.time()
+                set_progress(is_running=True, task_name=f'正在下载{asset_type}{freq_name}', start_time=start_time)
+                safe_print(f"\n===== 处理{asset_type}{freq_name} =====")
+
+                # 获取当前频率的最新数据日期
+                latest_date = self.db.get_last_date(stock_code=None, frequency=freq, asset_type=asset_type)
+                if latest_date:
+                    latest_date_dt = pd.to_datetime(latest_date)
+                    days_diff = (pd.Timestamp.now() - latest_date_dt).days
+                    safe_print(f"📅 当前{freq_name}最新数据日期: {latest_date}, 距今{days_diff}天")
+
+                    if days_diff >= three_month_days:
+                        safe_print(f"⚠️ 缺失超过3个月数据，执行全量下载")
+                        # 执行全量下载
+                        if asset_type == 'stock':
+                            self.full_download_pipeline(frequency=freq)
+                        else:
+                            self.etf_download_pipeline(frequency=freq)
+                    else:
+                        safe_print(f"✅ 缺失少于3个月数据，执行增量更新")
+                        # 执行增量更新
+                        if asset_type == 'stock':
+                            self.daily_update_pipeline(frequency=freq)
+                        else:
+                            self.etf_update_pipeline(frequency=freq)
+                else:
+                    safe_print(f"⚠️ 无历史数据，执行全量下载")
+                    # 无历史数据，全量下载
+                    if asset_type == 'stock':
+                        self.full_download_pipeline(frequency=freq)
+                    else:
+                        self.etf_download_pipeline(frequency=freq)
+
+                elapsed = round(time.time() - start_time, 2)
+                results.append({
+                    'cycle': freq_name,
+                    'status': 'success',
+                    'elapsed': elapsed,
+                    'error': None
+                })
+                safe_print(f"✅ {asset_type}{freq_name}处理完成，耗时{elapsed}秒")
+                logger.info(f"✅ {asset_type}{freq_name}处理完成，耗时{elapsed}秒")
+
+            except Exception as e:
+                elapsed = round(time.time() - start_time, 2)
+                error_msg = str(e)
+                tb_str = traceback.format_exc()
+                results.append({
+                    'cycle': freq_name,
+                    'status': 'failed',
+                    'elapsed': elapsed,
+                    'error': error_msg
+                })
+                safe_print(f"❌ {asset_type}{freq_name}处理失败: {error_msg}, 耗时{elapsed}秒")
+                logger.error(f"❌ {asset_type}{freq_name}处理失败: {error_msg}\n{tb_str}")
+                # 继续下一个周期，不中断
+
+        # 生成最终报告
+        safe_print(f"\n📋 {asset_type}全周期下载任务完成，结果汇总:")
+        total_success = sum(1 for r in results if r['status'] == 'success')
+        total_failed = sum(1 for r in results if r['status'] == 'failed')
+        total_elapsed = round(sum(r['elapsed'] for r in results), 2)
+
+        for r in results:
+            status_icon = "✅" if r['status'] == 'success' else "❌"
+            err_info = f" 错误: {r['error']}" if r['error'] else ""
+            safe_print(f"{status_icon} {r['cycle']}: {r['status']}, 耗时{r['elapsed']}秒{err_info}")
+
+        safe_print(f"\n📊 总计: 成功{total_success}个, 失败{total_failed}个, 总耗时{total_elapsed}秒")
+        logger.info(f"📊 {asset_type}全周期下载任务结束: 成功{total_success}, 失败{total_failed}, 总耗时{total_elapsed}秒")
+
+        set_progress(
+            is_running=False,
+            message=f"{asset_type}全周期下载完成: 成功{total_success}/失败{total_failed}"
+        )
+
+        return {
+            'asset_type': asset_type,
+            'total_success': total_success,
+            'total_failed': total_failed,
+            'total_elapsed': total_elapsed,
+            'details': results
+        }

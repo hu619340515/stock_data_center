@@ -183,7 +183,19 @@ def api_daily_download():
 @app.route('/api/daily_to_latest', methods=['POST'])
 def api_daily_to_latest():
     target = request.json.get('target', 'stock')
-    ok, msg = _run_task(lambda p: p.daily_update_pipeline(f'{target}_d'), use_temp_db=True, asset_type=target)
+    ok, msg = _run_task(lambda p: p.daily_update_pipeline(f'{target}_d'), use_temp_db=False, asset_type=target)
+    return jsonify({'success': ok, 'message': msg})
+
+@app.route('/api/download_stock_all_cycles', methods=['POST'])
+def api_download_stock_all_cycles():
+    """下载股票的日/周/月全周期数据，自动判断全量/增量"""
+    ok, msg = _run_task(lambda p: p.download_all_cycles(asset_type='stock'), use_temp_db=False, asset_type='stock')
+    return jsonify({'success': ok, 'message': msg})
+
+@app.route('/api/download_etf_all_cycles', methods=['POST'])
+def api_download_etf_all_cycles():
+    """下载ETF的日/周/月全周期数据，自动判断全量/增量"""
+    ok, msg = _run_task(lambda p: p.download_all_cycles(asset_type='etf'), use_temp_db=False, asset_type='etf')
     return jsonify({'success': ok, 'message': msg})
 
 @app.route('/api/aggregate_weekly', methods=['POST'])

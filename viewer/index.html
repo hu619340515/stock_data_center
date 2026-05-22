@@ -404,6 +404,18 @@
               onclick="triggerUpdate(this, '/api/etf_download', {})">
         <span class="btn-icon">⬇️</span> ETF全量下载
       </button>
+
+      <hr style="margin: 12px 0; border: none; border-top: 1px solid var(--border);" />
+
+      <div class="update-title">✨ 智能全周期下载</div>
+      <button class="update-btn" id="btn-stock-all-cycles"
+              onclick="triggerUpdate(this, '/api/download_stock_all_cycles', {})">
+        <span class="btn-icon">📈</span> 股票数据下载
+      </button>
+      <button class="update-btn" id="btn-etf-all-cycles"
+              onclick="triggerUpdate(this, '/api/download_etf_all_cycles', {})">
+        <span class="btn-icon">📊</span> ETF数据下载
+      </button>
     </div>
   </aside>
 
@@ -793,6 +805,15 @@ async function triggerUpdate(btn, url, body = {}) {
   btn.classList.add('running');
   btn.innerHTML = `<span class="btn-icon">⏳</span> 运行中…`;
   
+  // 自动切换表显示：下载ETF时显示ETF日线，下载股票时显示股票日线
+  if (url.includes('download_etf')) {
+    currentTable = 'etf_daily';
+    document.getElementById('global-table-select').value = currentTable;
+  } else if (url.includes('download_stock')) {
+    currentTable = 'stock_daily';
+    document.getElementById('global-table-select').value = currentTable;
+  }
+
   try {
     const res = await api(url, {
       method: 'POST',

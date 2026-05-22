@@ -315,8 +315,73 @@ class AKShareClient(DataSourceInterface):
             )
             # 新浪接口不支持日期参数，获取全部数据后过滤
             if not df.empty:
-                df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
+                # 数据校验：确保date列是日期格式，过滤异常数据
+                df['date'] = pd.to_datetime(df['date'], errors='coerce')
+                # 过滤date为NaN的行（可能是ETF名称等异常数据）
+                df = df.dropna(subset=['date'])
+                if df.empty:
+                    logger.warning(f"⚠️ ETF {code} 数据过滤后为空")
+                    return pd.DataFrame()
+                df['date'] = df['date'].dt.strftime('%Y-%m-%d')
                 df = df[(df['date'] >= start_date_fund) & (df['date'] <= end_date_fund)]
+            
+            # 新浪接口只返回日线数据，需要转换为周线或月线
+            if not df.empty and frequency in ['w', 'm']:
+                logger.info(f"🔄 将ETF日线数据转换为{frequency}周期")
+                df['date'] = pd.to_datetime(df['date'])
+                
+                # 过滤掉未来日期的数据（只保留到当前日期）
+                current_date = pd.Timestamp.now()
+                original_count = len(df)
+                df = df[df['date'] <= current_date]
+                if original_count > len(df):
+                    logger.warning(f"⚠️ 过滤了 {original_count - len(df)} 条未来日期数据")
+                
+                df = df.set_index('date')
+                
+                # 定义周期转换规则 (pandas新版本使用'ME'代替'M'表示月末)
+                freq_map = {'w': 'W', 'm': 'ME'}
+                resample_freq = freq_map.get(frequency, 'W')
+                
+                # 重采样：开盘取第一个，最高取最大，最低取最小，收盘取最后
+                # 只保留需要的数值列进行重采样
+                df_resampled = df[['open', 'high', 'low', 'close', 'volume', 'amount']].resample(resample_freq).agg({
+                    'open': 'first',
+                    'high': 'max',
+                    'low': 'min',
+                    'close': 'last',
+                    'volume': 'sum',
+                    'amount': 'sum'
+                }).dropna()
+                
+                # 计算涨跌幅
+                df_resampled['pctChg'] = df_resampled['close'].pct_change() * 100
+                df_resampled['pctChg'] = df_resampled['pctChg'].fillna(0)
+                
+                # 重置日期格式
+                df_resampled = df_resampled.reset_index()
+                
+                # 再次过滤，确保周期结束日期也不超过当前日期
+                # pandas resample 会产生周期结束日期（如周日的日期），需要过滤
+                df_resampled = df_resampled[df_resampled['date'] <= current_date]
+                
+                df_resampled['date'] = df_resampled['date'].dt.strftime('%Y-%m-%d')
+                
+                # 添加code列和其他必要字段
+                df_resampled['code'] = code
+                df_resampled['name'] = ""  # name字段后续在worker_download中填充
+                df_resampled['preclose'] = 0.0
+                df_resampled['adjustflag'] = ""
+                df_resampled['turn'] = 0.0
+                df_resampled['tradestatus'] = "1"
+                df_resampled['isST'] = "0"
+                
+                # 强制按照数据库表结构的列顺序排列
+                target_columns = [
+                    'code', 'name', 'date', 'open', 'high', 'low', 'close', 'preclose', 
+                    'volume', 'amount', 'adjustflag', 'turn', 'tradestatus', 'pctChg', 'isST'
+                ]
+                df = df_resampled[target_columns]
         else:
             # 股票使用东方财富接口，增加更长延迟避免限流
             logger.info(f"📥 [AKShare] 获取股票 {code} 数据: {start_date_stock} ~ {end_date_stock}")

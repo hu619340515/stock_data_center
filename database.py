@@ -227,28 +227,81 @@ class DuckDBManager:
             return 0
         
         try:
-            combined_df = pd.concat(df_list, ignore_index=True)
+            # 检查所有DataFrame的列顺序是否一致
+            target_columns = [
+                'code', 'name', 'date', 'open', 'high', 'low', 'close', 'preclose', 
+                'volume', 'amount', 'adjustflag', 'turn', 'tradestatus', 'pctChg', 'isST'
+            ]
+            
+            # 强制每个DataFrame的列顺序一致
+            aligned_dfs = []
+            for i, df in enumerate(df_list):
+                if df is not None and not df.empty:
+                    # 检查列顺序是否正确
+                    if list(df.columns) != target_columns:
+                        logger.warning(f"⚠️ DataFrame {i} 列顺序不一致，正在调整: {df.columns.tolist()}")
+                    # 确保所有必需的列都存在
+                    for col in target_columns:
+                        if col not in df.columns:
+                            if col in ['open', 'high', 'low', 'close', 'preclose', 'volume', 'amount', 'turn', 'pctChg']:
+                                df[col] = 0.0
+                            elif col in ['adjustflag']:
+                                df[col] = ""
+                            elif col in ['tradestatus']:
+                                df[col] = "1"
+                            elif col in ['isST']:
+                                df[col] = "0"
+                            elif col in ['code', 'name', 'date']:
+                                df[col] = ""
+                    # 强制列顺序
+                    aligned_df = df[target_columns]
+                    aligned_dfs.append(aligned_df)
+            
+            combined_df = pd.concat(aligned_dfs, ignore_index=True) if aligned_dfs else pd.DataFrame()
             if combined_df.empty: 
                 safe_print(f"⚠️ upload_batch 空数据框 - frequency={frequency}, asset_type={asset_type}")
                 return 0
+
+            # 检查合并后的列顺序
+            if list(combined_df.columns) != target_columns:
+                logger.error(f"❌ 合并后列顺序错误: {combined_df.columns.tolist()}")
+                # 强制重新排序
+                combined_df = combined_df[target_columns]
 
             df_clean = self._clean_data(combined_df)
             count = len(df_clean)
             table_name = self._get_table_name(frequency, asset_type)
             safe_print(f"📥 upload_batch - 准备写入 {count} 条记录到 {table_name}")
             
+            # 调试：检查df_clean的前几行数据
+            if not df_clean.empty:
+                logger.debug(f"📊 df_clean前3行数据:")
+                logger.debug(f"列顺序: {df_clean.columns.tolist()}")
+                for i in range(min(3, len(df_clean))):
+                    row_dict = df_clean.iloc[i].to_dict()
+                    logger.debug(f"行{i}: {row_dict}")
+            
             # 优化：使用DuckDB的COPY命令进行更高效的批量导入
             # 对于大型DataFrame，COPY命令比INSERT更高效
             if count > 1000:
                 # 对于大型数据，使用COPY命令
                 temp_table = f"temp_{table_name}"
+                # 先删除可能存在的残留临时表，避免冲突
+                self.con.execute(f"DROP TABLE IF EXISTS {temp_table}")
                 self.con.execute(f"CREATE TEMP TABLE {temp_table} AS SELECT * FROM {table_name} WHERE 1=0")
-                self.con.execute(f"INSERT INTO {temp_table} SELECT * FROM df_clean")
+                # 显式指定列名
+                columns_str = ', '.join(df_clean.columns.tolist())
+                self.con.execute(f"INSERT INTO {temp_table} ({columns_str}) SELECT {columns_str} FROM df_clean")
                 self.con.execute(f"INSERT OR REPLACE INTO {table_name} SELECT * FROM {temp_table}")
-                self.con.execute(f"DROP TABLE {temp_table}")
+                self.con.execute(f"DROP TABLE IF EXISTS {temp_table}")
             else:
                 # 对于小型数据，使用常规INSERT
-                self.con.execute(f"INSERT OR REPLACE INTO {table_name} SELECT * FROM df_clean")
+                # 显式指定列名
+                columns_str = ', '.join(df_clean.columns.tolist())
+                self.con.execute(f"INSERT OR REPLACE INTO {table_name} ({columns_str}) SELECT {columns_str} FROM df_clean")
+            
+            # 显式提交事务，确保数据持久化到磁盘
+            self.con.commit()
             
             logger.info(f"💾 批量写入完成: {count} 条记录 (表: {table_name})")
             return count
@@ -361,14 +414,17 @@ class DuckDBManager:
             logger.error(f"查询缺失日期范围失败: {e}")
             return [(start_date, end_date)]
 
-    def get_last_date(self, stock_code: str, frequency: str = "d", asset_type: str = "stock"):
-        """获取某只股票/ETF在数据库中的最后交易日"""
+    def get_last_date(self, stock_code: str = None, frequency: str = "d", asset_type: str = "stock"):
+        """获取某只股票/ETF在数据库中的最后交易日，如果stock_code为None则获取整个表的最新日期"""
         try:
             table_name = self._get_table_name(frequency, asset_type)
-            res = self.con.execute(
-                f"SELECT MAX(date) FROM {table_name} WHERE code = ?", 
-                [stock_code]
-            ).fetchone()
+            if stock_code is None:
+                res = self.con.execute(f"SELECT MAX(date) FROM {table_name}").fetchone()
+            else:
+                res = self.con.execute(
+                    f"SELECT MAX(date) FROM {table_name} WHERE code = ?", 
+                    [stock_code]
+                ).fetchone()
             if res[0]:
                 # 确保返回字符串格式
                 if isinstance(res[0], str):
@@ -553,18 +609,63 @@ class DuckDBManager:
     def _clean_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """数据清洗：类型转换 + 列顺序重排"""
         df_copy = df.copy()
-        if 'date' in df_copy.columns:
-            df_copy['date'] = pd.to_datetime(df_copy['date']).dt.date
-        numeric_cols = ['open', 'high', 'low', 'close', 'preclose', 'volume', 'amount', 'turn', 'pctChg']
-        for col in numeric_cols:
-            if col in df_copy.columns:
-                df_copy[col] = pd.to_numeric(df_copy[col], errors='coerce').fillna(0)
         
-        target_columns = [
+        # 确保所有必需的列都存在
+        required_columns = [
             'code', 'name', 'date', 'open', 'high', 'low', 'close', 'preclose', 
             'volume', 'amount', 'adjustflag', 'turn', 'tradestatus', 'pctChg', 'isST'
         ]
-        return df_copy[target_columns]
+        
+        # 添加缺失的列
+        for col in required_columns:
+            if col not in df_copy.columns:
+                if col in ['open', 'high', 'low', 'close', 'preclose', 'volume', 'amount', 'turn', 'pctChg']:
+                    df_copy[col] = 0.0
+                elif col in ['adjustflag']:
+                    df_copy[col] = ""
+                elif col in ['tradestatus']:
+                    df_copy[col] = "1"
+                elif col in ['isST']:
+                    df_copy[col] = "0"
+                elif col in ['code', 'name', 'date']:
+                    df_copy[col] = ""
+        
+        # 日期字段处理：确保是日期格式
+        if 'date' in df_copy.columns:
+            # 检查date列的数据类型
+            logger.debug(f"📊 date列原始类型: {df_copy['date'].dtype}")
+            # 先尝试转换，无效的日期会变成NaT
+            df_copy['date'] = pd.to_datetime(df_copy['date'], errors='coerce')
+            # 过滤无效日期的行
+            valid_mask = df_copy['date'].notna()
+            invalid_count = len(df_copy) - valid_mask.sum()
+            if invalid_count > 0:
+                logger.warning(f"⚠️ 过滤 {invalid_count} 条无效日期数据")
+            df_copy = df_copy[valid_mask]
+            if not df_copy.empty:
+                df_copy['date'] = df_copy['date'].dt.date
+                logger.debug(f"📊 date列转换后类型: {df_copy['date'].dtype}")
+        
+        # 数字字段处理
+        numeric_cols = ['open', 'high', 'low', 'close', 'preclose', 'volume', 'amount', 'turn', 'pctChg']
+        for col in numeric_cols:
+            if col in df_copy.columns:
+                logger.debug(f"📊 {col}列原始类型: {df_copy[col].dtype}")
+                df_copy[col] = pd.to_numeric(df_copy[col], errors='coerce').fillna(0)
+                logger.debug(f"📊 {col}列转换后类型: {df_copy[col].dtype}")
+        
+        # 检查列顺序
+        if list(df_copy.columns) != required_columns:
+            logger.warning(f"⚠️ _clean_data 列顺序不一致: {df_copy.columns.tolist()}")
+        
+        # 强制按照目标列顺序重排
+        result = df_copy[required_columns]
+        
+        # 验证最终列顺序
+        if list(result.columns) != required_columns:
+            logger.error(f"❌ _clean_data 最终列顺序错误: {result.columns.tolist()}")
+        
+        return result
 
     def close(self):
         self.con.close()
