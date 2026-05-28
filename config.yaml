@@ -12,16 +12,16 @@ qmt:
   dividend_type: "front"  # none/front/back/front_ratio/back_ratio
   download_before_query: true  # 查询历史行情前先同步下载到本地缓存
   sync_sector_data: false  # download_sector_data 在部分券商环境会长时间阻塞，默认不在启动路径同步
-  code_list_data_dir: "S:/QMT/国金证券QMT交易端/datadir"  # 板块为空时，从QMT本地datadir推导股票/ETF代码
+  code_list_data_dir: ""  # 板块为空时，从QMT本地datadir推导股票/ETF代码
   stock_sectors: ["沪深A股"]  # QMT板块名，可按券商环境调整
   etf_sectors: ["沪深ETF", "沪深基金"]  # QMT板块名，可按券商环境调整
 
 # 并发与性能配置
 concurrency:
-  max_workers: 20  # QMT本地缓存下载并发数
+  max_workers: 10  # QMT本地缓存下载并发数
   dynamic_concurrency: true  # 是否启用动态并发控制，true表示根据错误率和成功率自动调整进程数
   min_workers: 3  # 最小并发进程数，当错误率过高时会减少到此值
-  max_workers_limit: 20  # 最大并发进程数限制，动态调整时不会超过此值
+  max_workers_limit: 10  # 最大并发进程数限制，动态调整时不会超过此值
   error_threshold: 3  # 错误率阈值(%)，当错误率超过此值时自动减少进程数
   success_threshold: 95  # 成功率阈值(%)，当成功率超过此值时自动增加进程数
 
@@ -34,7 +34,7 @@ batch:
 
 # 重试机制配置
 retry:
-  max_retries: 20  # 最大重试次数，网络错误时会自动重试此次数
+  max_retries: 200  # 最大重试次数，网络错误时会自动重试此次数
   initial_retry_delay: 1  # 初始重试延迟时间(秒)，第一次重试等待1秒
   max_retry_delay: 10  # 最大重试延迟时间(秒)，重试延迟不会超过此值
   retry_backoff_factor: 2  # 重试退避因子，每次重试延迟时间乘以此因子(1秒、2秒、4秒...)
@@ -60,7 +60,7 @@ error:
 # 进程监控与复活配置
 process_monitor:
   enable_revive: true  # 是否启用进程自动复活功能，true表示当进程卡住或异常退出时自动重启
-  heartbeat_timeout: 30  # 进程心跳超时时间(秒)，如果进程超过此时间没有输出任何日志/进度，则认为已卡住
+  heartbeat_timeout: 120  # 进程心跳超时时间(秒)，如果进程超过此时间没有输出任何日志/进度，则认为已卡住
   max_revive_times: 20  # 单个进程最大复活次数，超过此次数后不再重启，避免无限循环
 
 # 数据处理配置

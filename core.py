@@ -605,6 +605,7 @@ class StockDataPipeline:
         process_revive_counts: List[int] = [0] * len(chunks)  # 记录每个进程的复活次数
         process_last_heartbeat: List[float] = [time.time()] * len(chunks)  # 记录每个进程最后心跳时间
         process_current_progress: List[Tuple[int, int]] = [(0, len(c)) for c in chunks]  # 记录每个进程当前进度(已处理, 总数)
+        process_base_completed: List[int] = [0] * len(chunks)  # 复活后累积已完成的偏移量
         end_date = pd.Timestamp.now().strftime("%Y-%m-%d")
 
         for i, chunk in enumerate(chunks):
@@ -674,7 +675,7 @@ class StockDataPipeline:
                         idx = process_id - 1
                         if 0 <= idx < len(processes):
                             process_last_heartbeat[idx] = heartbeat_time
-                            process_current_progress[idx] = (processed, total)
+                            process_current_progress[idx] = (process_base_completed[idx] + processed, len(process_chunks[idx]))
                     except:
                         pass
                 
@@ -695,6 +696,7 @@ class StockDataPipeline:
                             # 获取剩余未处理的任务
                             processed, total = process_current_progress[idx]
                             remaining_chunk = process_chunks[idx].iloc[processed:]
+                            process_base_completed[idx] = processed
                             
                             if not remaining_chunk.empty:
                                 # 重启进程，只处理剩余的任务
@@ -722,6 +724,7 @@ class StockDataPipeline:
                         # 获取剩余未处理的任务
                         processed, total = process_current_progress[idx]
                         remaining_chunk = process_chunks[idx].iloc[processed:]
+                        process_base_completed[idx] = processed
                         
                         if not remaining_chunk.empty:
                             # 重启进程，只处理剩余的任务
@@ -981,6 +984,7 @@ class StockDataPipeline:
         process_revive_counts: List[int] = [0] * len(chunks)  # 记录每个进程的复活次数
         process_last_heartbeat: List[float] = [time.time()] * len(chunks)  # 记录每个进程最后心跳时间
         process_current_progress: List[Tuple[int, int]] = [(0, len(c)) for c in chunks]  # 记录每个进程当前进度(已处理, 总数)
+        process_base_completed: List[int] = [0] * len(chunks)  # 复活后累积已完成的偏移量
 
         for i, chunk in enumerate(chunks):
             p = Process(target=worker_update, args=(i+1, chunk, data_queue, heartbeat_queue, frequency, self.stop_event, 'stock', log_queue))
@@ -1034,7 +1038,7 @@ class StockDataPipeline:
                         idx = process_id - 1
                         if 0 <= idx < len(processes):
                             process_last_heartbeat[idx] = heartbeat_time
-                            process_current_progress[idx] = (processed, total)
+                            process_current_progress[idx] = (process_base_completed[idx] + processed, len(process_chunks[idx]))
                     except:
                         pass
                 
@@ -1055,6 +1059,7 @@ class StockDataPipeline:
                             # 获取剩余未处理的任务
                             processed, total = process_current_progress[idx]
                             remaining_chunk = process_chunks[idx].iloc[processed:]
+                            process_base_completed[idx] = processed
                             
                             if not remaining_chunk.empty:
                                 # 重启进程，只处理剩余的任务
@@ -1082,6 +1087,7 @@ class StockDataPipeline:
                         # 获取剩余未处理的任务
                         processed, total = process_current_progress[idx]
                         remaining_chunk = process_chunks[idx].iloc[processed:]
+                        process_base_completed[idx] = processed
                         
                         if not remaining_chunk.empty:
                             # 重启进程，只处理剩余的任务
@@ -1579,6 +1585,7 @@ class StockDataPipeline:
         process_revive_counts: List[int] = [0] * len(chunks)  # 记录每个进程的复活次数
         process_last_heartbeat: List[float] = [time.time()] * len(chunks)  # 记录每个进程最后心跳时间
         process_current_progress: List[Tuple[int, int]] = [(0, len(c)) for c in chunks]  # 记录每个进程当前进度(已处理, 总数)
+        process_base_completed: List[int] = [0] * len(chunks)  # 复活后累积已完成的偏移量
 
         for i, chunk in enumerate(chunks):
             p = Process(target=worker_update, args=(i+1, chunk, data_queue, heartbeat_queue, frequency, self.stop_event, 'etf', log_queue))
@@ -1619,7 +1626,7 @@ class StockDataPipeline:
                         idx = process_id - 1
                         if 0 <= idx < len(processes):
                             process_last_heartbeat[idx] = heartbeat_time
-                            process_current_progress[idx] = (processed, total)
+                            process_current_progress[idx] = (process_base_completed[idx] + processed, len(process_chunks[idx]))
                     except:
                         pass
                 
@@ -1640,6 +1647,7 @@ class StockDataPipeline:
                             # 获取剩余未处理的任务
                             processed, total = process_current_progress[idx]
                             remaining_chunk = process_chunks[idx].iloc[processed:]
+                            process_base_completed[idx] = processed
                             
                             if not remaining_chunk.empty():
                                 # 重启进程，只处理剩余的任务
@@ -1667,6 +1675,7 @@ class StockDataPipeline:
                         # 获取剩余未处理的任务
                         processed, total = process_current_progress[idx]
                         remaining_chunk = process_chunks[idx].iloc[processed:]
+                        process_base_completed[idx] = processed
                         
                         if not remaining_chunk.empty():
                             # 重启进程，只处理剩余的任务

@@ -268,6 +268,8 @@ def get_conn(read_only=True, asset_type='stock'):
             return conn
         except TypeError:
             return duckdb.connect(db_path)
+        except duckdb.ConnectionException:
+            return duckdb.connect(db_path)
         except Exception as e:
             # 如果数据库被锁定，尝试只读连接
             if read_only and attempt < max_retries -1:

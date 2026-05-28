@@ -7,6 +7,91 @@ from typing import Any, Dict
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(PROJECT_ROOT, "logs")
 
+def _auto_find_qmt_paths():
+    """自动查找常见的 QMT 安装路径"""
+    common_paths = []
+    
+    # 常见的驱动器
+    drives = ['C:', 'D:', 'E:', 'F:', 'G:','H:','S:']
+    
+    # 常见的 QMT 安装目录名称
+    qmt_dir_names = [
+        'QMT', '国金证券QMT', '国金证券QMT交易端', '国金QMT', 'miniQMT',
+        'QMT交易端', 'QMT交易系统', '国金QMT交易端'
+    ]
+    
+    # 检查常见路径
+    for drive in drives:
+        for dir_name in qmt_dir_names:
+            # 检查根目录下的路径
+            path = os.path.join(drive, dir_name)
+            if os.path.exists(path):
+                common_paths.append(path)
+            
+            # 检查 Program Files/Program Files (x86)
+            for pf in ['Program Files', 'Program Files (x86)']:
+                path = os.path.join(drive, pf, dir_name)
+                if os.path.exists(path):
+                    common_paths.append(path)
+    
+    # 从注册表查找（Windows only）
+    try:
+        import winreg
+        key_paths = [
+            r'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+            r'SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+        ]
+        
+        for key_path in key_paths:
+            try:
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path) as key:
+                    i = 0
+                    while True:
+                        try:
+                            subkey_name = winreg.EnumKey(key, i)
+                            i += 1
+                            try:
+                                with winreg.OpenKey(key, subkey_name) as subkey:
+                                    display_name, _ = winreg.QueryValueEx(subkey, 'DisplayName')
+                                    if 'QMT' in display_name or '国金' in display_name:
+                                        try:
+                                            install_location, _ = winreg.QueryValueEx(subkey, 'InstallLocation')
+                                            if install_location and os.path.exists(install_location):
+                                                common_paths.append(install_location)
+                                        except:
+                                            pass
+                            except:
+                                pass
+                        except OSError:
+                            break
+            except:
+                pass
+    except:
+        pass
+    
+    # 去重并检查 datadir
+    found_datadir = None
+    found_qmt_dir = None
+    
+    for path in set(common_paths):
+        # 检查这个路径下的 datadir
+        datadir_candidates = [
+            os.path.join(path, 'datadir'),
+            os.path.join(path, 'userdata_mini', 'datadir'),
+            os.path.join(path, 'userdata', 'datadir')
+        ]
+        
+        for datadir in datadir_candidates:
+            if os.path.exists(datadir):
+                found_datadir = datadir
+                found_qmt_dir = path
+                break
+        
+        if found_datadir:
+            break
+    
+    return found_qmt_dir, found_datadir
+
 class ConfigLoader:
     """配置加载器"""
     
@@ -19,7 +104,22 @@ class ConfigLoader:
         try:
             with open(self.config_file, 'r', encoding='utf-8') as f:
                 config = yaml.safe_load(f)
-            return self._replace_env_vars(config)
+            config = self._replace_env_vars(config)
+            
+            # 自动查找 QMT 路径（如果未配置）
+            qmt_config = config.get('qmt', {})
+            if not qmt_config.get('code_list_data_dir') or not qmt_config.get('data_dir'):
+                qmt_dir, datadir = _auto_find_qmt_paths()
+                if datadir:
+                    print(f"[Config] 自动发现 QMT 路径: {qmt_dir}")
+                    print(f"[Config] 自动配置 datadir: {datadir}")
+                    if not qmt_config.get('code_list_data_dir'):
+                        qmt_config['code_list_data_dir'] = datadir
+                    if not qmt_config.get('data_dir'):
+                        qmt_config['data_dir'] = datadir
+                    config['qmt'] = qmt_config
+            
+            return config
         except Exception as e:
             print(f"Warning: 加载配置文件失败: {e}")
             return self._get_default_config()
