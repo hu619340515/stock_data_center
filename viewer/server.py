@@ -26,6 +26,7 @@ import datetime
 import traceback
 import threading
 import socketserver
+import sys
 import duckdb
 from flask import Flask, request, jsonify, send_from_directory, make_response, Response
 from flask_cors import CORS
@@ -101,14 +102,19 @@ _current_pipeline = None  # 保存当前正在运行的 pipeline 实例
 # ─────────────────────────────────────────────
 _VIEWER_DIR   = os.path.abspath(os.path.dirname(__file__))
 _PROJECT_ROOT = os.path.abspath(os.path.join(_VIEWER_DIR, '..'))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.append(_PROJECT_ROOT)
+from config import STOCK_DB_PATH as CONFIG_STOCK_DB_PATH, ETF_DB_PATH as CONFIG_ETF_DB_PATH, LOG_DIR
 
 # 数据库路径配置
-STOCK_DB_PATH = os.path.join(_PROJECT_ROOT, 'stock_data.db')
-ETF_DB_PATH = os.path.join(_PROJECT_ROOT, 'etf_data.db')
+STOCK_DB_PATH = os.environ.get('STOCK_DB_PATH', CONFIG_STOCK_DB_PATH)
+ETF_DB_PATH = os.environ.get('ETF_DB_PATH', CONFIG_ETF_DB_PATH)
 DEFAULT_DB_PATH = STOCK_DB_PATH  # 默认使用股票数据库
 
 # 优先读环境变量
 DB_PATH = os.environ.get('DB_PATH', DEFAULT_DB_PATH)
+APP_LOG_PATH = os.path.join(LOG_DIR, 'app.log')
+ERROR_LOG_PATH = os.path.join(_PROJECT_ROOT, 'error_log.txt')
 
 app = Flask(__name__, static_folder=_VIEWER_DIR)
 CORS(app)
@@ -125,7 +131,7 @@ def _run_task(func, *args, use_temp_db=False, asset_type='stock'):
         reset_progress()
     
     # 根据资产类型选择目标数据库路径
-    target_db_path = os.path.join(_PROJECT_ROOT, 'stock_data.db') if asset_type == 'stock' else os.path.join(_PROJECT_ROOT, 'etf_data.db')
+    target_db_path = STOCK_DB_PATH if asset_type == 'stock' else ETF_DB_PATH
     
     def worker():
         global _task_running, _current_pipeline
@@ -177,13 +183,19 @@ def api_stop_task():
 @app.route('/api/daily_download', methods=['POST'])
 def api_daily_download():
     target = request.json.get('target', 'stock')
-    ok, msg = _run_task(lambda p: p.full_download_pipeline(f'{target}_d'), use_temp_db=True, asset_type=target)
+    if target == 'etf':
+        ok, msg = _run_task(lambda p: p.etf_download_pipeline('d'), use_temp_db=True, asset_type='etf')
+    else:
+        ok, msg = _run_task(lambda p: p.full_download_pipeline('d'), use_temp_db=True, asset_type='stock')
     return jsonify({'success': ok, 'message': msg})
 
 @app.route('/api/daily_to_latest', methods=['POST'])
 def api_daily_to_latest():
     target = request.json.get('target', 'stock')
-    ok, msg = _run_task(lambda p: p.daily_update_pipeline(f'{target}_d'), use_temp_db=False, asset_type=target)
+    if target == 'etf':
+        ok, msg = _run_task(lambda p: p.etf_update_pipeline('d'), use_temp_db=False, asset_type='etf')
+    else:
+        ok, msg = _run_task(lambda p: p.daily_update_pipeline('d'), use_temp_db=False, asset_type='stock')
     return jsonify({'success': ok, 'message': msg})
 
 @app.route('/api/download_stock_all_cycles', methods=['POST'])
@@ -201,13 +213,19 @@ def api_download_etf_all_cycles():
 @app.route('/api/aggregate_weekly', methods=['POST'])
 def api_aggregate_weekly():
     target = request.json.get('target', 'stock')
-    ok, msg = _run_task(lambda p: p.full_download_pipeline(f'{target}_w'), use_temp_db=True, asset_type=target)
+    if target == 'etf':
+        ok, msg = _run_task(lambda p: p.etf_download_pipeline('w'), use_temp_db=True, asset_type='etf')
+    else:
+        ok, msg = _run_task(lambda p: p.full_download_pipeline('w'), use_temp_db=True, asset_type='stock')
     return jsonify({'success': ok, 'message': msg})
 
 @app.route('/api/aggregate_monthly', methods=['POST'])
 def api_aggregate_monthly():
     target = request.json.get('target', 'stock')
-    ok, msg = _run_task(lambda p: p.full_download_pipeline(f'{target}_m'), use_temp_db=True, asset_type=target)
+    if target == 'etf':
+        ok, msg = _run_task(lambda p: p.etf_download_pipeline('m'), use_temp_db=True, asset_type='etf')
+    else:
+        ok, msg = _run_task(lambda p: p.full_download_pipeline('m'), use_temp_db=True, asset_type='stock')
     return jsonify({'success': ok, 'message': msg})
 
 @app.route('/api/etf_download', methods=['POST'])
@@ -273,6 +291,14 @@ def df_to_records(df):
         if 'datetime' in dtype_str or 'date' in dtype_str or dtype_str == 'object':
             df[col] = df[col].astype(str)
     return df.to_dict(orient='records')
+
+def read_last_lines(path, max_lines=200):
+    max_lines = max(1, min(int(max_lines), 2000))
+    if not os.path.exists(path):
+        return []
+    from collections import deque
+    with open(path, 'r', encoding='utf-8', errors='replace') as f:
+        return list(deque((line.rstrip('\n') for line in f), maxlen=max_lines))
 
 def check_table(table):
     if table not in ALLOWED_TABLES:
@@ -383,6 +409,9 @@ def api_progress():
     try:
         get_progress = _get_core()[1]
         progress = get_progress()
+        progress['backend_task_running'] = _task_running
+        progress['data_source'] = 'qmt'
+        progress['log_path'] = APP_LOG_PATH
         return jsonify(progress)
     except Exception as e:
         return jsonify({
@@ -394,8 +423,30 @@ def api_progress():
             'error': 0,
             'speed': 0,
             'eta': '',
-            'message': ''
+            'message': '',
+            'backend_task_running': _task_running,
+            'data_source': 'qmt',
+            'log_path': APP_LOG_PATH
         })
+
+
+@app.route('/api/logs')
+def api_logs():
+    try:
+        limit = request.args.get('limit', 200)
+        include_errors = request.args.get('errors', '1') != '0'
+        logs = read_last_lines(APP_LOG_PATH, limit)
+        error_logs = read_last_lines(ERROR_LOG_PATH, 80) if include_errors else []
+        return jsonify({
+            'status': 'ok',
+            'is_running': _task_running,
+            'log_path': APP_LOG_PATH,
+            'error_log_path': ERROR_LOG_PATH,
+            'logs': logs,
+            'error_logs': error_logs,
+        })
+    except Exception as e:
+        return jsonify({'status': 'error', 'msg': str(e), 'logs': [], 'error_logs': []}), 500
 
 
 # ═══════════════════════════════════════════════════════════
@@ -863,13 +914,13 @@ def api_delete():
         return jsonify({'status': 'error', 'msg': '必须指定 code 或 start/end 至少一个条件'}), 400
 
     try:
-        where = build_where(code=code, start=start, end=end)
+        where, params = build_where(code=code, start=start, end=end)
         if not where:
             return jsonify({'status': 'error', 'msg': '条件为空，拒绝全表删除'}), 400
         asset_type = 'etf' if table.startswith('etf_') else 'stock'
         conn  = get_conn(read_only=False, asset_type=asset_type)
-        count = conn.execute(f"SELECT COUNT(1) FROM {table} {where}").fetchone()[0]
-        conn.execute(f"DELETE FROM {table} {where}")
+        count = conn.execute(f"SELECT COUNT(1) FROM {table} {where}", params).fetchone()[0]
+        conn.execute(f"DELETE FROM {table} {where}", params)
         conn.commit()
         conn.close()
         return jsonify({'status': 'ok', 'deleted': int(count)})
@@ -909,7 +960,7 @@ def api_summary_by_code():
     if err: return err
 
     try:
-        where = build_where(start=start, end=end)
+        where, params = build_where(start=start, end=end)
         asset_type = 'etf' if table.startswith('etf_') else 'stock'
         conn  = get_conn(asset_type=asset_type)
         sql   = (f"SELECT code, COUNT(1) as days, "
@@ -918,7 +969,7 @@ def api_summary_by_code():
                  f"SUM(volume) as total_volume "
                  f"FROM {table} {where} "
                  f"GROUP BY code ORDER BY total_volume DESC LIMIT {limit}")
-        df = conn.execute(sql).fetchdf()
+        df = conn.execute(sql, params).fetchdf()
         conn.close()
         return jsonify(df_to_records(df))
     except Exception as e:

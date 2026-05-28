@@ -28,6 +28,14 @@ class DataSourceInterface(ABC):
         返回包含股票代码和名称的DataFrame
         """
         pass
+
+    @abstractmethod
+    def get_etf_list(self) -> pd.DataFrame:
+        """
+        📋 获取ETF列表
+        返回包含ETF代码和名称的DataFrame
+        """
+        pass
     
     @abstractmethod
     def get_stock_history(self, code: str, start_date: str, end_date: str, frequency: str = "d") -> pd.DataFrame:

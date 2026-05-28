@@ -2,7 +2,23 @@ import logging
 import logging.handlers
 import os
 import multiprocessing
+import sys
 from config import LOG_DIR
+
+
+def configure_console_encoding():
+    """Make console output tolerant of emoji/non-ASCII logs on Windows."""
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is None or not hasattr(stream, "reconfigure"):
+            continue
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+configure_console_encoding()
 
 
 def setup_logger(name="StockLogger", log_file="app.log", level=logging.INFO):
@@ -19,11 +35,16 @@ def setup_logger(name="StockLogger", log_file="app.log", level=logging.INFO):
         encoding='utf-8'
     )
     handler.setFormatter(formatter)
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
     
     logger = logging.getLogger(name)
     logger.setLevel(level)
+    for old_handler in list(logger.handlers):
+        logger.removeHandler(old_handler)
     logger.addHandler(handler)
-    logger.addHandler(logging.StreamHandler()) # 屏幕输出
+    logger.addHandler(stream_handler) # 屏幕输出
+    logger.propagate = False
     
     return logger
 
@@ -83,3 +104,6 @@ def attach_queue_handler(log_queue):
         lg = logging.getLogger(name)
         for h in list(lg.handlers):
             lg.removeHandler(h)
+        lg.propagate = True
+        if lg.level == logging.NOTSET:
+            lg.setLevel(logging.INFO)

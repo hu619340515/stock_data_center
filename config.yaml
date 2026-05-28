@@ -1,14 +1,24 @@
 # 数据库配置
 database:
   path: "quant_data.db"  # 数据库文件路径，默认保存在项目根目录下，支持相对路径和绝对路径
+  stock_path: "stock_data.db"  # 股票数据库文件路径
+  etf_path: "etf_data.db"  # ETF数据库文件路径
 
-# Baostock 配置
-baostock:
-  adjust_flag: "2"  # 复权类型：1-后复权，2-前复权，3-不复权，建议使用前复权(2)以保持价格连续性
+# QMT/xtquant 配置（国金QMT通常通过本机 miniQMT/QMT + xtquant 提供行情）
+qmt:
+  ip: "127.0.0.1"  # 本机QMT行情服务地址
+  port: 58610  # MiniQMT/miniquote 行情端口；普通交易端 58600 不提供完整历史行情接口
+  data_dir: ""  # 可选：miniQMT userdata_mini 目录；留空则使用 xtquant 默认目录
+  dividend_type: "front"  # none/front/back/front_ratio/back_ratio
+  download_before_query: true  # 查询历史行情前先同步下载到本地缓存
+  sync_sector_data: false  # download_sector_data 在部分券商环境会长时间阻塞，默认不在启动路径同步
+  code_list_data_dir: "S:/QMT/国金证券QMT交易端/datadir"  # 板块为空时，从QMT本地datadir推导股票/ETF代码
+  stock_sectors: ["沪深A股"]  # QMT板块名，可按券商环境调整
+  etf_sectors: ["沪深ETF", "沪深基金"]  # QMT板块名，可按券商环境调整
 
 # 并发与性能配置
 concurrency:
-  max_workers: 20  # 新浪接口请求频繁会被限制，调小并发数
+  max_workers: 20  # QMT本地缓存下载并发数
   dynamic_concurrency: true  # 是否启用动态并发控制，true表示根据错误率和成功率自动调整进程数
   min_workers: 3  # 最小并发进程数，当错误率过高时会减少到此值
   max_workers_limit: 20  # 最大并发进程数限制，动态调整时不会超过此值
@@ -31,11 +41,10 @@ retry:
 
 # 数据源配置
 datasource:
-  default: "baostock"  # 默认数据源
-  stock_source: "baostock"  # 股票数据源，优先用Baostock更稳定
-  etf_source: "akshare"  # ETF数据源，优先用AKShare更稳定
-  enable_fallback: true  # 是否启用数据源故障切换，true表示当主数据源失败时自动切换到备用数据源
-  priority: ["baostock", "akshare"]  # 数据源优先级列表
+  default: "qmt"  # 默认数据源
+  stock_source: "qmt"  # 股票数据源
+  etf_source: "qmt"  # ETF数据源
+  priority: ["qmt"]  # 数据源优先级列表
 
 # 数据范围配置
 data:

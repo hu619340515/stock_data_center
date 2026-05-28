@@ -1,224 +1,427 @@
-# 📈 股票/ETF 数据采集与分析平台
+# A 股 / ETF 数据采集与可视化平台
 
-一个高并发、高可靠的A股股票/ETF历史数据采集、存储、可视化一体化平台，支持多数据源自动切换、断点续传、进程自动复活，开箱即用。
+这是一个面向本地量化研究的数据采集、存储和可视化工具。项目使用国金 QMT / miniQMT 的 `xtquant` 本地行情接口拉取 A 股和 ETF 历史行情，使用 DuckDB 做本地列式存储，并提供命令行工具和 Flask Web 管理界面。
 
----
+当前版本只保留 QMT / xtquant 数据源链路。使用前请确认 QMT 或 miniQMT 客户端已启动，并且当前 Python 环境可以导入 `xtquant`。
 
-## ✨ 功能特性
+## 功能概览
 
-### 📊 数据采集
-- ✅ 支持**股票+ETF**两大品类
-- ✅ 支持**日线/周线/月线**三种时间周期
-- ✅ 支持多数据源自动 fallback（baostock/akshare 等）
-- ✅ 多进程并发下载，自动调整并发数
-- ✅ 增量更新：自动计算每只股票的最后更新日期，只下载缺失数据
-- ✅ 断点续传：下载中断后重启自动从断点继续，无需从头开始
-- ✅ 进程自动复活：工作进程异常崩溃或心跳超时自动重启，继续剩余任务
-- ✅ 支持临时数据库下载，完成后合并到主库，避免主库污染
+- 支持股票和 ETF 两类资产。
+- 支持日线、周线、月线三个周期，命令行统一使用 `d`、`w`、`m` 表示。
+- 股票与 ETF 分库存储，默认写入 `stock_data.db` 和 `etf_data.db`。
+- 使用 DuckDB 存储行情数据，自动创建日线、周线、月线表和基础信息表。
+- 支持全量下载、增量更新、断点续传、失败重试、动态并发和进程复活。
+- 支持按代码、日期范围、频率、资产类型导出 `csv`、`parquet`、`json`。
+- 提供 Web 界面查看概览、表格、K 线、涨跌排行、分布统计、日志和后台任务进度。
 
-### 🗄️ 数据存储
-- ✅ 采用 DuckDB 列式存储，查询性能是 SQLite 的 10~100 倍
-- ✅ 自动创建表结构和联合索引，查询速度毫秒级
-- ✅ 支持前复权/后复权数据存储
-- ✅ 批量入库，自动调整批大小平衡内存占用和写入速度
-- ✅ 自动 vacuum 优化数据库文件大小
+## 目录结构
 
-### 🖥️ 可视化管理界面
-- ✅ 开箱即用的 Web 管理界面，无需额外部署
-- ✅ 数据概览：总记录数、证券数量、最早/最新日期、ETF数量统计
-- ✅ 数据查询：支持代码/日期范围筛选，分页展示
-- ✅ K线图：单只股票/ETF的K线走势查询，支持日线/周线/月线切换
-- ✅ 统计分析：数值列统计（最大/最小/平均/总和）、涨跌幅排行、成交量分布
-- ✅ 数据导出：支持 CSV 格式导出筛选结果
-- ✅ 实时进度：更新/下载任务实时进度展示，支持中途停止
-
-### 🛠️ 运维特性
-- ✅ 多进程安全日志系统，避免日志文件写入冲突
-- ✅ 完整错误日志记录，包含错误代码和堆栈信息
-- ✅ 动态调整并发数和批大小，根据错误率和内存占用自动优化
-- ✅ 支持内存使用监控，避免OOM
-- ✅ 启动速度优化：重模块延迟加载，启动时间从10秒+降到1秒内
-
----
-
-## 📁 目录结构
-
-```
-stock_data_center/
-├── core.py                  # 核心业务逻辑：下载/更新流水线、多进程调度
-├── data_source.py           # 数据源实现：baostock/akshare 对接
-├── data_source_factory.py   # 数据源工厂：自动选择可用数据源
-├── database.py              # 数据库管理：DuckDB 增删改查、表结构维护
-├── config.py                # 配置文件：路径、并发数、数据源优先级等
-├── logger_config.py         # 日志配置：多进程安全日志系统
-├── cli.py                   # 命令行工具入口
-├── requirements.txt         # Python 依赖包列表
-├── viewer/                  # Web 可视化界面
-│   ├── server.py            # Flask 后端服务
-│   └── index.html           # 前端单页应用
-├── data/                    # 数据存储目录（自动创建）
-│   ├── stock.db             # 股票数据库
-│   ├── etf.db               # ETF数据库
-│   └── logs/                # 日志文件目录
-└── error_log.txt            # 错误日志文件
+```text
+.
+├── cli.py                     # 命令行入口
+├── config.py                  # 配置加载与默认值
+├── config.yaml                # 本地配置文件
+├── core.py                    # 下载、更新、进度、临时库合并等核心流程
+├── database.py                # DuckDB 表结构、写入、查询、导出和维护
+├── data_source.py             # QMT / xtquant 数据源实现
+├── data_source_factory.py     # 数据源工厂，目前仅支持 QMT / xtquant
+├── data_source_interface.py   # 数据源接口定义
+├── logger_config.py           # 日志配置
+├── requirements.txt           # Python 依赖
+├── start_viewer.bat           # Windows 快速启动脚本
+├── viewer/
+│   ├── server.py              # Flask API 服务
+│   ├── index.html             # Web 单页界面
+│   ├── README.md              # viewer 子模块说明
+│   └── db_portrait.md         # 数据库画像说明
+└── test/                      # 单元测试与接口测试
 ```
 
----
+运行后会在项目根目录生成或使用这些本地文件：
 
-## 🚀 快速部署
+```text
+stock_data.db                  # 股票数据库
+etf_data.db                    # ETF 数据库
+logs/app.log                   # 应用日志
+error_log.txt                  # 错误日志
+```
 
-### 1. 环境要求
-- Python 3.10+
-- Windows/Linux/macOS 全平台支持
+## 环境要求
 
-### 2. 安装依赖
+- Python 3.10 或更高版本。
+- DuckDB、Flask、pandas、PyYAML、psutil、click、numpy 等依赖。
+- 国金 QMT / miniQMT 客户端。
+- 可用的 `xtquant` Python SDK。
+
+安装依赖：
+
 ```bash
 pip install -r requirements.txt
 ```
 
-### 3. （可选）修改配置
-编辑 `config.py` 调整并发数、数据源优先级、存储路径等参数。
+如果 `xtquant` 无法通过普通 `pip` 安装，请按券商或 QMT 客户端提供的方式把 SDK 加入当前 Python 环境。
 
-### 4. 启动 Web 界面
-```bash
-python cli.py start-viewer
+## 配置说明
+
+主要配置写在 `config.yaml`，程序通过 `config.py` 读取。常用项如下：
+
+```yaml
+database:
+  path: "quant_data.db"
+  stock_path: "stock_data.db"
+  etf_path: "etf_data.db"
+
+qmt:
+  ip: "127.0.0.1"
+  port: 58610
+  data_dir: ""
+  dividend_type: "front"
+  download_before_query: true
+  sync_sector_data: false
+  code_list_data_dir: ""
+  stock_sectors: ["沪深A股"]
+  etf_sectors: ["沪深ETF", "沪深基金"]
+
+datasource:
+  default: "qmt"
+  stock_source: "qmt"
+  etf_source: "qmt"
+  priority: ["qmt"]
 ```
-访问 `http://127.0.0.1:5678` 即可打开管理界面。
 
----
+关键配置：
 
-## 📖 使用指南
+| 配置项 | 说明 |
+| --- | --- |
+| `database.stock_path` | 股票数据库路径，默认 `stock_data.db` |
+| `database.etf_path` | ETF 数据库路径，默认 `etf_data.db` |
+| `qmt.ip` / `qmt.port` | QMT 行情服务地址和端口，miniQMT 常用行情端口为 `58610` |
+| `qmt.data_dir` | 可选，指定 QMT 本地行情缓存目录 |
+| `qmt.code_list_data_dir` | 可选，板块列表不可用时用于从本地 `datadir` 推导代码列表 |
+| `qmt.stock_sectors` | QMT 股票板块名称，可按本机券商环境调整 |
+| `qmt.etf_sectors` | QMT ETF / 基金板块名称，可按本机券商环境调整 |
+| `qmt.dividend_type` | 复权方式：`none`、`front`、`back`、`front_ratio`、`back_ratio` |
+| `data.start_date_full` | 股票全量下载起始日期 |
+| `data.start_date_full_etf` | ETF 全量下载起始日期 |
+| `data.end_date` | 可选，固定拉取结束日期；不配置时自动按当前日期判断 |
+| `concurrency.max_workers` | 初始并发数 |
+| `concurrency.dynamic_concurrency` | 是否启用动态并发调整 |
+| `batch.size` | 批量写入大小 |
+| `retry.max_retries` | 数据源调用最大重试次数 |
+| `process_monitor.enable_revive` | 是否启用子进程异常复活 |
 
-### 🔧 命令行工具
+`config.py` 支持在配置值中使用 `${ENV_NAME}` 引用环境变量。
 
-#### 全量下载股票数据
+## 命令行使用
+
+查看全部命令：
+
 ```bash
-# 下载所有股票日线数据（默认）
-python cli.py download
+python cli.py --help
+```
 
-# 指定频率：周线/月线
+### 股票数据
+
+全量下载股票数据：
+
+```bash
+python cli.py download
+python cli.py download -f d
 python cli.py download -f w
 python cli.py download -f m
-
-# 指定并发数
-python cli.py download -w 8
 ```
 
-#### 增量更新股票数据
+`download` 是 `full` 的别名，也可以使用：
+
 ```bash
-# 增量更新所有股票日线数据
+python cli.py full -f d
+```
+
+增量更新股票数据：
+
+```bash
 python cli.py update
-
-# 指定频率
 python cli.py update -f w
+python cli.py update -f m
 ```
 
-#### ETF 数据下载/更新
+### ETF 数据
+
+全量下载 ETF 数据：
+
 ```bash
-# 全量下载ETF日线
 python cli.py download-etf
-
-# 增量更新ETF日线
-python cli.py update-etf
-
-# 支持 -f 参数指定周线/月线
+python cli.py download-etf -f d
+python cli.py download-etf -f w
+python cli.py download-etf -f m
 ```
 
-#### 数据导出
-```bash
-# 导出所有股票日线数据到 CSV
-python cli.py export -o stock_daily.csv
+`download-etf` 是 `etf-full` 的别名。
 
-# 导出指定代码和日期范围
+增量更新 ETF 数据：
+
+```bash
+python cli.py update-etf
+python cli.py update-etf -f d
+python cli.py update-etf -f w
+python cli.py update-etf -f m
+```
+
+`update-etf` 是 `etf-update` 的别名。
+
+### 查看状态
+
+```bash
+python cli.py status
+python cli.py status -t stock -f d
+python cli.py status -t etf -f m
+```
+
+参数说明：
+
+- `-t, --type`：资产类型，支持 `stock`、`etf`。
+- `-f, --frequency`：频率，支持 `d`、`w`、`m`。
+
+### 导出数据
+
+导出全部股票日线：
+
+```bash
+python cli.py export -o stock_daily.csv
+```
+
+按代码和日期范围导出：
+
+```bash
 python cli.py export -c sh.600000 -s 2023-01-01 -e 2023-12-31 -o 600000.csv
 ```
 
-#### 数据删除
-```bash
-# 删除指定代码的所有数据
-python cli.py delete -c sh.600000
+导出 ETF 周线为 Parquet：
 
-# 删除指定日期范围的数据
-python cli.py delete -s 2023-01-01 -e 2023-01-31
+```bash
+python cli.py export -t etf -f w -m parquet -o etf_weekly.parquet
 ```
 
-#### 数据库优化
+参数说明：
+
+- `-c, --code`：证券代码，留空表示全部。
+- `-s, --start-date`：开始日期，格式 `YYYY-MM-DD`。
+- `-e, --end-date`：结束日期，默认当天。
+- `-o, --output`：输出文件路径，必填。
+- `-f, --frequency`：频率，支持 `d`、`w`、`m`。
+- `-m, --format`：输出格式，支持 `csv`、`parquet`、`json`。
+- `-t, --type`：资产类型，支持 `stock`、`etf`。
+
+### 删除数据
+
+删除指定代码：
+
 ```bash
-# 优化数据库文件，减少空间占用
+python cli.py delete -c sh.600000 -y
+```
+
+删除指定日期范围：
+
+```bash
+python cli.py delete -s 2023-01-01 -e 2023-01-31 -y
+```
+
+删除 ETF 月线中的指定代码：
+
+```bash
+python cli.py delete -t etf -f m -c sh.510300 -y
+```
+
+如果不传 `-y`，命令会在删除前要求确认。
+
+### 数据库维护
+
+维护全部数据库：
+
+```bash
 python cli.py vacuum
 ```
 
----
+只维护股票库或 ETF 库：
 
-### 🖥️ Web 界面使用
+```bash
+python cli.py vacuum -t stock
+python cli.py vacuum -t etf
+```
 
-1. **概览页**：查看整体统计数据、各表更新状态
-2. **数据查询**：搜索、筛选、导出数据
-3. **K线分析**：输入代码查询走势，切换时间周期
-4. **统计分析**：查看涨跌幅排行、成交量分布、数值统计
-5. **数据更新**：在界面上直接启动全量/增量更新任务，查看实时进度
+## Web 管理界面
 
----
+启动 Web 服务：
 
-## ⚙️ 配置说明（config.py）
+```bash
+python cli.py start-viewer
+```
 
-| 参数名 | 说明 | 默认值 |
-|--------|------|--------|
-| MAX_WORKERS | 最大并发进程数 | 4 |
-| MIN_WORKERS | 最小并发进程数 | 1 |
-| BATCH_SIZE | 初始入库批大小 | 1000 |
-| MAX_BATCH_SIZE | 最大入库批大小 | 5000 |
-| MIN_BATCH_SIZE | 最小入库批大小 | 200 |
-| MEMORY_THRESHOLD | 内存使用率阈值（超过则减小批大小） | 0.8 |
-| DATA_SOURCE_PRIORITY | 数据源优先级 | ['baostock', 'akshare'] |
-| START_DATE_FULL | 股票全量下载起始日期 | '2000-01-01' |
-| START_DATE_FULL_ETF | ETF全量下载起始日期 | '2010-01-01' |
-| ERROR_THRESHOLD | 错误率阈值（超过则减小并发数） | 0.3 |
-| SUCCESS_THRESHOLD | 成功率阈值（超过则增大并发数） | 0.95 |
+默认访问地址：
 
----
+```text
+http://127.0.0.1:5678
+```
 
-## ❓ 常见问题
+也可以指定监听地址和端口：
 
-### Q: 下载速度慢怎么办？
-A: 可以增大 `MAX_WORKERS` 提高并发数，建议不超过 CPU 核心数的 2 倍。
+```bash
+python cli.py start-viewer --host 0.0.0.0 --port 5678
+```
 
-### Q: 数据库文件太大怎么办？
-A: 运行 `python cli.py vacuum` 优化数据库，通常可以减少 30%~50% 的文件大小。
+Web 界面支持：
 
-### Q: 下载过程中可以中断吗？
-A: 可以直接关闭程序，下次启动会自动从断点继续，无需重新下载已完成的数据。
+- 查看股票库和 ETF 库连接状态。
+- 查看日线、周线、月线表的记录数、日期范围和证券数量。
+- 按表、代码、关键词、日期范围分页浏览数据。
+- 查看单只股票或 ETF 的 K 线和 MA5、MA10、MA20、MA60。
+- 查看涨跌幅排行、数值列统计、成交量或价格分布。
+- 导出当前筛选结果为 CSV。
+- 发起股票 / ETF 的日线下载、增量更新，以及日 / 周 / 月全周期下载。
+- 查看任务进度、后台运行状态、应用日志和错误日志。
+- 停止当前后台任务。
 
-### Q: 数据源不可用怎么办？
-A: 程序会自动尝试优先级列表里的下一个数据源，无需人工干预。
+viewer 默认读取 `config.yaml` 中的 `database.stock_path` 和 `database.etf_path`。也可以通过环境变量覆盖：
 
-### Q: 日志提示文件被占用怎么办？
-A: 已采用多进程安全的日志队列机制，不会出现文件冲突，所有日志会统一写入。
+```bash
+set STOCK_DB_PATH=S:\path\stock_data.db
+set ETF_DB_PATH=S:\path\etf_data.db
+python cli.py start-viewer
+```
 
----
+`DB_PATH` 仍保留为兼容变量，但当前接口会根据表名前缀自动选择股票库或 ETF 库。
 
-## 📝 更新日志
+## 数据库表
 
-### v2.1.0（2026-05-20）
-- ✅ 新增 ETF 数量统计卡片
-- ✅ 多进程安全日志系统，解决日志文件写入冲突
-- ✅ 延迟加载优化，启动速度提升 10 倍以上
-- ✅ 修复 Windows 平台端口占用和 orphan socket 问题
-- ✅ 完善进程复活逻辑，支持心跳超时检测
+默认会创建以下行情表：
 
-### v2.0.0
-- ✅ 重写多进程调度架构，稳定性大幅提升
-- ✅ 新增 ETF 品类支持
-- ✅ 新增周线/月线数据支持
-- ✅ 全新 Web 管理界面
-- ✅ 临时数据库下载+合并机制，避免主库污染
+| 表名 | 资产 | 周期 |
+| --- | --- | --- |
+| `stock_daily` | 股票 | 日线 |
+| `stock_weekly` | 股票 | 周线 |
+| `stock_monthly` | 股票 | 月线 |
+| `etf_daily` | ETF | 日线 |
+| `etf_weekly` | ETF | 周线 |
+| `etf_monthly` | ETF | 月线 |
 
-### v1.0.0
-- ✅ 基础股票日线数据下载/更新功能
-- ✅ DuckDB 存储引擎接入
-- ✅ 基础 CLI 工具
+行情表主要字段：
 
----
+| 字段 | 说明 |
+| --- | --- |
+| `code` | 项目内部证券代码，如 `sh.600000`、`sz.000001` |
+| `name` | 证券名称 |
+| `date` | 交易日期 |
+| `open` / `high` / `low` / `close` | 开高低收 |
+| `preclose` | 前收盘价 |
+| `volume` | 成交量 |
+| `amount` | 成交额 |
+| `adjustflag` | 复权标记 |
+| `turn` | 换手率相关字段 |
+| `tradestatus` | 交易状态 |
+| `pctChg` | 涨跌幅 |
+| `isST` | ST 标记 |
 
-## 📄 开源协议
+基础信息表：
+
+- `stock_info`
+- `etf_info`
+
+## Web API 摘要
+
+常用接口：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/api/status` | 查看股票库和 ETF 库连接状态 |
+| `GET` | `/api/overview` | 查看所有表概览或指定表概览 |
+| `GET` | `/api/table` | 分页查询表格数据 |
+| `GET` | `/api/codes` | 获取指定表的代码列表 |
+| `GET` | `/api/kline` | 获取指定代码的 K 线数据 |
+| `GET` | `/api/stats` | 获取数值字段统计 |
+| `GET` | `/api/top_movers` | 获取涨跌幅排行 |
+| `GET` | `/api/distribution` | 获取价格、成交量或涨跌幅分布 |
+| `GET` | `/api/trend` | 获取按日期聚合的趋势数据 |
+| `GET` | `/api/refresh_status` | 查看各表最新更新时间 |
+| `GET` | `/api/export` | 导出 CSV |
+| `POST` | `/api/delete` | 删除指定数据 |
+| `GET` | `/api/schema` | 查看表结构 |
+| `GET` | `/api/summary_by_code` | 按代码聚合统计 |
+| `GET` | `/api/progress` | 查看后台任务进度 |
+| `GET` | `/api/logs` | 查看应用日志和错误日志 |
+| `POST` | `/api/stop_task` | 停止当前后台任务 |
+
+任务类接口：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `POST` | `/api/daily_download` | 股票或 ETF 日线全量下载，body 可传 `{"target":"stock"}` 或 `{"target":"etf"}` |
+| `POST` | `/api/daily_to_latest` | 股票或 ETF 日线增量更新 |
+| `POST` | `/api/download_stock_all_cycles` | 股票日 / 周 / 月全周期下载或更新 |
+| `POST` | `/api/download_etf_all_cycles` | ETF 日 / 周 / 月全周期下载或更新 |
+| `POST` | `/api/aggregate_weekly` | 周线下载 |
+| `POST` | `/api/aggregate_monthly` | 月线下载 |
+| `POST` | `/api/etf_download` | ETF 日线全量下载 |
+| `POST` | `/api/etf_update_latest` | ETF 日线增量更新 |
+
+查询示例：
+
+```text
+GET /api/table?table=stock_daily&page=0&page_size=50&keyword=600000&start=2023-01-01&end=2023-12-31
+GET /api/kline?table=etf_daily&code=sh.510300&start=2024-01-01
+GET /api/top_movers?table=stock_daily&direction=rise&limit=20
+```
+
+## 测试
+
+运行全部测试：
+
+```bash
+python -m pytest test
+```
+
+或使用项目内测试入口：
+
+```bash
+python test/run_tests.py
+```
+
+测试覆盖配置加载、数据源、数据库、核心流程和 viewer API / 路由。
+
+## 常见问题
+
+### `ImportError: 未安装 xtquant`
+
+确认 QMT / miniQMT 已安装，并且当前 Python 环境可以导入 `xtquant`。不同券商环境的 SDK 安装方式可能不同，必要时把 QMT 提供的 Python 包路径加入 `PYTHONPATH`。
+
+### 无法获取股票或 ETF 列表
+
+优先检查 `qmt.stock_sectors` 和 `qmt.etf_sectors` 是否与本机 QMT 板块名称一致。如果板块接口不可用，可以配置 `qmt.code_list_data_dir` 指向 QMT 本地 `datadir`，程序会尝试从本地文件推导代码列表。
+
+### QMT 接口报端口或服务错误
+
+确认使用的是行情服务端口。miniQMT 常见行情端口是 `58610`，普通交易端口不一定提供完整历史行情接口。
+
+### Web 页面没有数据显示
+
+先运行：
+
+```bash
+python cli.py status -t stock -f d
+python cli.py status -t etf -f d
+```
+
+确认数据库中已有对应表和记录。然后检查 `config.yaml` 的数据库路径或 `STOCK_DB_PATH`、`ETF_DB_PATH` 环境变量。
+
+### 数据库文件太大
+
+运行：
+
+```bash
+python cli.py vacuum
+```
+
+DuckDB 的维护操作可以回收部分空间并优化数据库文件。
+
+## 许可
+
 MIT License

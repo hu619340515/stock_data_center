@@ -7,9 +7,12 @@ import traceback
 from typing import List, Tuple, Optional, Set, Any
 from database import DuckDBManager
 from data_source_factory import DataSourceFactory
-from config import MAX_WORKERS, START_DATE_FULL, START_DATE_FULL_ETF, DYNAMIC_CONCURRENCY, MIN_WORKERS, MAX_WORKERS_LIMIT, ERROR_THRESHOLD, SUCCESS_THRESHOLD, BATCH_SIZE, MAX_BATCH_SIZE, MIN_BATCH_SIZE, MEMORY_THRESHOLD, USE_ARROW, COMPRESS_DATA, ERROR_LOG_FILE, MAX_ERRORS_BEFORE_WARNING, DEFAULT_DATA_SOURCE, ENABLE_DATA_SOURCE_FALLBACK, DATA_SOURCE_PRIORITY, ENABLE_PROCESS_REVIVE, PROCESS_HEARTBEAT_TIMEOUT, PROCESS_MAX_REVIVE_TIMES, END_DATE, STOCK_DB_PATH, ETF_DB_PATH
+from config import MAX_WORKERS, START_DATE_FULL, START_DATE_FULL_ETF, DYNAMIC_CONCURRENCY, MIN_WORKERS, MAX_WORKERS_LIMIT, ERROR_THRESHOLD, SUCCESS_THRESHOLD, BATCH_SIZE, MAX_BATCH_SIZE, MIN_BATCH_SIZE, MEMORY_THRESHOLD, USE_ARROW, COMPRESS_DATA, ERROR_LOG_FILE, MAX_ERRORS_BEFORE_WARNING, DATA_SOURCE_PRIORITY, ENABLE_PROCESS_REVIVE, PROCESS_HEARTBEAT_TIMEOUT, PROCESS_MAX_REVIVE_TIMES, END_DATE, STOCK_DB_PATH, ETF_DB_PATH
+from logger_config import configure_console_encoding
 import threading
 import time
+
+configure_console_encoding()
 
 # 配置日志
 logger = logging.getLogger("Core")
@@ -87,7 +90,31 @@ def safe_print(msg):
     # 获取 logging 的锁，确保同一时间只有一个进程在输出
     # 注意：这里使用的是标准 logging 的锁
     with logging._lock:
-        print(msg)
+        try:
+            print(msg, flush=True)
+        except UnicodeEncodeError:
+            print(str(msg).encode("utf-8", errors="replace").decode("utf-8", errors="replace"), flush=True)
+
+DB_MARKET_COLUMNS = [
+    'code', 'name', 'date', 'open', 'high', 'low', 'close', 'preclose',
+    'volume', 'amount', 'adjustflag', 'turn', 'tradestatus', 'pctChg', 'isST'
+]
+
+def prepare_market_df_for_db(df: pd.DataFrame, name: str) -> pd.DataFrame:
+    """Add the display name and align columns to the DuckDB market table schema."""
+    df = df.copy()
+    df['name'] = name or ''
+    for col in DB_MARKET_COLUMNS:
+        if col not in df.columns:
+            if col in {'open', 'high', 'low', 'close', 'preclose', 'volume', 'amount', 'turn', 'pctChg'}:
+                df[col] = 0.0
+            elif col == 'tradestatus':
+                df[col] = '1'
+            elif col == 'isST':
+                df[col] = '0'
+            else:
+                df[col] = ''
+    return df[DB_MARKET_COLUMNS]
 
 def _safe_queue_put(q: Queue, item, process_id: int, max_retries: int = 5, timeout: float = 10.0):
     """
@@ -131,7 +158,7 @@ def worker_update(process_id: int, stock_list: pd.DataFrame, result_queue: Queue
         attach_queue_handler(log_queue)
     
     from data_source_factory import DataSourceFactory
-    from config import DEFAULT_DATA_SOURCE, ETF_DATA_SOURCE, STOCK_DATA_SOURCE
+    from config import ETF_DATA_SOURCE, STOCK_DATA_SOURCE
     
     # 根据资产类型选择数据源
     if asset_type == 'etf':
@@ -174,8 +201,7 @@ def worker_update(process_id: int, stock_list: pd.DataFrame, result_queue: Queue
                     
                     # 5. 将数据放入队列（供主进程入库和去重）
                     if not df.empty:
-                        # 添加名称字段
-                        df['name'] = row['code_name']
+                        df = prepare_market_df_for_db(df, row.get('code_name', ''))
                         safe_print(f"✅ [进程 {process_id}] {code} ({row['code_name']}) 增量更新成功，数据量: {len(df)} 条")
                         _safe_queue_put(result_queue, (df, True, None), process_id)
                     else:
@@ -217,7 +243,7 @@ def worker_download(process_id: int, stock_list: pd.DataFrame, start_date: str, 
         attach_queue_handler(log_queue)
     
     from data_source_factory import DataSourceFactory
-    from config import DEFAULT_DATA_SOURCE, ETF_DATA_SOURCE, STOCK_DATA_SOURCE
+    from config import ETF_DATA_SOURCE, STOCK_DATA_SOURCE
     
     # 根据资产类型选择数据源
     if asset_type == 'etf':
@@ -264,8 +290,7 @@ def worker_download(process_id: int, stock_list: pd.DataFrame, start_date: str, 
                 
                 # 2. 将数据放入队列（供主进程入库和去重）
                 if not df.empty:
-                    # 添加名称字段
-                    df['name'] = row['code_name']
+                    df = prepare_market_df_for_db(df, row.get('code_name', ''))
                     safe_print(f"✅ [进程 {process_id}] {code} ({row['code_name']}) 下载成功，数据量: {len(df)} 条")
                     logger.info(f"✅ [进程 {process_id}] {code} ({row['code_name']}) 下载成功，数据量: {len(df)} 条")
                     _safe_queue_put(result_queue, (df, True, None), process_id)

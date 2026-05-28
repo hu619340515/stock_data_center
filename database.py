@@ -1,18 +1,21 @@
 import duckdb
 import pandas as pd
 import os
-from config import DATABASE_PATH
+from config import STOCK_DB_PATH
 from logger_config import setup_logger
 
 logger = setup_logger("Database")
 
 def safe_print(msg):
     """安全打印函数"""
-    print(msg)
+    try:
+        print(msg, flush=True)
+    except UnicodeEncodeError:
+        print(str(msg).encode("utf-8", errors="replace").decode("utf-8", errors="replace"), flush=True)
 
 class DuckDBManager:
     def __init__(self, db_path=None):
-        db_path = db_path or DATABASE_PATH
+        db_path = db_path or STOCK_DB_PATH
         self.con = duckdb.connect(db_path)
         self._create_table()
         logger.info(f"✅ DuckDB 初始化完成 (文件: {db_path})")
@@ -548,14 +551,7 @@ class DuckDBManager:
             logger.error(f"数据库合并失败: {e}")
             return False
     
-    def close(self):
-        """关闭数据库连接"""
-        try:
-            self.con.close()
-        except Exception:
-            pass
-            
-    def export_data(self, code: str, start_date: str, end_date: str, output_file: str, frequency: str = "d", format: str = "csv") -> bool:
+    def export_data(self, code: str, start_date: str, end_date: str, output_file: str, frequency: str = "d", format: str = "csv", asset_type: str = "stock") -> bool:
         """
         📤 导出数据
         
@@ -566,12 +562,13 @@ class DuckDBManager:
             output_file: 输出文件路径
             frequency: 数据频率 (d: 日线, w: 周线, m: 月线)
             format: 输出格式 (csv, parquet, json)
+            asset_type: 资产类型 (stock 或 etf)
             
         Returns:
             是否导出成功
         """
         try:
-            table_name = self._get_table_name(frequency)
+            table_name = self._get_table_name(frequency, asset_type)
             
             # 构建查询语句
             if code:
@@ -668,4 +665,7 @@ class DuckDBManager:
         return result
 
     def close(self):
-        self.con.close()
+        try:
+            self.con.close()
+        except Exception:
+            pass

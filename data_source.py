@@ -2,30 +2,40 @@ import pandas as pd
 import time
 import random
 import re
-from datetime import timedelta
+import os
 from logger_config import setup_logger
-from config import MAX_RETRIES, INITIAL_RETRY_DELAY, MAX_RETRY_DELAY, RETRY_BACKOFF_FACTOR
+from config import (
+    MAX_RETRIES,
+    INITIAL_RETRY_DELAY,
+    MAX_RETRY_DELAY,
+    RETRY_BACKOFF_FACTOR,
+    QMT_IP,
+    QMT_PORT,
+    QMT_DATA_DIR,
+    QMT_DIVIDEND_TYPE,
+    QMT_DOWNLOAD_BEFORE_QUERY,
+    QMT_SYNC_SECTOR_DATA,
+    QMT_CODE_LIST_DATA_DIR,
+    QMT_STOCK_SECTORS,
+    QMT_ETF_SECTORS,
+)
 from data_source_interface import DataSourceInterface
 
 logger = setup_logger("DataFetcher")
 
-_BS = None
+_XTDATA = None
 
-def _bs():
-    global _BS
-    if _BS is None:
-        import baostock as _mod
-        _BS = _mod
-    return _BS
-
-_AK = None
-
-def _ak():
-    global _AK
-    if _AK is None:
-        import akshare as _mod
-        _AK = _mod
-    return _AK
+def _xtdata():
+    global _XTDATA
+    if _XTDATA is None:
+        try:
+            from xtquant import xtdata as _mod
+        except ImportError as e:
+            raise ImportError(
+                "未安装 xtquant，无法使用国金QMT数据源。请先安装/配置国金QMT或miniQMT的Python SDK，并确保QMT客户端已启动。"
+            ) from e
+        _XTDATA = _mod
+    return _XTDATA
 
 def retry_with_backoff(func):
     """
@@ -38,7 +48,13 @@ def retry_with_backoff(func):
         while retries < MAX_RETRIES:
             try:
                 return func(*args, **kwargs)
+            except ImportError as e:
+                logger.error(f"❌ 数据源依赖缺失: {e}")
+                raise
             except Exception as e:
+                if "未找到处理函数" in str(e) or "ErrorID\" : 200005" in str(e) or "ErrorID\":200005" in str(e):
+                    logger.error(f"❌ 数据源服务不支持当前接口: {e}")
+                    raise
                 retries += 1
                 if retries >= MAX_RETRIES:
                     logger.error(f"❌ 达到最大重试次数，操作失败: {e}")
@@ -53,404 +69,330 @@ def retry_with_backoff(func):
         return None
     return wrapper
 
-class BaoStockClient(DataSourceInterface):
-    def __init__(self):
-        self.lg = None
-        # 设置 socket 默认超时，防止 HTTP 请求无限挂起
-        import socket
-        socket.setdefaulttimeout(180)
-        logger.info("⏱️ 已设置网络请求超时: 180秒")
+
+class QMTClient(DataSourceInterface):
+    """
+    国金QMT/xtquant 行情数据源。
+
+    约定：
+    - 项目内部代码格式保持 sh.600000 / sz.000001 / bj.xxxxxx。
+    - QMT接口代码格式使用 600000.SH / 000001.SZ / xxxxxx.BJ。
+    - 历史行情先下载到QMT本地缓存，再从缓存读取。
+    """
+
+    TARGET_COLUMNS = [
+        'code', 'date', 'open', 'high', 'low', 'close', 'preclose',
+        'volume', 'amount', 'adjustflag', 'turn', 'tradestatus', 'pctChg', 'isST'
+    ]
 
     @retry_with_backoff
     def login(self):
-        if self.lg is None:
-            logger.info("🚀 正在登录 Baostock...")
-            self.lg = _bs().login()
-            if self.lg.error_code != '0':
-                raise Exception(f"Login Failed: {self.lg.error_msg}")
-            logger.info("✅ Baostock 登录成功")
-
-    def logout(self):
-        if self.lg:
+        xtdata = _xtdata()
+        if QMT_DATA_DIR:
             try:
-                _bs().logout()
-                logger.info("👋 Baostock 登出")
+                xtdata.data_dir = QMT_DATA_DIR
             except Exception as e:
-                logger.warning(f"⚠️ 登出失败: {e}")
-
-    @retry_with_backoff
-    def get_stock_list(self) -> pd.DataFrame:
-        self.login()
-        # 尝试多个日期，避免单日数据问题
-        test_dates = [
-            (pd.Timestamp.now() - timedelta(days=1)).strftime("%Y-%m-%d"),
-            (pd.Timestamp.now() - timedelta(days=2)).strftime("%Y-%m-%d"),
-            (pd.Timestamp.now() - timedelta(days=3)).strftime("%Y-%m-%d"),
-            "2026-04-15",
-            "2024-12-31"
-        ]
-        
-        for test_date in test_dates:
-            logger.info(f"📅 尝试获取股票列表 (查询日期: {test_date})...")
-            rs = _bs().query_all_stock(day=test_date)
-            
-            if rs.error_code == '0':
-                data_list = []
-                while rs.next():
-                    data_list.append(rs.get_row_data())
-                
-                if len(data_list) > 0:
-                    df = pd.DataFrame(data_list, columns=rs.fields)
-                    # 过滤A股
-                    df = df[df['code'].str.contains(r'sh\.6|sz\.0|sz\.3|bj\.')]
-                    logger.info(f"✅ 获取到 {len(df)} 只A股股票")
-                    return df
-                else:
-                    logger.warning(f"⚠️ 日期 {test_date} 返回数据为空，尝试下一个日期")
-            else:
-                logger.warning(f"⚠️ 日期 {test_date} 查询失败: {rs.error_msg}，尝试下一个日期")
-        
-        logger.error("❌ 所有日期均无法获取股票列表数据")
-        return pd.DataFrame()
-
-    @retry_with_backoff
-    def get_stock_history(self, code: str, start_date: str, end_date: str, frequency: str = "d") -> pd.DataFrame:
-        self.login()
-        # 映射频率参数
-        frequency_map = {
-            "d": "d",   # 日线
-            "w": "w",   # 周线
-            "m": "m",   # 月线
-            "1": "1",   # 1分钟
-            "5": "5"   # 5分钟
-        }
-        bs_frequency = frequency_map.get(frequency, "d")
-        
-        # 根据频率选择不同的字段列表
-        if frequency in ["w", "m"]:
-            # 周线和月线支持的字段
-            fields = "date,code,open,high,low,close,volume,amount,adjustflag,turn,pctChg"
+                logger.warning(f"⚠️ 设置QMT数据目录失败，将使用默认目录: {e}")
+        if hasattr(xtdata, "connect"):
+            result = xtdata.connect(QMT_IP, int(QMT_PORT) if QMT_PORT else None)
+            logger.info(f"✅ QMT行情服务连接完成: {result}")
         else:
-            # 日线和分钟线支持所有字段
-            fields = "date,code,open,high,low,close,preclose,volume,amount,adjustflag,turn,tradestatus,pctChg,isST"
-        
-        rs = _bs().query_history_k_data_plus(
-            code,
-            fields,
-            start_date=start_date,
-            end_date=end_date,
-            frequency=bs_frequency,
-            adjustflag="2" 
-        )
-        
-        if rs.error_code != '0':
-            # 检查是否是登录失效错误
-            if "用户未登录" in rs.error_msg:
-                logger.warning(f"⚠️ 会话已过期，需要重新登录: {rs.error_msg}")
-                # 重置登录状态
-                self.lg = None
-                # 重新登录
-                self.login()
-                # 重新尝试获取数据
-                rs = _bs().query_history_k_data_plus(
-                    code,
-                    fields,
-                    start_date=start_date,
-                    end_date=end_date,
-                    frequency=bs_frequency,
-                    adjustflag="2" 
-                )
-                if rs.error_code != '0':
-                    logger.error(f"❌ 重新登录后获取数据失败 {code}: {rs.error_msg}")
-                    raise Exception(f"获取数据失败 {code}: {rs.error_msg}")
-            else:
-                logger.error(f"❌ 获取数据失败 {code}: {rs.error_msg}")
-                raise Exception(f"获取数据失败 {code}: {rs.error_msg}")
-            
-        data_list = []
-        while rs.next():
-            data_list.append(rs.get_row_data())
-        
-        if not data_list:
-            logger.warning(f"⚠️ 未获取到 {code} 的历史数据")
-            return pd.DataFrame()
-            
-        return pd.DataFrame(data_list, columns=rs.fields)
-    
-    @retry_with_backoff
-    def get_etf_list(self) -> pd.DataFrame:
-        """
-        📋 获取ETF基金列表
-        """
-        self.login()
-        # 尝试多个日期，避免单日数据问题
-        test_dates = [
-            (pd.Timestamp.now() - timedelta(days=1)).strftime("%Y-%m-%d"),
-            (pd.Timestamp.now() - timedelta(days=2)).strftime("%Y-%m-%d"),
-            (pd.Timestamp.now() - timedelta(days=3)).strftime("%Y-%m-%d"),
-            "2026-04-15",
-            "2024-12-31"
-        ]
-        
-        for test_date in test_dates:
-            logger.info(f"📅 尝试获取ETF列表 (查询日期: {test_date})...")
-            rs = _bs().query_all_stock(day=test_date)
-            
-            if rs.error_code == '0':
-                data_list = []
-                while rs.next():
-                    data_list.append(rs.get_row_data())
-                
-                if len(data_list) > 0:
-                    df = pd.DataFrame(data_list, columns=rs.fields)
-                    # 过滤ETF基金
-                    # 沪市ETF: sh.51/56/58开头
-                    # 深市ETF: sz.15/159开头
-                    df = df[df['code'].str.contains(r'sh\.5[168]|sz\.15[09]')]
-                    logger.info(f"✅ 获取到 {len(df)} 只ETF基金")
-                    return df
-                else:
-                    logger.warning(f"⚠️ 日期 {test_date} 返回数据为空，尝试下一个日期")
-            else:
-                logger.warning(f"⚠️ 日期 {test_date} 查询失败: {rs.error_msg}，尝试下一个日期")
-        
-        logger.error("❌ 所有日期均无法获取ETF列表数据")
-        return pd.DataFrame()
-    
-    def get_data_source_name(self) -> str:
-        """
-        📛 获取数据源名称
-        """
-        return "Baostock"
+            logger.info("✅ QMT xtdata 已加载")
 
-
-class AKShareClient(DataSourceInterface):
-    def __init__(self):
-        # AKShare无需登录
-        import socket
-        socket.setdefaulttimeout(180)
-        logger.info("⏱️ 已设置网络请求超时: 180秒")
-    
-    @retry_with_backoff
-    def login(self):
-        # AKShare不需要登录，直接返回
-        logger.info("✅ AKShare无需登录，已就绪")
-        return
-    
     def logout(self):
-        # AKShare不需要登出
-        logger.info("👋 AKShare已退出")
-        return
-    
+        logger.info("👋 QMT数据源无需显式登出")
+
+    @staticmethod
+    def _to_qmt_code(code: str) -> str:
+        code = str(code).strip()
+        if "." not in code:
+            return code
+        left, right = code.split(".", 1)
+        if left.lower() in {"sh", "sz", "bj"}:
+            return f"{right}.{left.upper()}"
+        return code
+
+    @staticmethod
+    def _from_qmt_code(code: str) -> str:
+        code = str(code).strip()
+        if "." not in code:
+            return code
+        left, right = code.split(".", 1)
+        market = right.lower()
+        if market in {"sh", "sz", "bj"}:
+            return f"{market}.{left}"
+        return code
+
+    @staticmethod
+    def _is_stock_code(code: str) -> bool:
+        return bool(re.match(r'^(sh\.6|sz\.0|sz\.3|bj\.)', code))
+
+    @staticmethod
+    def _is_etf_code(code: str) -> bool:
+        return bool(re.match(r'^(sh\.5[168]|sz\.15[09])', code))
+
+    @staticmethod
+    def _period(frequency: str) -> str:
+        return {
+            "d": "1d",
+            "w": "1w",
+            "m": "1mon",
+            "1": "1m",
+            "5": "5m",
+        }.get(frequency, "1d")
+
+    @staticmethod
+    def _date_arg(date_text: str) -> str:
+        return str(date_text).replace("-", "")[:8]
+
+    @staticmethod
+    def _adjustflag() -> str:
+        return {
+            "front": "2",
+            "front_ratio": "2",
+            "back": "1",
+            "back_ratio": "1",
+            "none": "3",
+        }.get(str(QMT_DIVIDEND_TYPE).lower(), "2")
+
+    def _get_name(self, qmt_code: str) -> str:
+        xtdata = _xtdata()
+        try:
+            detail = xtdata.get_instrument_detail(qmt_code)
+            if isinstance(detail, dict):
+                return (
+                    detail.get("InstrumentName")
+                    or detail.get("instrument_name")
+                    or detail.get("name")
+                    or detail.get("Name")
+                    or ""
+                )
+        except Exception:
+            return ""
+        return ""
+
+    def _code_list_dirs(self) -> list:
+        xtdata = _xtdata()
+        candidates = []
+        for path in [QMT_CODE_LIST_DATA_DIR, QMT_DATA_DIR]:
+            if path:
+                candidates.append(path)
+        try:
+            data_dir = xtdata.get_data_dir()
+            if data_dir:
+                candidates.append(data_dir)
+                # MiniQMT常返回 .../userdata_mini/datadir；国金完整客户端还会有兄弟目录 datadir。
+                root = os.path.abspath(os.path.join(data_dir, os.pardir, os.pardir))
+                candidates.append(os.path.join(root, "datadir"))
+        except Exception:
+            pass
+
+        seen = set()
+        result = []
+        for path in candidates:
+            path = os.path.abspath(os.path.normpath(path))
+            if path not in seen and os.path.isdir(path):
+                seen.add(path)
+                result.append(path)
+        return result
+
+    def _get_codes_from_local_files(self, filter_func) -> pd.DataFrame:
+        rows = []
+        for data_dir in self._code_list_dirs():
+            for market, prefix in [("SH", "sh"), ("SZ", "sz"), ("BJ", "bj")]:
+                market_dir = os.path.join(data_dir, market, "86400")
+                if not os.path.isdir(market_dir):
+                    continue
+                for entry in os.scandir(market_dir):
+                    if not entry.is_file() or not entry.name.upper().endswith(".DAT"):
+                        continue
+                    raw_code = os.path.splitext(entry.name)[0]
+                    if not re.match(r"^\d{6}$", raw_code):
+                        continue
+                    code = f"{prefix}.{raw_code}"
+                    if filter_func(code):
+                        rows.append({"code": code, "code_name": ""})
+
+        df = pd.DataFrame(rows).drop_duplicates(subset=["code"]) if rows else pd.DataFrame(columns=["code", "code_name"])
+        return df.sort_values("code").reset_index(drop=True) if not df.empty else df
+
+    def _get_sector_codes(self, sectors: list, filter_func) -> pd.DataFrame:
+        self.login()
+        xtdata = _xtdata()
+        rows = []
+        for sector in sectors:
+            if QMT_SYNC_SECTOR_DATA:
+                try:
+                    if hasattr(xtdata, "download_sector_data"):
+                        xtdata.download_sector_data()
+                except Exception as e:
+                    logger.warning(f"⚠️ QMT板块数据同步失败，继续尝试读取本地板块: {e}")
+            try:
+                qmt_codes = xtdata.get_stock_list_in_sector(sector) or []
+                logger.info(f"📋 QMT板块 {sector} 返回 {len(qmt_codes)} 个代码")
+            except Exception as e:
+                logger.warning(f"⚠️ 读取QMT板块 {sector} 失败: {e}")
+                continue
+            for qmt_code in qmt_codes:
+                code = self._from_qmt_code(qmt_code)
+                if filter_func(code):
+                    rows.append({
+                        "code": code,
+                        "code_name": self._get_name(qmt_code),
+                    })
+
+        df = pd.DataFrame(rows).drop_duplicates(subset=["code"]) if rows else pd.DataFrame(columns=["code", "code_name"])
+        if df.empty:
+            df = self._get_codes_from_local_files(filter_func)
+            logger.info(f"📁 QMT本地datadir推导出 {len(df)} 个代码")
+        return df.sort_values("code").reset_index(drop=True) if not df.empty else df
+
     @retry_with_backoff
     def get_stock_list(self) -> pd.DataFrame:
-        """
-        📋 获取A股股票列表
-        """
-        logger.info("📅 正在获取A股股票列表...")
-        df = _ak().stock_zh_a_spot()
-        # 格式化代码，添加市场前缀
-        df['code'] = df.apply(lambda x: f"sh.{x['代码']}" if x['代码'].startswith('6') else f"sz.{x['代码']}", axis=1)
-        df['code_name'] = df['名称']
-        # 过滤A股
-        df = df[df['code'].str.contains(r'sh\.6|sz\.0|sz\.3|bj\.')]
-        logger.info(f"✅ 获取到 {len(df)} 只A股股票")
-        return df[['code', 'code_name']]
-    
+        df = self._get_sector_codes(QMT_STOCK_SECTORS, self._is_stock_code)
+        logger.info(f"✅ QMT获取到 {len(df)} 只A股股票")
+        return df
+
     @retry_with_backoff
     def get_etf_list(self) -> pd.DataFrame:
-        """
-        📋 获取ETF基金列表
-        """
-        logger.info("📅 正在获取ETF基金列表...")
-        df = _ak().fund_etf_spot_em()  # 适配新版本AKShare接口
-        # 格式化代码，添加市场前缀
-        df['code'] = df.apply(lambda x: f"sh.{x['代码']}" if x['代码'].startswith('5') else f"sz.{x['代码']}", axis=1)
-        df['code_name'] = df['名称']
-        # 过滤所有ETF（51/56/58开头沪市，15/159开头深市）
-        df = df[df['code'].str.contains(r'sh\.5[168]|sz\.15[09]')]
-        
-        logger.info(f"✅ 获取到 {len(df)} 只ETF基金")
-        return df[['code', 'code_name']]
-    
+        df = self._get_sector_codes(QMT_ETF_SECTORS, self._is_etf_code)
+        logger.info(f"✅ QMT获取到 {len(df)} 只ETF基金")
+        return df
+
+    def _extract_market_df(self, market_data, qmt_code: str) -> pd.DataFrame:
+        if market_data is None:
+            return pd.DataFrame()
+        if isinstance(market_data, pd.DataFrame):
+            return market_data.copy()
+        if isinstance(market_data, dict):
+            if qmt_code in market_data and isinstance(market_data[qmt_code], pd.DataFrame):
+                return market_data[qmt_code].copy()
+
+            # 兼容 get_market_data 返回的 field -> DataFrame/Series 结构。
+            field_frames = {}
+            for field, value in market_data.items():
+                if isinstance(value, pd.DataFrame):
+                    if qmt_code in value.columns:
+                        field_frames[field] = value[qmt_code]
+                    elif len(value.columns) == 1:
+                        field_frames[field] = value.iloc[:, 0]
+                elif isinstance(value, pd.Series):
+                    field_frames[field] = value
+            if field_frames:
+                return pd.DataFrame(field_frames)
+        return pd.DataFrame()
+
+    @staticmethod
+    def _normalize_date_series(df: pd.DataFrame) -> pd.Series:
+        if "date" in df.columns:
+            raw = df["date"]
+        elif "time" in df.columns:
+            raw = df["time"]
+        elif "stime" in df.columns:
+            raw = df["stime"]
+        elif "index" in df.columns:
+            raw = df["index"]
+        else:
+            raw = pd.Series(df.index, index=df.index)
+
+        if pd.api.types.is_datetime64_any_dtype(raw):
+            return pd.to_datetime(raw).dt.strftime("%Y-%m-%d")
+
+        raw_str = raw.astype(str).str.replace(r"\.0$", "", regex=True)
+        compact = raw_str.str.replace(r"\D", "", regex=True)
+        # QMT常见time可能是YYYYMMDD、YYYYMMDDHHMMSS或毫秒时间戳。
+        if compact.str.len().isin([8, 14]).any():
+            parsed = pd.to_datetime(compact.str.slice(0, 8), format="%Y%m%d", errors="coerce")
+            if parsed.notna().any():
+                return parsed.dt.strftime("%Y-%m-%d")
+        numeric = pd.to_numeric(raw, errors="coerce")
+        if numeric.notna().any() and numeric.dropna().astype("int64").astype(str).str.len().max() >= 12:
+            return pd.to_datetime(numeric, unit="ms", errors="coerce").dt.strftime("%Y-%m-%d")
+        return pd.to_datetime(raw_str, errors="coerce").dt.strftime("%Y-%m-%d")
+
+    def _standardize_history_df(self, raw_df: pd.DataFrame, code: str) -> pd.DataFrame:
+        if raw_df.empty:
+            return pd.DataFrame(columns=self.TARGET_COLUMNS)
+
+        df = raw_df.copy().reset_index()
+        rename_map = {
+            "vol": "volume",
+            "turnover": "amount",
+            "amount": "amount",
+            "lastClose": "preclose",
+            "preClose": "preclose",
+            "pre_close": "preclose",
+        }
+        df.rename(columns=rename_map, inplace=True)
+
+        df["date"] = self._normalize_date_series(df)
+        df = df.dropna(subset=["date"])
+        df["code"] = code
+
+        for col in ["open", "high", "low", "close", "volume", "amount"]:
+            if col not in df.columns:
+                df[col] = 0.0
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+        if "preclose" not in df.columns:
+            df["preclose"] = df["close"].shift(1).fillna(0)
+        df["preclose"] = pd.to_numeric(df["preclose"], errors="coerce").fillna(0)
+
+        if "pctChg" not in df.columns:
+            df["pctChg"] = ((df["close"] - df["preclose"]) / df["preclose"].replace(0, pd.NA) * 100).fillna(0)
+        df["pctChg"] = pd.to_numeric(df["pctChg"], errors="coerce").fillna(0)
+
+        df["adjustflag"] = self._adjustflag()
+        df["turn"] = pd.to_numeric(df["turn"], errors="coerce").fillna(0) if "turn" in df.columns else 0.0
+        df["tradestatus"] = df["tradestatus"].astype(str) if "tradestatus" in df.columns else "1"
+        df["isST"] = df["isST"].astype(str) if "isST" in df.columns else "0"
+
+        return df[self.TARGET_COLUMNS]
+
     @retry_with_backoff
     def get_stock_history(self, code: str, start_date: str, end_date: str, frequency: str = "d") -> pd.DataFrame:
-        """
-        📈 获取股票/ETF历史数据
-        """
-        # 转换频率参数
-        period_map = {
-            "d": "daily",
-            "w": "weekly",
-            "m": "monthly",
-            "1": "1min",
-            "5": "5min"
-        }
-        period = period_map.get(frequency, "daily")
-        
-        # 去掉代码前缀
-        pure_code = code.split('.')[1]
-        
-        # 处理日期格式
-        # 股票接口要求YYYYMMDD，基金接口要求YYYY-MM-DD
-        start_date_stock = start_date.replace('-', '')
-        end_date_stock = end_date.replace('-', '')
-        start_date_fund = start_date
-        end_date_fund = end_date
-        
-        # 判断是股票还是ETF
-        is_etf = bool(re.match(r'sh\.5[168]|sz\.15[09]', code))
-        
-        if is_etf:
-            # ETF改用新浪财经数据源，更稳定
-            logger.info(f"📥 [新浪财经] 获取ETF {code} 数据: {start_date_fund} ~ {end_date_fund}")
-            # 新浪接口需要带市场前缀的代码，如sh513310
-            sina_symbol = code.replace('.', '')
-            # 添加随机延迟，避免触发限流
-            import random
-            import time
-            time.sleep(random.uniform(0.5, 1.5))
-            df = _ak().fund_etf_hist_sina(
-                symbol=sina_symbol
-            )
-            # 新浪接口不支持日期参数，获取全部数据后过滤
-            if not df.empty:
-                # 数据校验：确保date列是日期格式，过滤异常数据
-                df['date'] = pd.to_datetime(df['date'], errors='coerce')
-                # 过滤date为NaN的行（可能是ETF名称等异常数据）
-                df = df.dropna(subset=['date'])
-                if df.empty:
-                    logger.warning(f"⚠️ ETF {code} 数据过滤后为空")
-                    return pd.DataFrame()
-                df['date'] = df['date'].dt.strftime('%Y-%m-%d')
-                df = df[(df['date'] >= start_date_fund) & (df['date'] <= end_date_fund)]
-            
-            # 新浪接口只返回日线数据，需要转换为周线或月线
-            if not df.empty and frequency in ['w', 'm']:
-                logger.info(f"🔄 将ETF日线数据转换为{frequency}周期")
-                df['date'] = pd.to_datetime(df['date'])
-                
-                # 过滤掉未来日期的数据（只保留到当前日期）
-                current_date = pd.Timestamp.now()
-                original_count = len(df)
-                df = df[df['date'] <= current_date]
-                if original_count > len(df):
-                    logger.warning(f"⚠️ 过滤了 {original_count - len(df)} 条未来日期数据")
-                
-                df = df.set_index('date')
-                
-                # 定义周期转换规则 (pandas新版本使用'ME'代替'M'表示月末)
-                freq_map = {'w': 'W', 'm': 'ME'}
-                resample_freq = freq_map.get(frequency, 'W')
-                
-                # 重采样：开盘取第一个，最高取最大，最低取最小，收盘取最后
-                # 只保留需要的数值列进行重采样
-                df_resampled = df[['open', 'high', 'low', 'close', 'volume', 'amount']].resample(resample_freq).agg({
-                    'open': 'first',
-                    'high': 'max',
-                    'low': 'min',
-                    'close': 'last',
-                    'volume': 'sum',
-                    'amount': 'sum'
-                }).dropna()
-                
-                # 计算涨跌幅
-                df_resampled['pctChg'] = df_resampled['close'].pct_change() * 100
-                df_resampled['pctChg'] = df_resampled['pctChg'].fillna(0)
-                
-                # 重置日期格式
-                df_resampled = df_resampled.reset_index()
-                
-                # 再次过滤，确保周期结束日期也不超过当前日期
-                # pandas resample 会产生周期结束日期（如周日的日期），需要过滤
-                df_resampled = df_resampled[df_resampled['date'] <= current_date]
-                
-                df_resampled['date'] = df_resampled['date'].dt.strftime('%Y-%m-%d')
-                
-                # 添加code列和其他必要字段
-                df_resampled['code'] = code
-                df_resampled['name'] = ""  # name字段后续在worker_download中填充
-                df_resampled['preclose'] = 0.0
-                df_resampled['adjustflag'] = ""
-                df_resampled['turn'] = 0.0
-                df_resampled['tradestatus'] = "1"
-                df_resampled['isST'] = "0"
-                
-                # 强制按照数据库表结构的列顺序排列
-                target_columns = [
-                    'code', 'name', 'date', 'open', 'high', 'low', 'close', 'preclose', 
-                    'volume', 'amount', 'adjustflag', 'turn', 'tradestatus', 'pctChg', 'isST'
-                ]
-                df = df_resampled[target_columns]
-        else:
-            # 股票使用东方财富接口，增加更长延迟避免限流
-            logger.info(f"📥 [AKShare] 获取股票 {code} 数据: {start_date_stock} ~ {end_date_stock}")
-            # 增加更长的随机延迟，避免东方财富限流
-            import random
-            import time
-            time.sleep(random.uniform(2, 3.5))
-            df = _ak().stock_zh_a_hist(
-                symbol=pure_code,
+        self.login()
+        xtdata = _xtdata()
+        qmt_code = self._to_qmt_code(code)
+        period = self._period(frequency)
+        start = self._date_arg(start_date)
+        end = self._date_arg(end_date)
+
+        logger.info(f"📥 [QMT] 获取 {code}({qmt_code}) {period} 数据: {start} ~ {end}")
+        if QMT_DOWNLOAD_BEFORE_QUERY and hasattr(xtdata, "download_history_data"):
+            xtdata.download_history_data(qmt_code, period=period, start_time=start, end_time=end)
+
+        fields = ["open", "high", "low", "close", "volume", "amount"]
+        if hasattr(xtdata, "get_market_data_ex"):
+            market_data = xtdata.get_market_data_ex(
+                fields,
+                [qmt_code],
                 period=period,
-                start_date=start_date_stock,
-                end_date=end_date_stock,
-                adjust="hfq"
+                start_time=start,
+                end_time=end,
+                count=-1,
+                dividend_type=QMT_DIVIDEND_TYPE,
+                fill_data=True,
             )
-        
+        else:
+            market_data = xtdata.get_market_data(
+                fields,
+                [qmt_code],
+                period=period,
+                start_time=start,
+                end_time=end,
+                count=-1,
+                dividend_type=QMT_DIVIDEND_TYPE,
+                fill_data=True,
+            )
+
+        raw_df = self._extract_market_df(market_data, qmt_code)
+        df = self._standardize_history_df(raw_df, code)
         if df.empty:
-            logger.warning(f"⚠️ 未获取到 {code} 的历史数据")
-            return pd.DataFrame()
-        
-        # 调试信息：返回数据的日期范围
-        if not df.empty:
-            if '日期' in df.columns:
-                min_date = pd.to_datetime(df['日期']).min().strftime('%Y-%m-%d')
-                max_date = pd.to_datetime(df['日期']).max().strftime('%Y-%m-%d')
-            elif 'date' in df.columns:
-                min_date = df['date'].min()
-                max_date = df['date'].max()
-            else:
-                min_date = "未知"
-                max_date = "未知"
-            logger.info(f"✅ {code} 返回数据范围: {min_date} ~ {max_date}，共 {len(df)} 条")
-        
-        # 格式化列名，统一格式
-        df['code'] = code
-        
-        # 东方财富字段映射
-        rename_dict = {
-            "日期": "date",
-            "开盘": "open",
-            "最高": "high",
-            "最低": "low",
-            "收盘": "close",
-            "前收盘": "preclose",
-            "成交量": "volume",
-            "成交额": "amount",
-            "调整标志": "adjustflag",
-            "换手率": "turn",
-            "交易状态": "tradestatus",
-            "涨跌幅": "pctChg",
-            "是否ST": "isST"
-        }
-        # 处理可能缺少的字段
-        for col in ["preclose", "adjustflag", "turn", "tradestatus", "pctChg", "isST"]:
-            if col not in df.columns:
-                if col in ["preclose", "turn", "pctChg"]:
-                    df[col] = 0.0
-                elif col == "adjustflag":
-                    df[col] = ""
-                elif col == "tradestatus":
-                    df[col] = "1"
-                elif col == "isST":
-                    df[col] = "0"
-        
-        df.rename(columns=rename_dict, inplace=True)
-        logger.info(f"📤 {code} 数据列: {df.columns.tolist()}")
-        return df[['code', 'date', 'open', 'high', 'low', 'close', 'preclose', 'volume', 'amount', 'adjustflag', 'turn', 'tradestatus', 'pctChg', 'isST']]
-    
+            logger.warning(f"⚠️ QMT未获取到 {code} 的历史数据")
+        else:
+            logger.info(f"✅ QMT返回 {code} 数据范围: {df['date'].min()} ~ {df['date'].max()}，共 {len(df)} 条")
+        return df
+
     def get_data_source_name(self) -> str:
-        """
-        📛 获取数据源名称
-        """
-        return "AKShare"
+        return "QMT/xtquant"

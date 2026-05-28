@@ -47,8 +47,16 @@ class ConfigLoader:
             "database": {
                 "path": "quant_data.db"
             },
-            "baostock": {
-                "adjust_flag": "2"
+            "qmt": {
+                "ip": "127.0.0.1",
+                "port": 58610,
+                "data_dir": "",
+                "dividend_type": "front",
+                "download_before_query": True,
+                "sync_sector_data": False,
+                "code_list_data_dir": "",
+                "stock_sectors": ["沪深A股"],
+                "etf_sectors": ["沪深ETF", "沪深基金"]
             },
             "concurrency": {
                 "max_workers": 1,
@@ -79,11 +87,10 @@ class ConfigLoader:
                 "max_errors_before_warning": 10
             },
             "datasource": {
-                "default": "baostock",
-                "stock_source": "baostock",
-                "etf_source": "akshare",
-                "enable_fallback": True,
-                "priority": ["baostock", "akshare"]
+                "default": "qmt",
+                "stock_source": "qmt",
+                "etf_source": "qmt",
+                "priority": ["qmt"]
             },
             "data": {
                 "start_date_full": "1999-01-01",
@@ -111,8 +118,15 @@ DATABASE_PATH = os.path.join(PROJECT_ROOT, config_loader.get("database.path", "q
 STOCK_DB_PATH = os.path.join(PROJECT_ROOT, config_loader.get("database.stock_path", "stock_data.db"))
 ETF_DB_PATH = os.path.join(PROJECT_ROOT, config_loader.get("database.etf_path", "etf_data.db"))
 
-# Baostock 配置
-BAOSTOCK_ADJUST_FLAG = config_loader.get("baostock.adjust_flag", "2")
+QMT_IP = config_loader.get("qmt.ip", "127.0.0.1")
+QMT_PORT = config_loader.get("qmt.port", 58610)
+QMT_DATA_DIR = config_loader.get("qmt.data_dir", "")
+QMT_DIVIDEND_TYPE = config_loader.get("qmt.dividend_type", "front")
+QMT_DOWNLOAD_BEFORE_QUERY = config_loader.get("qmt.download_before_query", True)
+QMT_SYNC_SECTOR_DATA = config_loader.get("qmt.sync_sector_data", False)
+QMT_CODE_LIST_DATA_DIR = config_loader.get("qmt.code_list_data_dir", "")
+QMT_STOCK_SECTORS = config_loader.get("qmt.stock_sectors", ["沪深A股"])
+QMT_ETF_SECTORS = config_loader.get("qmt.etf_sectors", ["沪深ETF", "沪深基金"])
 START_DATE_FULL = config_loader.get("data.start_date_full", "1999-01-01")
 START_DATE_FULL_ETF = config_loader.get("data.start_date_full_etf", "1999-01-04")
 END_DATE = config_loader.get("data.end_date", None)  # 拉取结束日期，None则自动使用当前日期（18点前用前一天，18点后用当天）
@@ -151,8 +165,6 @@ PROCESS_HEARTBEAT_TIMEOUT = config_loader.get("process_monitor.heartbeat_timeout
 PROCESS_MAX_REVIVE_TIMES = config_loader.get("process_monitor.max_revive_times", 3)  # 单个进程最大复活次数
 
 # 数据源配置
-DEFAULT_DATA_SOURCE = config_loader.get("datasource.default", "baostock")
-STOCK_DATA_SOURCE = config_loader.get("datasource.stock_source", "baostock")
-ETF_DATA_SOURCE = config_loader.get("datasource.etf_source", "akshare")
-ENABLE_DATA_SOURCE_FALLBACK = config_loader.get("datasource.enable_fallback", True)
-DATA_SOURCE_PRIORITY = config_loader.get("datasource.priority", ["baostock"])
+STOCK_DATA_SOURCE = config_loader.get("datasource.stock_source", "qmt")
+ETF_DATA_SOURCE = config_loader.get("datasource.etf_source", "qmt")
+DATA_SOURCE_PRIORITY = config_loader.get("datasource.priority", ["qmt"])

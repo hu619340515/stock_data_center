@@ -1,5 +1,5 @@
 from data_source_interface import DataSourceInterface
-from data_source import BaoStockClient, AKShareClient
+from data_source import QMTClient
 
 class DataSourceFactory:
     """
@@ -13,19 +13,13 @@ class DataSourceFactory:
         📱 创建数据源实例
         
         Args:
-            source_type: 数据源类型 (baostock, tushare, etc.)
+            source_type: 数据源类型（仅支持 qmt/xtquant）
             
         Returns:
             数据源实例
         """
-        if source_type.lower() == "baostock":
-            return BaoStockClient()
-        elif source_type.lower() == "akshare":
-            return AKShareClient()
-        # 未来可以添加其他数据源
-        # elif source_type.lower() == "tushare":
-        #     return TuShareClient()
-        # elif source_type.lower() == "sina":
-        #     return SinaClient()
+        normalized_type = source_type.lower()
+        if normalized_type in ("qmt", "xtquant", "gjqmt", "guojin_qmt"):
+            return QMTClient()
         else:
-            raise ValueError(f"不支持的数据源类型: {source_type}")
+            raise ValueError(f"不支持的数据源类型: {source_type}。当前版本只支持 qmt/xtquant。")

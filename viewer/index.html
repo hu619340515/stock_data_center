@@ -316,6 +316,33 @@
     }
     .progress-speed { color: var(--green-card); }
     .progress-eta { color: var(--orange-card); }
+    .log-panel {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: #0f172a;
+      color: #dbeafe;
+      height: 260px;
+      overflow: auto;
+      padding: 12px;
+      font-family: Consolas, 'Courier New', monospace;
+      font-size: 12px;
+      line-height: 1.55;
+      white-space: pre-wrap;
+    }
+    .log-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 10px;
+      color: var(--text-dim);
+      font-size: 12px;
+    }
+    .log-path {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
   </style>
 </head>
 <body>
@@ -440,8 +467,18 @@
             <span id="progress-detail-main">-</span>
             <span id="progress-speed" class="progress-speed">-</span>
             <span id="progress-eta" class="progress-eta">-</span>
+            <span id="progress-source">数据源: qmt</span>
           </div>
         </div>
+      </div>
+
+      <div class="card" id="log-card">
+        <div class="card-title">🧾 实时日志</div>
+        <div class="log-toolbar">
+          <span id="log-status">等待日志...</span>
+          <span class="log-path" id="log-path">-</span>
+        </div>
+        <div class="log-panel" id="log-panel">暂无日志</div>
       </div>
 
       <!-- 统计卡片 -->
@@ -686,12 +723,37 @@ async function loadProgress() {
       document.getElementById('progress-detail-main').textContent = `${progress.processed}/${progress.total} (成功: ${progress.success}, 失败: ${progress.error})`;
       document.getElementById('progress-speed').textContent = progress.speed ? `速度: ${progress.speed} 只/秒` : '-';
       document.getElementById('progress-eta').textContent = progress.eta ? `剩余: ${progress.eta}` : '-';
+      document.getElementById('progress-source').textContent = `数据源: ${progress.data_source || 'qmt'}`;
     } else {
       card.style.display = 'none';
       stopBtn.style.display = 'none';
     }
   } catch (e) {
     console.error('加载进度失败:', e);
+  }
+}
+
+/* ───────── 加载实时日志 ───────── */
+async function loadLogs() {
+  try {
+    const d = await api('/api/logs?limit=160');
+    const panel = document.getElementById('log-panel');
+    const status = document.getElementById('log-status');
+    const path = document.getElementById('log-path');
+    const logs = [...(d.logs || [])];
+    const errors = (d.error_logs || []).filter(line => line && !line.startsWith('#'));
+
+    if (errors.length) {
+      logs.push('', '--- error_log.txt ---', ...errors.slice(-40));
+    }
+
+    panel.textContent = logs.length ? logs.join('\n') : '暂无日志';
+    panel.scrollTop = panel.scrollHeight;
+    status.textContent = d.is_running ? '任务运行中，日志实时刷新' : '当前没有运行中的下载任务';
+    path.textContent = d.log_path || '-';
+  } catch (e) {
+    document.getElementById('log-status').textContent = '日志加载失败';
+    console.error('加载日志失败:', e);
   }
 }
 
@@ -850,6 +912,7 @@ function refreshAll() {
   if (document.getElementById('panel-overview').classList.contains('active')) {
     loadOverview();
     loadProgress();
+    loadLogs();
   } else if (document.getElementById('panel-table').classList.contains('active')) {
     loadTable(currentPage);
   }
@@ -861,8 +924,10 @@ window.addEventListener('DOMContentLoaded', async () => {
   await checkStatus();
   await loadOverview();
   await loadProgress();
+  await loadLogs();
   setInterval(checkStatus, 30000);
   setInterval(loadProgress, 1000);
+  setInterval(loadLogs, 1000);
 });
 </script>
 </body>

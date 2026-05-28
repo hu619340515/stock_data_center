@@ -15,14 +15,14 @@ class TestConfigLoader(unittest.TestCase):
         self.assertEqual(loader.get("database.path"), "quant_data.db")
         
         # 测试并发配置
-        self.assertEqual(loader.get("concurrency.max_workers"), 4)
+        self.assertEqual(loader.get("concurrency.max_workers"), 1)
         self.assertTrue(loader.get("concurrency.dynamic_concurrency"))
         
         # 测试批量配置
         self.assertEqual(loader.get("batch.size"), 50)
         
         # 测试数据源配置
-        self.assertEqual(loader.get("datasource.default"), "baostock")
+        self.assertEqual(loader.get("datasource.default"), "qmt")
     
     def test_custom_config(self):
         """测试自定义配置"""
