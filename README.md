@@ -2,6 +2,15 @@
 
 这是一个面向本地量化研究的数据采集、存储和可视化工具。项目使用国金 QMT / miniQMT 的 `xtquant` 本地行情接口拉取 A 股和 ETF 历史行情，使用 DuckDB 做本地列式存储，并提供命令行工具和 Flask Web 管理界面。
 
+## 更新日志
+
+### 2026-05-29
+- **核心修复**：修复进程复活时进度偏移量未累积导致任务丢失的问题，新增 `process_base_completed` 追踪已完成偏移
+- **配置优化**：心跳超时从 30 秒调整到 120 秒，避免 `upload_batch` 写入大量数据时误杀子进程
+- **兼容性**：修复 DuckDB 不同配置同时连接导致的连接冲突问题
+- **启动体验**：`start_viewer.bat` 新增依赖自动检查与安装（使用国内镜像源），避免启动闪退
+- **自动化**：QMT 路径支持自动检测与配置
+
 当前版本只保留 QMT / xtquant 数据源链路。使用前请确认 QMT 或 miniQMT 客户端已启动，并且当前 Python 环境可以导入 `xtquant`。
 
 ## 功能概览
@@ -28,6 +37,7 @@
 ├── data_source_interface.py   # 数据源接口定义
 ├── logger_config.py           # 日志配置
 ├── requirements.txt           # Python 依赖
+├── check_deps.py              # 依赖自动检测与安装脚本
 ├── start_viewer.bat           # Windows 快速启动脚本
 ├── viewer/
 │   ├── server.py              # Flask API 服务
@@ -109,6 +119,8 @@ datasource:
 | `batch.size` | 批量写入大小 |
 | `retry.max_retries` | 数据源调用最大重试次数 |
 | `process_monitor.enable_revive` | 是否启用子进程异常复活 |
+| `process_monitor.heartbeat_timeout` | 子进程心跳超时时间（秒） |
+| `process_monitor.max_revive_times` | 单个进程最大复活次数 |
 
 `config.py` 支持在配置值中使用 `${ENV_NAME}` 引用环境变量。
 
@@ -251,7 +263,15 @@ python cli.py vacuum -t etf
 
 ## Web 管理界面
 
-启动 Web 服务：
+Windows 下推荐使用快速启动脚本：
+
+```bash
+start_viewer.bat
+```
+
+脚本会自动检查并安装缺失的依赖（使用国内镜像源），然后启动 Web 服务。
+
+或手动启动：
 
 ```bash
 python cli.py start-viewer
@@ -421,6 +441,21 @@ python cli.py vacuum
 ```
 
 DuckDB 的维护操作可以回收部分空间并优化数据库文件。
+
+### 进程异常退出与任务丢失
+
+如果下载过程中出现进程频繁退出、心跳超时，或任务完成后统计显示有股票/ETF未处理，通常是以下两个问题已修复：
+
+1. **心跳超时配置过短**：`config.yaml` 中 `heartbeat_timeout` 默认设为 120 秒，避免 `upload_batch` 写入大量数据时阻塞导致误杀子进程。
+2. **进程复活时进度偏移量未累积**：已修复复活逻辑，新增 `process_base_completed` 追踪已完成的偏移量，解决重复处理和任务丢失问题。
+
+### DuckDB 连接错误：不同配置冲突
+
+当后台正在合并数据库（`merge_to_main_db`）时，Web 前端查询可能会报错：`Can't open a connection to same database file with a different configuration than existing connections`。已修复 viewer 的 `get_conn`，当遇到连接配置冲突时自动回退到默认模式。
+
+### 快速启动依赖问题
+
+Windows 下使用 `start_viewer.bat` 时闪退，已将依赖检查逻辑迁移到 `check_deps.py`，脚本会自动检测缺失的包并尝试安装（使用国内镜像源）。
 
 ## 许可
 
