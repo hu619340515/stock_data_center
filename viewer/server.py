@@ -244,7 +244,15 @@ def api_etf_update_latest():
 # ─────────────────────────────────────────────
 ALLOWED_TABLES = {
     'stock_daily', 'stock_weekly', 'stock_monthly',
-    'etf_daily',   'etf_weekly',   'etf_monthly'
+    'etf_daily',   'etf_weekly',   'etf_monthly',
+    'stock_info', 'etf_info',
+    'trade_calendar',
+    'factor_rps_daily', 'factor_update_log'
+}
+
+MARKET_TABLES = {
+    'stock_daily', 'stock_weekly', 'stock_monthly',
+    'etf_daily', 'etf_weekly', 'etf_monthly'
 }
 
 # ─────────────────────────────────────────────
@@ -307,21 +315,61 @@ def check_table(table):
         return None, (jsonify({'status': 'error', 'msg': f'未知表名: {table}'}), 400)
     return table, None
 
-def build_where(keyword='', start='', end='', code=''):
+def asset_type_for_table(table):
+    return 'etf' if table.startswith('etf_') else 'stock'
+
+def table_columns(conn, table):
+    return [row[0] for row in conn.execute(f"DESCRIBE {table}").fetchall()]
+
+def info_table_for_market(table):
+    return 'etf_info' if table.startswith('etf_') else 'stock_info'
+
+def market_display_sql(conn, table):
+    columns = table_columns(conn, table)
+    select_parts = []
+    if 'code' in columns:
+        select_parts.append('d.code')
+    select_parts.append("COALESCE(i.name, '') AS name")
+    if 'date' in columns:
+        select_parts.append('d.date')
+    select_parts.extend(f'd.{col}' for col in columns if col not in {'code', 'name', 'date'})
+    info_table = info_table_for_market(table)
+    return ', '.join(select_parts), f"{table} d LEFT JOIN {info_table} i ON d.code = i.code"
+
+def build_where(keyword='', start='', end='', code='', columns=None):
     """返回 (where_clause: str, params: list)，使用参数化占位符 ? 防止 SQL 注入。"""
+    columns = set(columns or ['code', 'date'])
     conds  = []
     params = []
-    if keyword:
+    if keyword and 'code' in columns:
         conds.append("code LIKE ?")
         params.append(f'%{keyword}%')
-    if code:
+    if code and 'code' in columns:
         conds.append("code = ?")
         params.append(code)
-    if start:
+    if start and 'date' in columns:
         conds.append("date >= ?")
         params.append(start)
-    if end:
+    if end and 'date' in columns:
         conds.append("date <= ?")
+        params.append(end)
+    clause = ('WHERE ' + ' AND '.join(conds)) if conds else ''
+    return clause, params
+
+def build_market_where(keyword='', start='', end='', code=''):
+    conds = []
+    params = []
+    if keyword:
+        conds.append("(d.code LIKE ? OR i.name LIKE ?)")
+        params.extend([f'%{keyword}%', f'%{keyword}%'])
+    if code:
+        conds.append("d.code = ?")
+        params.append(code)
+    if start:
+        conds.append("d.date >= ?")
+        params.append(start)
+    if end:
+        conds.append("d.date <= ?")
         params.append(end)
     clause = ('WHERE ' + ' AND '.join(conds)) if conds else ''
     return clause, params
@@ -365,7 +413,7 @@ def api_status():
             # 尝试初始化
             try:
                 from database import DuckDBManager
-                db = DuckDBManager(db_path=STOCK_DB_PATH)
+                db = DuckDBManager(db_path=STOCK_DB_PATH, asset_type='stock')
                 db.close()
                 stock_status['status'] = 'ok'
             except Exception as init_e:
@@ -383,7 +431,7 @@ def api_status():
             # 尝试初始化
             try:
                 from database import DuckDBManager
-                db = DuckDBManager(db_path=ETF_DB_PATH)
+                db = DuckDBManager(db_path=ETF_DB_PATH, asset_type='etf')
                 db.close()
                 etf_status['status'] = 'ok'
             except Exception as init_e:
@@ -459,22 +507,26 @@ def api_overview():
     table = request.args.get('table', '').strip()
     try:
         # 根据表名自动选择数据库
-        asset_type = 'etf' if table.startswith('etf_') else 'stock'
+        asset_type = asset_type_for_table(table)
         conn = get_conn(asset_type=asset_type)
         if table and table in ALLOWED_TABLES:
+            columns = set(table_columns(conn, table))
             count      = conn.execute(f"SELECT COUNT(1) FROM {table}").fetchone()[0]
-            code_count = conn.execute(f"SELECT COUNT(DISTINCT code) FROM {table}").fetchone()[0]
-            dr         = conn.execute(f"SELECT MIN(date), MAX(date) FROM {table}").fetchone()
+            code_count = conn.execute(f"SELECT COUNT(DISTINCT code) FROM {table}").fetchone()[0] if 'code' in columns else 0
+            dr         = conn.execute(f"SELECT MIN(date), MAX(date) FROM {table}").fetchone() if 'date' in columns else (None, None)
             min_date   = str(dr[0]) if dr[0] else '-'
             max_date   = str(dr[1]) if dr[1] else '-'
             try:
                 latest   = str(dr[1])
-                rise_cnt = conn.execute(
-                    f"SELECT COUNT(1) FROM {table} WHERE date='{latest}' AND pctChg > 0"
-                ).fetchone()[0]
-                fall_cnt = conn.execute(
-                    f"SELECT COUNT(1) FROM {table} WHERE date='{latest}' AND pctChg < 0"
-                ).fetchone()[0]
+                if latest != '-' and 'date' in columns and 'pctChg' in columns:
+                    rise_cnt = conn.execute(
+                        f"SELECT COUNT(1) FROM {table} WHERE date='{latest}' AND pctChg > 0"
+                    ).fetchone()[0]
+                    fall_cnt = conn.execute(
+                        f"SELECT COUNT(1) FROM {table} WHERE date='{latest}' AND pctChg < 0"
+                    ).fetchone()[0]
+                else:
+                    rise_cnt = fall_cnt = 0
                 cards = [
                     {'label': '总记录数',  'value': f'{count:,}',   'trend': 'neutral'},
                     {'label': '证券数量',  'value': str(code_count),'trend': 'neutral'},
@@ -530,18 +582,29 @@ def api_table():
 
     try:
         #  参数化 WHERE，防注入，同时避免特殊字符（如 sh.600006 中的点）破坏 SQL
-        where, params = build_where(keyword=keyword, start=start, end=end)
-
-        sql_data  = (
-            f"SELECT * FROM {table} {where} "
-            f"ORDER BY date DESC, code "
-            f"LIMIT {page_size} OFFSET {offset}"
-        )
-        sql_count = f"SELECT COUNT(1) FROM {table} {where}"
+        asset_type = asset_type_for_table(table)
+        conn  = get_conn(asset_type=asset_type)
+        if table in MARKET_TABLES:
+            select_cols, from_sql = market_display_sql(conn, table)
+            where, params = build_market_where(keyword=keyword, start=start, end=end)
+            sql_data  = (
+                f"SELECT {select_cols} FROM {from_sql} {where} "
+                f"ORDER BY d.date DESC, d.code "
+                f"LIMIT {page_size} OFFSET {offset}"
+            )
+            sql_count = f"SELECT COUNT(1) FROM {from_sql} {where}"
+        else:
+            columns = table_columns(conn, table)
+            where, params = build_where(keyword=keyword, start=start, end=end, columns=columns)
+            order_by = "date DESC, code" if "date" in columns and "code" in columns else columns[0]
+            sql_data  = (
+                f"SELECT * FROM {table} {where} "
+                f"ORDER BY {order_by} "
+                f"LIMIT {page_size} OFFSET {offset}"
+            )
+            sql_count = f"SELECT COUNT(1) FROM {table} {where}"
 
         # 根据表名自动选择数据库
-        asset_type = 'etf' if table.startswith('etf_') else 'stock'
-        conn  = get_conn(asset_type=asset_type)
         # ② 用参数列表执行，DuckDB 支持 ? 占位符
         df    = conn.execute(sql_data,  params).fetchdf()
         total = conn.execute(sql_count, params).fetchone()[0]
@@ -574,8 +637,11 @@ def api_codes():
     tbl, err = check_table(table)
     if err: return err
     try:
-        asset_type = 'etf' if table.startswith('etf_') else 'stock'
+        asset_type = asset_type_for_table(table)
         conn  = get_conn(asset_type=asset_type)
+        if 'code' not in table_columns(conn, table):
+            conn.close()
+            return jsonify([])
         codes = conn.execute(f"SELECT DISTINCT code FROM {table} ORDER BY code").fetchall()
         conn.close()
         return jsonify([c[0] for c in codes])
@@ -594,12 +660,21 @@ def api_kline():
     end   = request.args.get('end', '').strip()
     tbl, err = check_table(table)
     if err: return err
+    if table not in MARKET_TABLES:
+        return jsonify({'status': 'error', 'msg': '该接口仅支持行情表'}), 400
     if not code:
         return jsonify({'status': 'error', 'msg': '缺少 code 参数'}), 400
     try:
-        where, params = build_where(code=code, start=start, end=end)
-        asset_type = 'etf' if table.startswith('etf_') else 'stock'
+        asset_type = asset_type_for_table(table)
         conn = get_conn(asset_type=asset_type)
+        columns = table_columns(conn, table)
+        where, params = build_where(code=code, start=start, end=end, columns=columns)
+        info_table = info_table_for_market(table)
+        name_row = conn.execute(
+            f"SELECT name FROM {info_table} WHERE code = ?",
+            [code]
+        ).fetchone()
+        security_name = name_row[0] if name_row else ''
         # 尝试含 amount 字段；若不存在则降级
         try:
             sql = (f"SELECT CAST(date AS VARCHAR) as date, open, high, low, close, "
@@ -620,7 +695,7 @@ def api_kline():
         conn.close()
 
         if df.empty:
-            return jsonify({'dates': [], 'ohlc': [], 'volumes': [], 'amounts': [], 'mas': {}})
+            return jsonify({'code': code, 'name': security_name, 'dates': [], 'ohlc': [], 'volumes': [], 'amounts': [], 'mas': {}})
 
         # 转换为 float，避免 NaN/Inf 序列化失败
         for col in ['open', 'high', 'low', 'close', 'volume', 'amount']:
@@ -647,6 +722,8 @@ def api_kline():
             mas[str(n)] = ma_vals
 
         return jsonify({
+            'code':    code,
+            'name':    security_name,
             'dates':   dates,
             'ohlc':    ohlc,
             'volumes': volumes,
@@ -668,7 +745,7 @@ def api_stats():
     tbl, err = check_table(table)
     if err: return err
     try:
-        asset_type = 'etf' if table.startswith('etf_') else 'stock'
+        asset_type = asset_type_for_table(table)
         conn   = get_conn(asset_type=asset_type)
         schema = conn.execute(f"DESCRIBE {table}").fetchall()
         num_types = ('INTEGER','DOUBLE','FLOAT','BIGINT','DECIMAL','REAL','HUGEINT','UBIGINT')
@@ -702,9 +779,11 @@ def api_top_movers():
 
     tbl, err = check_table(table)
     if err: return err
+    if table not in MARKET_TABLES:
+        return jsonify({'status': 'error', 'msg': '该接口仅支持行情表'}), 400
 
     try:
-        asset_type = 'etf' if table.startswith('etf_') else 'stock'
+        asset_type = asset_type_for_table(table)
         conn = get_conn(asset_type=asset_type)
         if not date:
             row  = conn.execute(f"SELECT MAX(date) FROM {table}").fetchone()
@@ -714,17 +793,22 @@ def api_top_movers():
             return jsonify({'status': 'error', 'msg': '表中无数据'}), 404
 
         order = 'DESC' if direction == 'rise' else 'ASC'
+        info_table = info_table_for_market(table)
         try:
-            sql = (f"SELECT code, open, high, low, close, volume, pctChg "
-                   f"FROM {table} WHERE date='{date}' "
+            sql = (f"SELECT d.code, COALESCE(i.name, '') AS name, d.open, d.high, d.low, "
+                   f"d.close, d.volume, d.pctChg "
+                   f"FROM {table} d LEFT JOIN {info_table} i ON d.code = i.code "
+                   f"WHERE d.date = ? "
                    f"ORDER BY pctChg {order} LIMIT {limit}")
-            df = conn.execute(sql).fetchdf()
+            df = conn.execute(sql, [date]).fetchdf()
         except Exception:
-            sql = (f"SELECT code, open, high, low, close, volume, "
-                   f"ROUND((close-open)/NULLIF(open,0)*100, 2) AS pctChg "
-                   f"FROM {table} WHERE date='{date}' "
+            sql = (f"SELECT d.code, COALESCE(i.name, '') AS name, d.open, d.high, d.low, "
+                   f"d.close, d.volume, "
+                   f"ROUND((d.close-d.open)/NULLIF(d.open,0)*100, 2) AS pctChg "
+                   f"FROM {table} d LEFT JOIN {info_table} i ON d.code = i.code "
+                   f"WHERE d.date = ? "
                    f"ORDER BY pctChg {order} LIMIT {limit}")
-            df = conn.execute(sql).fetchdf()
+            df = conn.execute(sql, [date]).fetchdf()
         conn.close()
         return jsonify({'date': date, 'direction': direction, 'data': df_to_records(df)})
     except Exception as e:
@@ -745,6 +829,8 @@ def api_distribution():
 
     tbl, err = check_table(table)
     if err: return err
+    if table not in MARKET_TABLES:
+        return jsonify({'status': 'error', 'msg': '该接口仅支持行情表'}), 400
     ALLOWED_FIELDS = {'open','high','low','close','volume','pctChg','amount','turnover_rate'}
     if field not in ALLOWED_FIELDS:
         return jsonify({'status': 'error', 'msg': f'不支持的字段: {field}'}), 400
@@ -755,7 +841,7 @@ def api_distribution():
         if date:
             where  = (where + ' AND date = ?') if where else 'WHERE date = ?'
             params = params + [date]
-        asset_type = 'etf' if table.startswith('etf_') else 'stock'
+        asset_type = asset_type_for_table(table)
         conn = get_conn(asset_type=asset_type)
         if where:
             sql = f"SELECT {field} FROM {table} {where} AND {field} IS NOT NULL"
@@ -805,11 +891,14 @@ def api_trend():
 
     tbl, err = check_table(table)
     if err: return err
+    if table not in MARKET_TABLES:
+        return jsonify({'status': 'error', 'msg': '该接口仅支持行情表'}), 400
 
     try:
-        where, params = build_where(code=code, start=start, end=end)
-        asset_type = 'etf' if table.startswith('etf_') else 'stock'
+        asset_type = asset_type_for_table(table)
         conn  = get_conn(asset_type=asset_type)
+        columns = table_columns(conn, table)
+        where, params = build_where(code=code, start=start, end=end, columns=columns)
         sql   = (f"SELECT CAST(date AS VARCHAR) as date, "
                  f"ROUND(AVG({field}),4) as avg_val, "
                  f"ROUND(MAX({field}),4) as max_val, "
@@ -818,9 +907,17 @@ def api_trend():
                  f"FROM {table} {where} "
                  f"GROUP BY date ORDER BY date DESC LIMIT {limit}")
         df = conn.execute(sql, params).fetchdf()
+        security_name = ''
+        if code:
+            info_table = info_table_for_market(table)
+            name_row = conn.execute(
+                f"SELECT name FROM {info_table} WHERE code = ?",
+                [code]
+            ).fetchone()
+            security_name = name_row[0] if name_row else ''
         conn.close()
         df = df.iloc[::-1].reset_index(drop=True)
-        return jsonify({'field': field, 'code': code, 'data': df_to_records(df)})
+        return jsonify({'field': field, 'code': code, 'name': security_name, 'data': df_to_records(df)})
     except Exception as e:
         return jsonify({'status': 'error', 'msg': str(e)}), 500
 
@@ -839,9 +936,14 @@ def api_refresh_status():
                 for t in tables:
                     tname = t[0]
                     try:
-                        row = conn.execute(
-                            f"SELECT MAX(date), MIN(date), COUNT(1) FROM {tname}"
-                        ).fetchone()
+                        columns = set(table_columns(conn, tname))
+                        if 'date' in columns:
+                            row = conn.execute(
+                                f"SELECT MAX(date), MIN(date), COUNT(1) FROM {tname}"
+                            ).fetchone()
+                        else:
+                            count = conn.execute(f"SELECT COUNT(1) FROM {tname}").fetchone()[0]
+                            row = (None, None, count)
                         result.append({
                             'table':    tname,
                             'max_date': str(row[0]) if row[0] else None,
@@ -874,10 +976,17 @@ def api_export():
     if err: return err
 
     try:
-        where, params = build_where(keyword=keyword, start=start, end=end, code=code)
-        sql   = f"SELECT * FROM {table} {where} ORDER BY date DESC, code LIMIT {limit}"
-        asset_type = 'etf' if table.startswith('etf_') else 'stock'
+        asset_type = asset_type_for_table(table)
         conn  = get_conn(asset_type=asset_type)
+        if table in MARKET_TABLES:
+            select_cols, from_sql = market_display_sql(conn, table)
+            where, params = build_market_where(keyword=keyword, start=start, end=end, code=code)
+            sql = f"SELECT {select_cols} FROM {from_sql} {where} ORDER BY d.date DESC, d.code LIMIT {limit}"
+        else:
+            columns = table_columns(conn, table)
+            where, params = build_where(keyword=keyword, start=start, end=end, code=code, columns=columns)
+            order_by = "date DESC, code" if "date" in columns and "code" in columns else columns[0]
+            sql = f"SELECT * FROM {table} {where} ORDER BY {order_by} LIMIT {limit}"
         df    = conn.execute(sql, params).fetchdf()
         conn.close()
         for col in df.columns:
@@ -916,11 +1025,13 @@ def api_delete():
         return jsonify({'status': 'error', 'msg': '必须指定 code 或 start/end 至少一个条件'}), 400
 
     try:
-        where, params = build_where(code=code, start=start, end=end)
-        if not where:
-            return jsonify({'status': 'error', 'msg': '条件为空，拒绝全表删除'}), 400
-        asset_type = 'etf' if table.startswith('etf_') else 'stock'
+        asset_type = asset_type_for_table(table)
         conn  = get_conn(read_only=False, asset_type=asset_type)
+        columns = table_columns(conn, table)
+        where, params = build_where(code=code, start=start, end=end, columns=columns)
+        if not where:
+            conn.close()
+            return jsonify({'status': 'error', 'msg': '条件为空，拒绝全表删除'}), 400
         count = conn.execute(f"SELECT COUNT(1) FROM {table} {where}", params).fetchone()[0]
         conn.execute(f"DELETE FROM {table} {where}", params)
         conn.commit()
@@ -939,7 +1050,7 @@ def api_schema():
     tbl, err = check_table(table)
     if err: return err
     try:
-        asset_type = 'etf' if table.startswith('etf_') else 'stock'
+        asset_type = asset_type_for_table(table)
         conn   = get_conn(asset_type=asset_type)
         schema = conn.execute(f"DESCRIBE {table}").fetchall()
         conn.close()
@@ -960,17 +1071,20 @@ def api_summary_by_code():
 
     tbl, err = check_table(table)
     if err: return err
+    if table not in MARKET_TABLES:
+        return jsonify({'status': 'error', 'msg': '该接口仅支持行情表'}), 400
 
     try:
-        where, params = build_where(start=start, end=end)
-        asset_type = 'etf' if table.startswith('etf_') else 'stock'
+        asset_type = asset_type_for_table(table)
         conn  = get_conn(asset_type=asset_type)
-        sql   = (f"SELECT code, COUNT(1) as days, "
-                 f"ROUND(AVG(close),4) as avg_close, "
-                 f"MAX(high) as max_high, MIN(low) as min_low, "
-                 f"SUM(volume) as total_volume "
-                 f"FROM {table} {where} "
-                 f"GROUP BY code ORDER BY total_volume DESC LIMIT {limit}")
+        where, params = build_market_where(start=start, end=end)
+        info_table = info_table_for_market(table)
+        sql   = (f"SELECT d.code, COALESCE(i.name, '') AS name, COUNT(1) as days, "
+                 f"ROUND(AVG(d.close),4) as avg_close, "
+                 f"MAX(d.high) as max_high, MIN(d.low) as min_low, "
+                 f"SUM(d.volume) as total_volume "
+                 f"FROM {table} d LEFT JOIN {info_table} i ON d.code = i.code {where} "
+                 f"GROUP BY d.code, i.name ORDER BY total_volume DESC LIMIT {limit}")
         df = conn.execute(sql, params).fetchdf()
         conn.close()
         return jsonify(df_to_records(df))

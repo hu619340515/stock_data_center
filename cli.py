@@ -103,7 +103,7 @@ def status(frequency, asset_type):
     asset_type = _validate_asset_type(asset_type)
     db = None
     try:
-        db = DuckDBManager(db_path=_db_path_for(asset_type))
+        db = DuckDBManager(db_path=_db_path_for(asset_type), asset_type=asset_type)
         table_name = db._get_table_name(frequency, asset_type)
         res = db.con.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()
         count = db.con.execute(f"SELECT COUNT(DISTINCT code) FROM {table_name}").fetchone()
@@ -182,7 +182,7 @@ def export(code, start_date, end_date, output, frequency, output_format, asset_t
     end_date = end_date or datetime.date.today().strftime("%Y-%m-%d")
     db = None
     try:
-        db = DuckDBManager(db_path=_db_path_for(asset_type))
+        db = DuckDBManager(db_path=_db_path_for(asset_type), asset_type=asset_type)
         success = db.export_data(code, start_date, end_date, output, frequency, output_format, asset_type=asset_type)
         if success:
             logger.info(f"✅ 数据导出成功: {output}")
@@ -214,7 +214,7 @@ def delete(code, start_date, end_date, frequency, asset_type, yes):
 
     db = None
     try:
-        db = DuckDBManager(db_path=_db_path_for(asset_type))
+        db = DuckDBManager(db_path=_db_path_for(asset_type), asset_type=asset_type)
         table_name = db._get_table_name(frequency, asset_type)
         conds = []
         params = []
@@ -258,7 +258,7 @@ def vacuum(asset_type):
     for target in targets:
         db = None
         try:
-            db = DuckDBManager(db_path=_db_path_for(target))
+            db = DuckDBManager(db_path=_db_path_for(target), asset_type=target)
             db.vacuum()
             logger.info(f"✅ {target} 数据库维护完成: {_db_path_for(target)}")
         finally:

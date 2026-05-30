@@ -370,9 +370,13 @@
         <option value="stock_daily">股票日线</option>
         <option value="stock_weekly">股票周线</option>
         <option value="stock_monthly">股票月线</option>
+        <option value="factor_rps_daily">RPS因子</option>
+        <option value="trade_calendar">交易日历</option>
+        <option value="stock_info">股票基础信息</option>
         <option value="etf_daily">ETF日线</option>
         <option value="etf_weekly">ETF周线</option>
         <option value="etf_monthly">ETF月线</option>
+        <option value="etf_info">ETF基础信息</option>
       </select>
     </div>
     <button class="refresh-btn" onclick="refreshAll()">
@@ -653,7 +657,7 @@ async function checkStatus() {
 /* ───────── 加载概览 ───────── */
 async function loadOverview() {
   try {
-    const tables = ['stock_daily', 'stock_weekly', 'stock_monthly', 'etf_daily', 'etf_weekly', 'etf_monthly'];
+    const tables = ['stock_daily', 'stock_weekly', 'stock_monthly', 'factor_rps_daily', 'trade_calendar', 'stock_info', 'etf_daily', 'etf_weekly', 'etf_monthly', 'etf_info'];
     const tbody = document.getElementById('all-tables-tbody');
     tbody.innerHTML = '';
     

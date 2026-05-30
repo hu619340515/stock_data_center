@@ -96,14 +96,13 @@ def safe_print(msg):
             print(str(msg).encode("utf-8", errors="replace").decode("utf-8", errors="replace"), flush=True)
 
 DB_MARKET_COLUMNS = [
-    'code', 'name', 'date', 'open', 'high', 'low', 'close', 'preclose',
+    'code', 'date', 'open', 'high', 'low', 'close', 'preclose',
     'volume', 'amount', 'adjustflag', 'turn', 'tradestatus', 'pctChg', 'isST'
 ]
 
 def prepare_market_df_for_db(df: pd.DataFrame, name: str) -> pd.DataFrame:
-    """Add the display name and align columns to the DuckDB market table schema."""
+    """Align market data columns to the DuckDB market table schema."""
     df = df.copy()
-    df['name'] = name or ''
     for col in DB_MARKET_COLUMNS:
         if col not in df.columns:
             if col in {'open', 'high', 'low', 'close', 'preclose', 'volume', 'amount', 'turn', 'pctChg'}:
@@ -330,7 +329,7 @@ class StockDataPipeline:
         if use_temp_db:
             import tempfile
             self.temp_db_path = os.path.join(tempfile.gettempdir(), f"temp_{asset_type}_{int(time.time())}.db")
-            self.db: DuckDBManager = DuckDBManager(db_path=self.temp_db_path)
+            self.db: DuckDBManager = DuckDBManager(db_path=self.temp_db_path, asset_type=asset_type)
             safe_print(f"📁 使用临时数据库: {self.temp_db_path}")
         else:
             # 根据资产类型选择数据库路径
@@ -339,7 +338,7 @@ class StockDataPipeline:
                     db_path = ETF_DB_PATH
                 else:
                     db_path = STOCK_DB_PATH
-            self.db: DuckDBManager = DuckDBManager(db_path=db_path)
+            self.db: DuckDBManager = DuckDBManager(db_path=db_path, asset_type=asset_type)
         
         self.current_workers: int = MAX_WORKERS
         self.error_count: int = 0
@@ -382,7 +381,7 @@ class StockDataPipeline:
             safe_print(f"✅ 已关闭临时数据库连接")
             
             # 连接主数据库进行合并
-            main_db = DuckDBManager(db_path=main_db_path)
+            main_db = DuckDBManager(db_path=main_db_path, asset_type=self.asset_type)
             result = main_db.merge_from_db(self.temp_db_path, tables)
             main_db.close()
             safe_print(f"✅ 主数据库合并完成")

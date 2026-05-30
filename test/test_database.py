@@ -10,7 +10,7 @@ class TestDatabase(unittest.TestCase):
         """设置测试环境"""
         # 创建临时数据库文件
         self.temp_db = tempfile.mktemp(suffix='.db')
-        self.db = DuckDBManager(db_path=self.temp_db)
+        self.db = DuckDBManager(db_path=self.temp_db, asset_type="stock")
     
     def tearDown(self):
         """清理测试环境"""

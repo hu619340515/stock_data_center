@@ -48,17 +48,18 @@ python cli.py start-viewer
 
 当前 API 会根据表名自动选择数据库：
 
-- `stock_daily`、`stock_weekly`、`stock_monthly` 读取股票库。
-- `etf_daily`、`etf_weekly`、`etf_monthly` 读取 ETF 库。
+- `stock_daily`、`stock_weekly`、`stock_monthly`、`stock_info`、`factor_rps_daily`、`factor_update_log` 读取股票库。
+- `etf_daily`、`etf_weekly`、`etf_monthly`、`etf_info` 读取 ETF 库。
+- `trade_calendar` 在股票库和 ETF 库均可存在，viewer 默认按股票库读取。
 
 ## 页面能力
 
 - 数据库状态：查看股票库和 ETF 库是否可连接、包含哪些表。
 - 数据概览：查看记录数、证券数量、最早日期、最新日期、最新上涨数和下跌数。
-- 表格浏览：按表、关键词、日期范围分页查询。
+- 表格浏览：按表、关键词、日期范围分页查询；行情表会自动关联 `stock_info` / `etf_info` 显示证券名称。
 - K 线图：按代码和日期范围查看 K 线、成交量、成交额和 MA5 / MA10 / MA20 / MA60。
 - 统计分析：查看数值列统计、涨跌幅排行、价格或成交量分布、聚合趋势。
-- 数据导出：把当前筛选结果导出为 UTF-8 BOM CSV。
+- 数据导出：把当前筛选结果导出为 UTF-8 BOM CSV，行情表导出会包含 `name` 展示列。
 - 后台任务：启动股票或 ETF 的下载、增量更新、周线 / 月线任务和全周期任务。
 - 任务进度：查看总量、已处理、成功、失败、速度、预计剩余时间和实时日志。
 - 数据删除：通过确认参数删除指定代码或日期范围的数据。
@@ -71,10 +72,26 @@ python cli.py start-viewer
 stock_daily
 stock_weekly
 stock_monthly
+stock_info
 etf_daily
 etf_weekly
 etf_monthly
+etf_info
+trade_calendar
+factor_rps_daily
+factor_update_log
 ```
+
+行情表自身不存储 `name` 字段，名称来自 `stock_info` / `etf_info`。以下接口会自动 JOIN 基础信息表并返回名称：
+
+- `/api/table`
+- `/api/export`
+- `/api/top_movers`
+- `/api/summary_by_code`
+- `/api/kline`
+- `/api/trend`
+
+`/api/table` 和 `/api/export` 的 `keyword` 参数支持同时匹配证券代码和证券名称。
 
 ## API 清单
 

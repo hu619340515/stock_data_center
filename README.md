@@ -4,6 +4,12 @@
 
 ## 更新日志
 
+### 2026-05-31
+- **数据库边界清理**：`stock_data.db` 只创建和保留 `stock_*`、股票基础信息、交易日历和股票因子表；`etf_data.db` 只创建和保留 `etf_*`、ETF 基础信息和交易日历，避免两个库混放全套表。
+- **基础信息拆分**：行情表不再存储 `name`，证券名称统一保存在 `stock_info` / `etf_info`，避免日线、周线、月线中重复写入名称。
+- **交易日历与因子层**：新增 `trade_calendar`、`factor_rps_daily`、`factor_update_log`，RPS 不混入行情表，支持 `universe`、`factor_version`、`updated_at` 等版本追踪字段。
+- **前端名称适配**：viewer 查询、导出、涨跌幅榜、按代码汇总、K 线和趋势接口会自动关联基础信息表返回名称，关键词搜索支持按代码或名称匹配。
+
 ### 2026-05-29
 - **核心修复**：修复进程复活时进度偏移量未累积导致任务丢失的问题，新增 `process_base_completed` 追踪已完成偏移
 - **配置优化**：心跳超时从 30 秒调整到 120 秒，避免 `upload_batch` 写入大量数据时误杀子进程
@@ -18,7 +24,9 @@
 - 支持股票和 ETF 两类资产。
 - 支持日线、周线、月线三个周期，命令行统一使用 `d`、`w`、`m` 表示。
 - 股票与 ETF 分库存储，默认写入 `stock_data.db` 和 `etf_data.db`。
-- 使用 DuckDB 存储行情数据，自动创建日线、周线、月线表和基础信息表。
+- 使用 DuckDB 存储行情数据，股票库和 ETF 库分别只创建自身资产相关表。
+- 基础信息独立存储在 `stock_info` / `etf_info`，行情表通过查询时 JOIN 展示证券名称。
+- 提供交易日历表和因子层，RPS 使用 `factor_rps_daily` 专表保存。
 - 支持全量下载、增量更新、断点续传、失败重试、动态并发和进程复活。
 - 支持按代码、日期范围、频率、资产类型导出 `csv`、`parquet`、`json`。
 - 提供 Web 界面查看概览、表格、K 线、涨跌排行、分布统计、日志和后台任务进度。
@@ -313,7 +321,14 @@ python cli.py start-viewer
 
 ## 数据库表
 
-默认会创建以下行情表：
+项目默认使用两个 DuckDB 文件，股票和 ETF 分库管理：
+
+| 数据库 | 资产边界 | 主要表 |
+| --- | --- | --- |
+| `stock_data.db` | 股票数据 | `stock_daily`、`stock_weekly`、`stock_monthly`、`stock_info`、`trade_calendar`、`factor_rps_daily`、`factor_update_log` |
+| `etf_data.db` | ETF 数据 | `etf_daily`、`etf_weekly`、`etf_monthly`、`etf_info`、`trade_calendar` |
+
+行情表：
 
 | 表名 | 资产 | 周期 |
 | --- | --- | --- |
@@ -329,7 +344,6 @@ python cli.py start-viewer
 | 字段 | 说明 |
 | --- | --- |
 | `code` | 项目内部证券代码，如 `sh.600000`、`sz.000001` |
-| `name` | 证券名称 |
 | `date` | 交易日期 |
 | `open` / `high` / `low` / `close` | 开高低收 |
 | `preclose` | 前收盘价 |
@@ -341,10 +355,27 @@ python cli.py start-viewer
 | `pctChg` | 涨跌幅 |
 | `isST` | ST 标记 |
 
+注意：行情表不再存储 `name`。前端查询、CSV 导出、涨跌幅榜、按代码汇总等展示接口会自动关联基础信息表返回名称。
+
 基础信息表：
 
-- `stock_info`
-- `etf_info`
+| 表名 | 所属库 | 说明 | 主要字段 |
+| --- | --- | --- | --- |
+| `stock_info` | `stock_data.db` | 股票基础信息 | `code`、`name`、`update_time` |
+| `etf_info` | `etf_data.db` | ETF 基础信息 | `code`、`name`、`update_time` |
+
+交易日历表：
+
+| 表名 | 所属库 | 说明 | 主要字段 |
+| --- | --- | --- | --- |
+| `trade_calendar` | 股票库和 ETF 库 | 交易日历 | `date`、`is_trading_day`、`market`、`updated_at` |
+
+因子表：
+
+| 表名 | 所属库 | 说明 | 主要字段 |
+| --- | --- | --- | --- |
+| `factor_rps_daily` | `stock_data.db` | RPS 日频因子 | `code`、`date`、`rps_5`、`rps_10`、`rps_20`、`rps_50`、`rps_120`、`rps_250`、`universe`、`factor_version`、`updated_at` |
+| `factor_update_log` | `stock_data.db` | 因子更新日志 | `factor_name`、`universe`、`factor_version`、`start_date`、`end_date`、`updated_at`、`status`、`message` |
 
 ## Web API 摘要
 

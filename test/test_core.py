@@ -6,7 +6,7 @@ from core import DB_MARKET_COLUMNS, prepare_market_df_for_db
 
 
 class TestCoreHelpers(unittest.TestCase):
-    def test_prepare_market_df_for_db_places_name_after_code(self):
+    def test_prepare_market_df_for_db_excludes_display_name(self):
         df = pd.DataFrame({
             "code": ["sz.159982"],
             "date": ["2026-05-27"],
@@ -27,7 +27,7 @@ class TestCoreHelpers(unittest.TestCase):
         result = prepare_market_df_for_db(df, "测试ETF")
 
         self.assertEqual(result.columns.tolist(), DB_MARKET_COLUMNS)
-        self.assertEqual(result["name"].iloc[0], "测试ETF")
+        self.assertNotIn("name", result.columns)
 
 
 if __name__ == "__main__":

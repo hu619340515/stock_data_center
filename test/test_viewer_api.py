@@ -18,7 +18,12 @@ class TestViewerApi(unittest.TestCase):
         server.app.config["TESTING"] = True
         self.client = server.app.test_client()
 
-        self.db = DuckDBManager(db_path=self.temp_db)
+        self.db = DuckDBManager(db_path=self.temp_db, asset_type="stock")
+        info_df = pd.DataFrame({
+            "code": ["sh.600000", "sh.600001"],
+            "name": ["\u6d66\u53d1\u94f6\u884c", "\u6d4b\u8bd5\u80a1\u7968"],
+        })
+        self.db.save_asset_info(info_df, asset_type="stock")
         df = pd.DataFrame({
             "code": ["sh.600000", "sh.600001"],
             "name": ["浦发银行", "测试股票"],
@@ -66,7 +71,7 @@ class TestViewerApi(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["deleted"], 1)
-        db = DuckDBManager(db_path=self.temp_db)
+        db = DuckDBManager(db_path=self.temp_db, asset_type="stock")
         remaining = db.con.execute("SELECT COUNT(*) FROM stock_daily").fetchone()[0]
         db.close()
         self.assertEqual(remaining, 1)
@@ -78,6 +83,38 @@ class TestViewerApi(unittest.TestCase):
         rows = response.get_json()
         self.assertEqual(len(rows), 2)
         self.assertIn("code", rows[0])
+        self.assertIn("name", rows[0])
+
+    def test_table_includes_name_from_info_table(self):
+        response = self.client.get("/api/table?table=stock_daily&page=0&page_size=10")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.get_json()
+        self.assertIn("name", body["columns"])
+        self.assertEqual(body["rows"][0]["name"], "\u6d4b\u8bd5\u80a1\u7968")
+
+    def test_table_keyword_search_matches_name(self):
+        response = self.client.get("/api/table?table=stock_daily&page=0&page_size=10&keyword=\u6d66\u53d1")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.get_json()
+        self.assertEqual(body["total"], 1)
+        self.assertEqual(body["rows"][0]["code"], "sh.600000")
+        self.assertEqual(body["rows"][0]["name"], "\u6d66\u53d1\u94f6\u884c")
+
+    def test_top_movers_includes_name(self):
+        response = self.client.get("/api/top_movers?table=stock_daily&date=2024-01-02&limit=5")
+
+        self.assertEqual(response.status_code, 200)
+        rows = response.get_json()["data"]
+        self.assertEqual(rows[0]["name"], "\u6d66\u53d1\u94f6\u884c")
+
+    def test_export_includes_name(self):
+        response = self.client.get("/api/export?table=stock_daily&limit=5")
+
+        self.assertEqual(response.status_code, 200)
+        csv_text = response.data.decode("utf-8-sig")
+        self.assertTrue(csv_text.startswith("code,name,date,"))
 
     def test_logs_endpoint_returns_log_state(self):
         response = self.client.get("/api/logs?limit=5")

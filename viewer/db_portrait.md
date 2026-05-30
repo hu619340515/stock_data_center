@@ -1,127 +1,147 @@
 # 数据库画像（DB Portrait）
 
-> 本文档旨在帮助开发者快速理解 viewer 工具所用数据库的结构与数据分布。
+本文档用于快速理解当前项目的 DuckDB 数据库边界、表结构和 viewer 查询行为。
 
----
+## 数据库文件
 
-## 数据库文件路径
-- 默认路径：`./data/data.db`（可在 server.py 中配置）
+项目默认使用两个本地 DuckDB 文件：
+
+| 数据库 | 资产范围 | 说明 |
+| --- | --- | --- |
+| `stock_data.db` | 股票 | 只保存 `stock_*` 行情表、股票基础信息、交易日历和股票因子表 |
+| `etf_data.db` | ETF | 只保存 `etf_*` 行情表、ETF 基础信息和交易日历 |
+
+`DuckDBManager` 会根据 `asset_type` 创建对应资产的表。股票库不会创建 ETF 行情表，ETF 库也不会创建股票行情表。
 
 ## 表结构总览
 
-| 表名              | 说明             | 行数             | 主要字段                |
-|-------------------|------------------|------------------|-------------------------|
-| stocks            | 股票列表         | 运行时查询       | symbol, name, market, industry, area, list_date |
-| daily_prices      | 日线行情         | 运行时查询       | symbol, trade_date, open, close, high, low, volume, amount |
-| minute_prices     | 分钟线行情       | 运行时查询       | symbol, datetime, open, close, high, low, volume, amount |
-| financials        | 财务数据         | 运行时查询       | symbol, report_date, revenue, profit, assets, liabilities |
-| events            | 重要事件         | 运行时查询       | symbol, event_date, event_type, description |
-| users             | 用户信息         | 运行时查询       | user_id, username, role, created_at |
+### 股票库
 
----
+| 表名 | 类型 | 说明 |
+| --- | --- | --- |
+| `stock_daily` | 行情表 | 股票日线 |
+| `stock_weekly` | 行情表 | 股票周线 |
+| `stock_monthly` | 行情表 | 股票月线 |
+| `stock_info` | 基础信息 | 股票代码和名称 |
+| `trade_calendar` | 日历表 | 交易日历 |
+| `factor_rps_daily` | 因子表 | RPS 日频因子 |
+| `factor_update_log` | 因子日志 | 因子更新记录 |
 
-## 各表字段详情
+### ETF 库
 
-### 1. stocks — 股票列表
-- symbol：股票代码（主键，字符串）
-- name：股票简称
-- market：市场板块（如上交所/深交所/科创板等）
-- industry：所属行业
-- area：地域
-- list_date：上市日期
+| 表名 | 类型 | 说明 |
+| --- | --- | --- |
+| `etf_daily` | 行情表 | ETF 日线 |
+| `etf_weekly` | 行情表 | ETF 周线 |
+| `etf_monthly` | 行情表 | ETF 月线 |
+| `etf_info` | 基础信息 | ETF 代码和名称 |
+| `trade_calendar` | 日历表 | 交易日历 |
 
-#### 数据范围
-- symbol: 如 '600519', '000001'
-- list_date: 2000-01-01 ~ 当前日期
+## 行情表
 
-#### 索引建议
-- 主键：symbol
-- 可加 market, industry 联合索引用于筛选
+适用表：
 
----
+- `stock_daily`
+- `stock_weekly`
+- `stock_monthly`
+- `etf_daily`
+- `etf_weekly`
+- `etf_monthly`
 
-### 2. daily_prices — 日线行情
-- symbol：股票代码（外键）
-- trade_date：交易日期（主键之一）
-- open：开盘价
-- close：收盘价
-- high：最高价
-- low：最低价
-- volume：成交量
-- amount：成交额
+主要字段：
 
-#### 数据范围
-- trade_date: 2000-01-01 ~ 当前日期
-- 数值型字段均为浮点数
+| 字段 | 说明 |
+| --- | --- |
+| `code` | 项目内部证券代码，如 `sh.600000`、`sz.000001` |
+| `date` | 交易日期 |
+| `open` | 开盘价 |
+| `high` | 最高价 |
+| `low` | 最低价 |
+| `close` | 收盘价 |
+| `preclose` | 前收盘价 |
+| `volume` | 成交量 |
+| `amount` | 成交额 |
+| `adjustflag` | 复权标记 |
+| `turn` | 换手率相关字段 |
+| `tradestatus` | 交易状态 |
+| `pctChg` | 涨跌幅 |
+| `isST` | ST 标记 |
 
-#### 索引建议
-- 联合主键：symbol + trade_date
-- 可加 trade_date 单独索引用于区间筛选
+行情表不保存 `name`。证券名称属于基础信息，保存在 `stock_info` 或 `etf_info` 中。viewer 在展示、导出、涨跌幅榜和按代码汇总时会自动 JOIN 基础信息表返回 `name`。
 
----
+## 基础信息表
 
-### 3. minute_prices — 分钟线行情
-- symbol：股票代码（外键）
-- datetime：分钟时间（主键之一，格式 'YYYY-MM-DD HH:MM'）
-- open, close, high, low, volume, amount：同上
+| 表名 | 所属库 | 字段 | 说明 |
+| --- | --- | --- | --- |
+| `stock_info` | `stock_data.db` | `code`、`name`、`update_time` | 股票基础信息 |
+| `etf_info` | `etf_data.db` | `code`、`name`、`update_time` | ETF 基础信息 |
 
-#### 数据范围
-- datetime: 近一年（或按存储容量调整）
+基础信息表用于去重存储证券名称，避免在日线、周线、月线中重复写入同一个名称。
 
-#### 索引建议
-- 联合主键：symbol + datetime
-- 可加 datetime 索引优化区间查询
+## 交易日历表
 
----
+| 表名 | 所属库 | 字段 |
+| --- | --- | --- |
+| `trade_calendar` | 股票库和 ETF 库 | `date`、`is_trading_day`、`market`、`updated_at` |
 
-### 4. financials — 财务数据
-- symbol：股票代码（外键）
-- report_date：报告期（主键之一）
-- revenue：营业收入
-- profit：净利润
-- assets：总资产
-- liabilities：总负债
+交易日历用于后续增量更新、回测对齐和因子计算的日期基准。
 
-#### 数据范围
-- report_date: 通常为每季度末（如 2023-03-31）
+## 因子表
 
-#### 索引建议
-- 联合主键：symbol + report_date
-- 可加 revenue, profit 索引便于筛选排序
+### `factor_rps_daily`
 
----
+RPS 使用专表保存，不混入 `stock_daily`。
 
-### 5. events — 重要事件
-- symbol：股票代码（外键）
-- event_date：事件时间（主键之一）
-- event_type：事件类型（如分红、重组等）
-- description：事件描述
+| 字段 | 说明 |
+| --- | --- |
+| `code` | 股票代码 |
+| `date` | 交易日期 |
+| `rps_5` / `rps_10` / `rps_20` | 短周期 RPS |
+| `rps_50` / `rps_120` / `rps_250` | 中长周期 RPS |
+| `universe` | 因子计算股票池 |
+| `factor_version` | 因子算法或口径版本 |
+| `updated_at` | 更新时间 |
 
-#### 数据范围
-- event_type: 『分红』、『重组』、『业绩快报』等
+### `factor_update_log`
 
-#### 索引建议
-- 联合主键：symbol + event_date + event_type
+| 字段 | 说明 |
+| --- | --- |
+| `factor_name` | 因子名称 |
+| `universe` | 股票池 |
+| `factor_version` | 因子版本 |
+| `start_date` / `end_date` | 本次更新覆盖日期 |
+| `updated_at` | 更新时间 |
+| `status` | 更新状态 |
+| `message` | 补充信息或错误信息 |
 
----
+## Viewer 查询行为
 
-### 6. users — 用户信息
-- user_id：用户唯一标识（主键，整数）
-- username：用户名
-- role：用户角色（如 admin、viewer）
-- created_at：注册时间
+viewer 的表访问使用白名单，允许访问：
 
-#### 索引建议
-- 主键：user_id
-- 可加 username 唯一索引
+```text
+stock_daily
+stock_weekly
+stock_monthly
+stock_info
+etf_daily
+etf_weekly
+etf_monthly
+etf_info
+trade_calendar
+factor_rps_daily
+factor_update_log
+```
 
----
+名称显示规则：
 
-## 其他说明
-- 所有表均支持分页、高级筛选，建议为主筛维度加索引。
-- DuckDB 支持多表高效 JOIN 查询，复杂分析可直接写 SQL。
-- 如需扩展字段/表结构，可在 server.py 的 INIT SQL 部分调整。
+- `/api/table`：行情表返回 `code, name, date, ...`，关键词同时匹配代码和名称。
+- `/api/export`：行情表导出 CSV 时包含 `name`。
+- `/api/top_movers`：涨跌幅榜返回 `name`。
+- `/api/summary_by_code`：按代码汇总返回 `name`。
+- `/api/kline` 和 `/api/trend`：指定 `code` 时响应中包含对应 `name`。
 
----
+## 扩展建议
 
-> 如需了解更多，参考 `viewer/server.py` 中的建表/初始化逻辑。
+- 新增通用因子时优先放入因子层，避免污染行情表。
+- 因子表建议保留 `universe`、`factor_version`、`updated_at`，方便回测复现和口径升级。
+- 需要面向前端展示的冗余字段，优先通过查询 JOIN 生成，不直接写入高频行情明细表。
