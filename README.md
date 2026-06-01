@@ -409,8 +409,9 @@ python cli.py start-viewer
 | `POST` | `/api/daily_to_latest` | 股票或 ETF 日线增量更新 |
 | `POST` | `/api/download_stock_all_cycles` | 股票日 / 周 / 月全周期下载或更新 |
 | `POST` | `/api/download_etf_all_cycles` | ETF 日 / 周 / 月全周期下载或更新 |
-| `POST` | `/api/aggregate_weekly` | 周线下载 |
-| `POST` | `/api/aggregate_monthly` | 月线下载 |
+| `POST` | `/api/aggregate_weekly` | 顺序下载股票和 ETF 周线 |
+| `POST` | `/api/aggregate_monthly` | 顺序下载股票和 ETF 月线 |
+| `POST` | `/api/calculate_rps` | 根据股票日线重算 RPS 日频因子 |
 | `POST` | `/api/etf_download` | ETF 日线全量下载 |
 | `POST` | `/api/etf_update_latest` | ETF 日线增量更新 |
 

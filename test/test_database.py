@@ -157,5 +157,54 @@ class TestDatabase(unittest.TestCase):
             if os.path.exists(output_file):
                 os.remove(output_file)
 
+    def test_calculate_rps_daily_ranks_cross_sectional_returns(self):
+        """测试RPS按同一交易日的横截面收益率排名"""
+        import pandas as pd
+
+        dates = pd.date_range("2024-01-01", periods=21, freq="D")
+        rows = []
+        for code, last_close in [("sh.600000", 200.0), ("sh.600001", 110.0)]:
+            for index, date in enumerate(dates):
+                close = last_close if index == 20 else 100.0
+                rows.append({
+                    "code": code,
+                    "date": date.strftime("%Y-%m-%d"),
+                    "open": close,
+                    "high": close,
+                    "low": close,
+                    "close": close,
+                    "preclose": close,
+                    "volume": 1000,
+                    "amount": 100000.0,
+                    "adjustflag": "2",
+                    "turn": 0.0,
+                    "tradestatus": "1",
+                    "pctChg": 0.0,
+                    "isST": "0",
+                })
+
+        self.db.upload_batch([pd.DataFrame(rows)])
+
+        count = self.db.calculate_rps_daily()
+
+        self.assertEqual(count, 42)
+        result = self.db.con.execute("""
+            SELECT code, ROUND(ret_20, 2), ROUND(rps_20, 2)
+            FROM factor_rps_daily
+            WHERE date = '2024-01-21'
+            ORDER BY code
+        """).fetchall()
+        self.assertEqual(result, [
+            ("sh.600000", 1.0, 100.0),
+            ("sh.600001", 0.1, 0.0),
+        ])
+        log = self.db.con.execute("""
+            SELECT status, message
+            FROM factor_update_log
+            ORDER BY updated_at DESC
+            LIMIT 1
+        """).fetchone()
+        self.assertEqual(log, ("success", "calculated 42 rows"))
+
 if __name__ == '__main__':
     unittest.main()

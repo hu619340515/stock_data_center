@@ -36,10 +36,11 @@ _CORE_MODULE = None
 _MOCK_PIPELINE_CLASS = None
 _MOCK_GET_PROGRESS = None
 _MOCK_RESET_PROGRESS = None
+_MOCK_SET_PROGRESS = None
 
 def _get_core():
     """延迟加载 core 模块，失败时返回备用 mock"""
-    global _CORE_MODULE, _MOCK_PIPELINE_CLASS, _MOCK_GET_PROGRESS, _MOCK_RESET_PROGRESS
+    global _CORE_MODULE, _MOCK_PIPELINE_CLASS, _MOCK_GET_PROGRESS, _MOCK_RESET_PROGRESS, _MOCK_SET_PROGRESS
     if _CORE_MODULE is not None or _MOCK_PIPELINE_CLASS is not None:
         return _CORE_MODULE
     
@@ -48,8 +49,8 @@ def _get_core():
         _PROJECT_ROOT_FOR_IMPORT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
         if _PROJECT_ROOT_FOR_IMPORT not in _sys.path:
             _sys.path.append(_PROJECT_ROOT_FOR_IMPORT)
-        from core import StockDataPipeline, get_progress, reset_progress
-        _CORE_MODULE = (StockDataPipeline, get_progress, reset_progress)
+        from core import StockDataPipeline, get_progress, reset_progress, set_progress
+        _CORE_MODULE = (StockDataPipeline, get_progress, reset_progress, set_progress)
     except ImportError as e:
         print(f"WARNING: 'core.StockDataPipeline' not found: {e}. Using a mock class for server startup.")
         # 定义 mock 类作为备用
@@ -88,7 +89,8 @@ def _get_core():
         _MOCK_PIPELINE_CLASS = _MockPipeline
         _MOCK_GET_PROGRESS = lambda: {'is_running': False}
         _MOCK_RESET_PROGRESS = lambda: None
-        _CORE_MODULE = (_MOCK_PIPELINE_CLASS, _MOCK_GET_PROGRESS, _MOCK_RESET_PROGRESS)
+        _MOCK_SET_PROGRESS = lambda **kwargs: None
+        _CORE_MODULE = (_MOCK_PIPELINE_CLASS, _MOCK_GET_PROGRESS, _MOCK_RESET_PROGRESS, _MOCK_SET_PROGRESS)
     
     return _CORE_MODULE
 
@@ -120,8 +122,32 @@ app = Flask(__name__, static_folder=_VIEWER_DIR)
 CORS(app)
 
 
-def _run_task(func, *args, use_temp_db=False, asset_type='stock'):
-    """在后台线程中执行任务，使用临时数据库避免锁定"""
+def _merge_pipeline_if_needed(pipeline, use_temp_db, asset_type):
+    """Merge one temporary pipeline into the matching main database."""
+    target_db_path = STOCK_DB_PATH if asset_type == 'stock' else ETF_DB_PATH
+    print(f"🔍 检查合并条件 - use_temp_db={use_temp_db}, should_stop={pipeline.should_stop}")
+    if use_temp_db and not pipeline.should_stop:
+        print(f"🔄 开始合并到主数据库: {target_db_path}")
+        tables = ['stock_daily', 'stock_weekly', 'stock_monthly']
+        if asset_type == 'etf':
+            tables = ['etf_daily', 'etf_weekly', 'etf_monthly']
+        pipeline.merge_to_main_db(target_db_path, tables)
+    else:
+        print(f"⏭️ 跳过合并 - use_temp_db={use_temp_db}, should_stop={pipeline.should_stop}")
+
+
+def _cleanup_pipeline(pipeline):
+    if not pipeline:
+        return
+    pipeline.cleanup_temp_db()
+    if not getattr(pipeline, 'temp_db_path', None):
+        db = getattr(pipeline, 'db', None)
+        if db:
+            db.close()
+
+
+def _run_task_sequence(steps):
+    """Run one or more pipeline tasks serially in a background thread."""
     global _task_running, _current_pipeline
     with _task_lock:
         if _task_running:
@@ -129,30 +155,24 @@ def _run_task(func, *args, use_temp_db=False, asset_type='stock'):
         _task_running = True
         reset_progress = _get_core()[2]
         reset_progress()
-    
-    # 根据资产类型选择目标数据库路径
-    target_db_path = STOCK_DB_PATH if asset_type == 'stock' else ETF_DB_PATH
-    
+
     def worker():
         global _task_running, _current_pipeline
         try:
             StockDataPipeline = _get_core()[0]
-            pipeline = StockDataPipeline(use_temp_db=use_temp_db, asset_type=asset_type)
-            _current_pipeline = pipeline
-            func(pipeline, *args)
-            
-            # 任务完成，合并到主数据库
-            print(f"🔍 检查合并条件 - use_temp_db={use_temp_db}, should_stop={pipeline.should_stop}")
-            if use_temp_db and not pipeline.should_stop:
-                print(f"🔄 开始合并到主数据库: {target_db_path}")
-                tables = None
-                if asset_type == 'stock':
-                    tables = ['stock_daily', 'stock_weekly', 'stock_monthly']
-                elif asset_type == 'etf':
-                    tables = ['etf_daily', 'etf_weekly', 'etf_monthly']
-                pipeline.merge_to_main_db(target_db_path, tables)
-            else:
-                print(f"❌ 跳过合并 - use_temp_db={use_temp_db}, should_stop={pipeline.should_stop}")
+            for step in steps:
+                pipeline = StockDataPipeline(
+                    use_temp_db=step.get('use_temp_db', False),
+                    asset_type=step.get('asset_type', 'stock'),
+                )
+                _current_pipeline = pipeline
+                step['func'](pipeline)
+                _merge_pipeline_if_needed(pipeline, step.get('use_temp_db', False), step.get('asset_type', 'stock'))
+                should_stop = pipeline.should_stop
+                _cleanup_pipeline(pipeline)
+                _current_pipeline = None
+                if should_stop:
+                    break
         except Exception as e:
             print(f"❌ 后台任务出错: {e}")
             import traceback
@@ -160,8 +180,8 @@ def _run_task(func, *args, use_temp_db=False, asset_type='stock'):
         finally:
             print(f"🔍 finally 块执行 - _current_pipeline={_current_pipeline}")
             if _current_pipeline:
-                print(f"🧹 清理临时数据库")
-                _current_pipeline.cleanup_temp_db()
+                print(f"🧹 清理数据库连接")
+                _cleanup_pipeline(_current_pipeline)
                 _current_pipeline = None
             with _task_lock:
                 _task_running = False
@@ -170,6 +190,65 @@ def _run_task(func, *args, use_temp_db=False, asset_type='stock'):
     t = threading.Thread(target=worker, daemon=True)
     t.start()
     return True, '任务已启动，请在进度条中查看'
+
+
+def _run_task(func, *args, use_temp_db=False, asset_type='stock'):
+    """Run one pipeline task in a background thread."""
+    return _run_task_sequence([{
+        'func': lambda pipeline: func(pipeline, *args),
+        'use_temp_db': use_temp_db,
+        'asset_type': asset_type,
+    }])
+
+
+def _run_frequency_for_all_assets(frequency):
+    """Download stock data first, then ETF data, for one frequency."""
+    return _run_task_sequence([
+        {
+            'func': lambda pipeline: pipeline.full_download_pipeline(frequency),
+            'use_temp_db': True,
+            'asset_type': 'stock',
+        },
+        {
+            'func': lambda pipeline: pipeline.etf_download_pipeline(frequency),
+            'use_temp_db': True,
+            'asset_type': 'etf',
+        },
+    ])
+
+
+def _run_rps_task():
+    """Calculate RPS in the background without initializing a market data source."""
+    global _task_running
+    with _task_lock:
+        if _task_running:
+            return False, '已有任务正在运行，请等待完成'
+        _task_running = True
+        reset_progress = _get_core()[2]
+        reset_progress()
+
+    def worker():
+        global _task_running
+        db = None
+        set_progress = _get_core()[3]
+        try:
+            from database import DuckDBManager
+            set_progress(is_running=True, task_name='计算RPS日频因子', start_time=datetime.datetime.now().timestamp())
+            db = DuckDBManager(db_path=STOCK_DB_PATH, asset_type='stock')
+            count = db.calculate_rps_daily()
+            set_progress(is_running=False, processed=count, total=count, success=count, message=f'RPS计算完成，共{count}条')
+        except Exception as e:
+            set_progress(is_running=False, error=1, message=f'RPS计算失败: {e}')
+            print(f"❌ RPS计算失败: {e}")
+            traceback.print_exc()
+        finally:
+            if db:
+                db.close()
+            with _task_lock:
+                _task_running = False
+
+    threading.Thread(target=worker, daemon=True).start()
+    return True, 'RPS计算任务已启动，请在进度条中查看'
 
 @app.route('/api/stop_task', methods=['POST'])
 def api_stop_task():
@@ -212,20 +291,17 @@ def api_download_etf_all_cycles():
 
 @app.route('/api/aggregate_weekly', methods=['POST'])
 def api_aggregate_weekly():
-    target = request.json.get('target', 'stock')
-    if target == 'etf':
-        ok, msg = _run_task(lambda p: p.etf_download_pipeline('w'), use_temp_db=True, asset_type='etf')
-    else:
-        ok, msg = _run_task(lambda p: p.full_download_pipeline('w'), use_temp_db=True, asset_type='stock')
+    ok, msg = _run_frequency_for_all_assets('w')
     return jsonify({'success': ok, 'message': msg})
 
 @app.route('/api/aggregate_monthly', methods=['POST'])
 def api_aggregate_monthly():
-    target = request.json.get('target', 'stock')
-    if target == 'etf':
-        ok, msg = _run_task(lambda p: p.etf_download_pipeline('m'), use_temp_db=True, asset_type='etf')
-    else:
-        ok, msg = _run_task(lambda p: p.full_download_pipeline('m'), use_temp_db=True, asset_type='stock')
+    ok, msg = _run_frequency_for_all_assets('m')
+    return jsonify({'success': ok, 'message': msg})
+
+@app.route('/api/calculate_rps', methods=['POST'])
+def api_calculate_rps():
+    ok, msg = _run_rps_task()
     return jsonify({'success': ok, 'message': msg})
 
 @app.route('/api/etf_download', methods=['POST'])

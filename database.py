@@ -25,6 +25,7 @@ INFO_TABLES = {
 }
 
 VALID_ASSET_TYPES = {"stock", "etf"}
+RPS_PERIODS = (20, 50, 120, 250)
 
 
 def safe_print(msg):
@@ -157,6 +158,86 @@ class DuckDBManager:
             foreign_tables.extend(["factor_rps_daily", "factor_update_log"])
         for table_name in foreign_tables:
             self.con.execute(f"DROP TABLE IF EXISTS {table_name}")
+
+    def calculate_rps_daily(self, universe: str = "all_stocks", factor_version: str = "rps_v1") -> int:
+        """Recalculate daily stock RPS factors from the full daily close history."""
+        if self.asset_type != "stock":
+            raise ValueError("RPS factors can only be calculated from the stock database")
+
+        date_range = self.con.execute("SELECT MIN(date), MAX(date) FROM stock_daily").fetchone()
+        start_date, end_date = date_range if date_range else (None, None)
+        if not start_date or not end_date:
+            raise ValueError("stock_daily has no data")
+
+        lag_columns = ",\n                ".join(
+            f"close / NULLIF(LAG(close, {period}) OVER (PARTITION BY code ORDER BY date), 0) - 1 AS ret_{period}"
+            for period in RPS_PERIODS
+        )
+        rank_columns = ",\n                ".join(
+            f"""CASE
+                    WHEN ret_{period} IS NULL THEN NULL
+                    WHEN COUNT(ret_{period}) OVER (PARTITION BY date) <= 1 THEN 100.0
+                    ELSE (RANK() OVER (PARTITION BY date ORDER BY ret_{period} NULLS LAST) - 1) * 100.0
+                         / (COUNT(ret_{period}) OVER (PARTITION BY date) - 1)
+                END AS rps_{period}"""
+            for period in RPS_PERIODS
+        )
+        ret_names = ", ".join(f"ret_{period}" for period in RPS_PERIODS)
+        rps_names = ", ".join(f"rps_{period}" for period in RPS_PERIODS)
+
+        try:
+            self.con.execute("BEGIN TRANSACTION")
+            self.con.execute("DELETE FROM factor_rps_daily")
+            self.con.execute(f"""
+                INSERT INTO factor_rps_daily (
+                    code, date, {ret_names}, {rps_names},
+                    universe, factor_version, updated_at
+                )
+                WITH returns AS (
+                    SELECT
+                        code,
+                        date,
+                        {lag_columns}
+                    FROM stock_daily
+                ),
+                ranked AS (
+                    SELECT
+                        code,
+                        date,
+                        {ret_names},
+                        {rank_columns}
+                    FROM returns
+                )
+                SELECT
+                    code,
+                    date,
+                    {ret_names},
+                    {rps_names},
+                    ?,
+                    ?,
+                    CURRENT_TIMESTAMP
+                FROM ranked
+            """, [universe, factor_version])
+            count = self.con.execute("SELECT COUNT(*) FROM factor_rps_daily").fetchone()[0]
+            self.con.execute("""
+                INSERT INTO factor_update_log (
+                    factor_name, universe, factor_version, start_date, end_date,
+                    status, message, updated_at
+                )
+                VALUES ('rps_daily', ?, ?, ?, ?, 'success', ?, CURRENT_TIMESTAMP)
+            """, [universe, factor_version, start_date, end_date, f"calculated {count} rows"])
+            self.con.execute("COMMIT")
+            return count
+        except Exception as e:
+            self.con.execute("ROLLBACK")
+            self.con.execute("""
+                INSERT INTO factor_update_log (
+                    factor_name, universe, factor_version, start_date, end_date,
+                    status, message, updated_at
+                )
+                VALUES ('rps_daily', ?, ?, ?, ?, 'failed', ?, CURRENT_TIMESTAMP)
+            """, [universe, factor_version, start_date, end_date, str(e)])
+            raise
 
     def _table_exists(self, table_name: str) -> bool:
         return self.con.execute(

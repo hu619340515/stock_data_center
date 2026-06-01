@@ -416,16 +416,6 @@
         <span class="btn-icon">🔄</span> ETF数据更新
       </button>
 
-      <button class="update-btn" id="btn-weekly"
-              onclick="triggerUpdate(this, '/api/aggregate_weekly', {target:'stock'})">
-        <span class="btn-icon">📅</span> 计算周线数据
-      </button>
-
-      <button class="update-btn" id="btn-monthly"
-              onclick="triggerUpdate(this, '/api/aggregate_monthly', {target:'stock'})">
-        <span class="btn-icon">📆</span> 计算月线数据
-      </button>
-
       <button class="update-btn" id="btn-stock-download"
               onclick="triggerUpdate(this, '/api/daily_download', {target:'stock'})">
         <span class="btn-icon">⬇️</span> 股票全量下载
@@ -446,6 +436,27 @@
       <button class="update-btn" id="btn-etf-all-cycles"
               onclick="triggerUpdate(this, '/api/download_etf_all_cycles', {})">
         <span class="btn-icon">📊</span> ETF数据下载
+      </button>
+    </div>
+
+    <hr class="sidebar-divider" />
+
+    <div class="update-section">
+      <div class="update-title">🧮 数据预处理</div>
+
+      <button class="update-btn" id="btn-weekly"
+              onclick="triggerUpdate(this, '/api/aggregate_weekly', {})">
+        <span class="btn-icon">📅</span> 计算周线数据
+      </button>
+
+      <button class="update-btn" id="btn-monthly"
+              onclick="triggerUpdate(this, '/api/aggregate_monthly', {})">
+        <span class="btn-icon">📆</span> 计算月线数据
+      </button>
+
+      <button class="update-btn" id="btn-rps"
+              onclick="triggerUpdate(this, '/api/calculate_rps', {})">
+        <span class="btn-icon">📐</span> 计算RPS数据
       </button>
     </div>
   </aside>
@@ -584,8 +595,16 @@ const COLUMN_LABEL_MAP = {
   isST: 'ST标记',
   update_time: '更新时间',
   updated_at: '更新时间',
+  is_open: '是否开市',
   is_trading_day: '是否交易日',
+  prev_trade_date: '上一交易日',
+  next_trade_date: '下一交易日',
+  source: '数据源',
   market: '市场',
+  ret_20: '20日收益率',
+  ret_50: '50日收益率',
+  ret_120: '120日收益率',
+  ret_250: '250日收益率',
   rps_5: 'RPS5',
   rps_10: 'RPS10',
   rps_20: 'RPS20',
@@ -599,6 +618,19 @@ const COLUMN_LABEL_MAP = {
   end_date: '结束日期',
   status: '状态',
   message: '消息'
+};
+const TABLE_LABEL_MAP = {
+  stock_daily: '股票日线',
+  stock_weekly: '股票周线',
+  stock_monthly: '股票月线',
+  factor_rps_daily: 'RPS日频因子',
+  factor_update_log: '因子更新日志',
+  trade_calendar: '交易日历',
+  stock_info: '股票基础信息',
+  etf_daily: 'ETF日线',
+  etf_weekly: 'ETF周线',
+  etf_monthly: 'ETF月线',
+  etf_info: 'ETF基础信息'
 };
 
 /* ───────── 工具函数 ───────── */
@@ -625,6 +657,10 @@ function fmt(n) {
 
 function getColumnLabel(col) {
   return COLUMN_LABEL_MAP[col] || col;
+}
+
+function getTableLabel(table) {
+  return TABLE_LABEL_MAP[table] || table;
 }
 
 /* ───────── 表选择 ───────── */
@@ -710,7 +746,7 @@ async function loadOverview() {
         
         const tr = document.createElement('tr');
         tr.innerHTML = `
-          <td style="font-weight:500;">${table}</td>
+          <td style="font-weight:500;">${getTableLabel(table)}</td>
           <td>${(count || 0).toLocaleString()}</td>
           <td>${minDate}</td>
           <td>${maxDate}</td>
