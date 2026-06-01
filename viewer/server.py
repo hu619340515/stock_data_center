@@ -1344,23 +1344,47 @@ def api_distribution():
             return jsonify({'bins': [], 'counts': []})
 
         vals = df[field].dropna().astype(float)
-        counts, edges = np.histogram(vals, bins=bins)
 
-        result = {
-            'field':  field,
-            'bins':   [f'{edges[i]:.2f}~{edges[i+1]:.2f}' for i in range(len(edges)-1)],
-            'counts': counts.tolist(),
-            'min':    round(float(vals.min()), 4),
-            'max':    round(float(vals.max()), 4),
-            'mean':   round(float(vals.mean()), 4),
-        }
-
-        # 当查询 pctChg 时，额外返回涨/跌/平家数与平均涨跌幅，供合并 K 线卡片使用
         if field == 'pctChg':
-            result['rise_count'] = int((vals > 0).sum())
-            result['fall_count'] = int((vals < 0).sum())
-            result['flat_count'] = int((vals == 0).sum())
-            result['avg_pct_chg'] = round(float(vals.mean()), 4)
+            bands = [
+                ('≤-20%', vals <= -20),
+                ('-20~-10%', (vals > -20) & (vals <= -10)),
+                ('-10~-7%', (vals > -10) & (vals <= -7)),
+                ('-7~-5%', (vals > -7) & (vals <= -5)),
+                ('-5~-3%', (vals > -5) & (vals <= -3)),
+                ('-3~-1%', (vals > -3) & (vals <= -1)),
+                ('-1~0%', (vals > -1) & (vals < 0)),
+                ('0%', vals == 0),
+                ('0~1%', (vals > 0) & (vals <= 1)),
+                ('1~3%', (vals > 1) & (vals <= 3)),
+                ('3~5%', (vals > 3) & (vals <= 5)),
+                ('5~7%', (vals > 5) & (vals <= 7)),
+                ('7~10%', (vals > 7) & (vals < 10)),
+                ('10~20%', (vals >= 10) & (vals < 20)),
+                ('≥20%', vals >= 20),
+            ]
+            result = {
+                'field': field,
+                'bins': [label for label, _ in bands],
+                'counts': [int(mask.sum()) for _, mask in bands],
+                'min': round(float(vals.min()), 4),
+                'max': round(float(vals.max()), 4),
+                'mean': round(float(vals.mean()), 4),
+                'rise_count': int((vals > 0).sum()),
+                'fall_count': int((vals < 0).sum()),
+                'flat_count': int((vals == 0).sum()),
+                'avg_pct_chg': round(float(vals.mean()), 4),
+            }
+        else:
+            counts, edges = np.histogram(vals, bins=bins)
+            result = {
+                'field':  field,
+                'bins':   [f'{edges[i]:.2f}~{edges[i+1]:.2f}' for i in range(len(edges)-1)],
+                'counts': counts.tolist(),
+                'min':    round(float(vals.min()), 4),
+                'max':    round(float(vals.max()), 4),
+                'mean':   round(float(vals.mean()), 4),
+            }
 
         return jsonify(result)
     except Exception as e:

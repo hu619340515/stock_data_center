@@ -125,6 +125,32 @@ class TestViewerApi(unittest.TestCase):
         rows = response.get_json()["data"]
         self.assertEqual(rows[0]["name"], "\u6d66\u53d1\u94f6\u884c")
 
+    def test_pct_chg_distribution_uses_fixed_market_bands(self):
+        db = DuckDBManager(db_path=self.temp_db, asset_type="stock")
+        db.con.execute("""
+            INSERT INTO stock_daily (
+                code, date, open, high, low, close, preclose, volume, amount,
+                adjustflag, turn, tradestatus, pctChg, isST
+            ) VALUES
+                ('sh.600002', '2024-01-02', 10, 11, 9, 11, 10, 1000, 11000, '2', 1, '1', 10, '0'),
+                ('sh.600003', '2024-01-02', 10, 11, 9, 9, 10, 1000, 9000, '2', 1, '1', -10, '0'),
+                ('sh.600004', '2024-01-02', 10, 10, 10, 10, 10, 1000, 10000, '2', 1, '1', 0, '0')
+        """)
+        db.con.commit()
+        db.close()
+
+        response = self.client.get("/api/distribution?table=stock_daily&field=pctChg&date=2024-01-02")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.get_json()
+        counts_by_bin = dict(zip(body["bins"], body["counts"]))
+        self.assertEqual(counts_by_bin["10~20%"], 1)
+        self.assertEqual(counts_by_bin["-20~-10%"], 1)
+        self.assertEqual(counts_by_bin["0%"], 1)
+        self.assertEqual(body["rise_count"], 2)
+        self.assertEqual(body["fall_count"], 1)
+        self.assertEqual(body["flat_count"], 1)
+
     def test_export_includes_name(self):
         response = self.client.get("/api/export?table=stock_daily&limit=5")
 
