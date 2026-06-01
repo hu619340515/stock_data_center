@@ -25,15 +25,26 @@ class TestQMTDataSource(unittest.TestCase):
             "close": [10.3, 10.6],
             "volume": [1000, 2000],
             "amount": [10000.0, 21000.0],
+            "preClose": [10.0, 10.3],
+            "suspendFlag": [0, 1],
         })
 
-        df = client._standardize_history_df(raw, "sh.600000")
+        df = client._standardize_history_df(
+            raw,
+            "sh.600000",
+            float_volume=1_000_000,
+            security_name="*ST测试",
+        )
 
         self.assertEqual(df.columns.tolist(), QMTClient.TARGET_COLUMNS)
         self.assertEqual(df["code"].iloc[0], "sh.600000")
         self.assertEqual(df["date"].tolist(), ["2024-01-02", "2024-01-03"])
         self.assertEqual(df["adjustflag"].iloc[0], "2")
         self.assertEqual(df["tradestatus"].iloc[0], "1")
+        self.assertEqual(df["tradestatus"].iloc[1], "0")
+        self.assertAlmostEqual(df["pctChg"].iloc[0], 3.0)
+        self.assertAlmostEqual(df["turn"].iloc[0], 10.0)
+        self.assertEqual(df["isST"].iloc[0], "1")
 
     def test_get_stock_history_downloads_from_qmt_cache(self):
         class FakeXtData:
@@ -48,6 +59,12 @@ class TestQMTDataSource(unittest.TestCase):
             def download_history_data(self, qmt_code, period, start_time, end_time):
                 self.download_calls.append((qmt_code, period, start_time, end_time))
 
+            def get_instrument_detail(self, qmt_code):
+                return {
+                    "InstrumentName": "浦发银行",
+                    "FloatVolume": 1_000_000,
+                }
+
             def get_market_data_ex(self, fields, codes, **kwargs):
                 self.market_calls.append((fields, codes, kwargs))
                 return {
@@ -59,6 +76,8 @@ class TestQMTDataSource(unittest.TestCase):
                         "close": [10.3],
                         "volume": [1000],
                         "amount": [10000.0],
+                        "preClose": [10.0],
+                        "suspendFlag": [0],
                     })
                 }
 
@@ -72,9 +91,12 @@ class TestQMTDataSource(unittest.TestCase):
 
         self.assertEqual(fake.download_calls, [("600000.SH", "1d", "20240102", "20240103")])
         self.assertEqual(fake.market_calls[0][1], ["600000.SH"])
+        self.assertEqual(fake.market_calls[0][0], QMTClient.HISTORY_FIELDS)
         self.assertFalse(df.empty)
         self.assertEqual(df["code"].iloc[0], "sh.600000")
         self.assertEqual(df["date"].iloc[0], "2024-01-02")
+        self.assertAlmostEqual(df["pctChg"].iloc[0], 3.0)
+        self.assertAlmostEqual(df["turn"].iloc[0], 10.0)
 
 
 if __name__ == '__main__':

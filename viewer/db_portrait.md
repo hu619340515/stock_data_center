@@ -145,3 +145,14 @@ factor_update_log
 - 新增通用因子时优先放入因子层，避免污染行情表。
 - 因子表建议保留 `universe`、`factor_version`、`updated_at`，方便回测复现和口径升级。
 - 需要面向前端展示的冗余字段，优先通过查询 JOIN 生成，不直接写入高频行情明细表。
+
+## 2026-06-01 schema update
+
+- `factor_rps_daily` / `etf_factor_rps_daily` now include 5-day factor dimensions:
+  - `ret_5`
+  - `rps_5`
+- Current RPS factor horizons in use:
+  - Return fields: `ret_5`, `ret_20`, `ret_50`, `ret_120`, `ret_250`
+  - RPS fields: `rps_5`, `rps_20`, `rps_50`, `rps_120`, `rps_250`
+- Viewer factor-table API (`/api/table`) is backward-compatible with old databases that do not yet contain `ret_5/rps_5`:
+  - missing columns are returned as `NULL` placeholders instead of throwing SQL errors.

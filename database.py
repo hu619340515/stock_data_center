@@ -25,7 +25,15 @@ INFO_TABLES = {
 }
 
 VALID_ASSET_TYPES = {"stock", "etf"}
-RPS_PERIODS = (20, 50, 120, 250)
+RPS_PERIODS = (5, 20, 50, 120, 250)
+FACTOR_TABLES = {
+    "stock": {"rps": "factor_rps_daily", "log": "factor_update_log"},
+    "etf": {"rps": "etf_factor_rps_daily", "log": "etf_factor_update_log"},
+}
+RPS_UNIVERSES = {
+    "stock": "all_stocks",
+    "etf": "all_etfs",
+}
 
 
 def safe_print(msg):
@@ -53,8 +61,7 @@ class DuckDBManager:
         self._create_asset_info_table()
         self._create_market_tables()
         self._create_common_tables()
-        if self.asset_type == "stock":
-            self._create_factor_tables()
+        self._create_factor_tables()
         self._migrate_legacy_market_name_columns()
         self._drop_foreign_asset_tables()
         self.con.commit()
@@ -114,14 +121,18 @@ class DuckDBManager:
         """)
 
     def _create_factor_tables(self):
-        self.con.execute("""
-        CREATE TABLE IF NOT EXISTS factor_rps_daily (
+        factor_table = FACTOR_TABLES[self.asset_type]["rps"]
+        log_table = FACTOR_TABLES[self.asset_type]["log"]
+        self.con.execute(f"""
+        CREATE TABLE IF NOT EXISTS {factor_table} (
             code VARCHAR,
             date DATE,
+            ret_5 DOUBLE,
             ret_20 DOUBLE,
             ret_50 DOUBLE,
             ret_120 DOUBLE,
             ret_250 DOUBLE,
+            rps_5 DOUBLE,
             rps_20 DOUBLE,
             rps_50 DOUBLE,
             rps_120 DOUBLE,
@@ -132,8 +143,9 @@ class DuckDBManager:
             PRIMARY KEY (code, date)
         )
         """)
-        self.con.execute("""
-        CREATE TABLE IF NOT EXISTS factor_update_log (
+        self._ensure_factor_columns(factor_table)
+        self.con.execute(f"""
+        CREATE TABLE IF NOT EXISTS {log_table} (
             factor_name VARCHAR,
             universe VARCHAR,
             factor_version VARCHAR,
@@ -145,29 +157,34 @@ class DuckDBManager:
         )
         """)
         try:
-            self.con.execute("CREATE INDEX IF NOT EXISTS idx_factor_rps_daily_code_date ON factor_rps_daily (code, date)")
-            self.con.execute("CREATE INDEX IF NOT EXISTS idx_factor_rps_daily_date ON factor_rps_daily (date)")
-            self.con.execute("CREATE INDEX IF NOT EXISTS idx_factor_rps_daily_date_rps120 ON factor_rps_daily (date, rps_120)")
+            self.con.execute(f"CREATE INDEX IF NOT EXISTS idx_{factor_table}_code_date ON {factor_table} (code, date)")
+            self.con.execute(f"CREATE INDEX IF NOT EXISTS idx_{factor_table}_date ON {factor_table} (date)")
+            self.con.execute(f"CREATE INDEX IF NOT EXISTS idx_{factor_table}_date_rps120 ON {factor_table} (date, rps_120)")
         except Exception as e:
             logger.warning(f"Factor index creation notice: {e}")
+
+    def _ensure_factor_columns(self, factor_table: str):
+        for column in ("ret_5", "rps_5"):
+            if not self._column_exists(factor_table, column):
+                self.con.execute(f"ALTER TABLE {factor_table} ADD COLUMN {column} DOUBLE")
 
     def _drop_foreign_asset_tables(self):
         foreign_asset = "etf" if self.asset_type == "stock" else "stock"
         foreign_tables = list(MARKET_TABLES[foreign_asset].values()) + [INFO_TABLES[foreign_asset]]
-        if self.asset_type == "etf":
-            foreign_tables.extend(["factor_rps_daily", "factor_update_log"])
+        foreign_tables.extend(FACTOR_TABLES[foreign_asset].values())
         for table_name in foreign_tables:
             self.con.execute(f"DROP TABLE IF EXISTS {table_name}")
 
-    def calculate_rps_daily(self, universe: str = "all_stocks", factor_version: str = "rps_v1") -> int:
-        """Recalculate daily stock RPS factors from the full daily close history."""
-        if self.asset_type != "stock":
-            raise ValueError("RPS factors can only be calculated from the stock database")
-
-        date_range = self.con.execute("SELECT MIN(date), MAX(date) FROM stock_daily").fetchone()
+    def calculate_rps_daily(self, universe: str = None, factor_version: str = "rps_v1") -> int:
+        """Recalculate daily RPS factors from the selected asset's close history."""
+        market_table = MARKET_TABLES[self.asset_type]["d"]
+        factor_table = FACTOR_TABLES[self.asset_type]["rps"]
+        log_table = FACTOR_TABLES[self.asset_type]["log"]
+        universe = universe or RPS_UNIVERSES[self.asset_type]
+        date_range = self.con.execute(f"SELECT MIN(date), MAX(date) FROM {market_table}").fetchone()
         start_date, end_date = date_range if date_range else (None, None)
         if not start_date or not end_date:
-            raise ValueError("stock_daily has no data")
+            raise ValueError(f"{market_table} has no data")
 
         lag_columns = ",\n                ".join(
             f"close / NULLIF(LAG(close, {period}) OVER (PARTITION BY code ORDER BY date), 0) - 1 AS ret_{period}"
@@ -187,9 +204,9 @@ class DuckDBManager:
 
         try:
             self.con.execute("BEGIN TRANSACTION")
-            self.con.execute("DELETE FROM factor_rps_daily")
+            self.con.execute(f"DELETE FROM {factor_table}")
             self.con.execute(f"""
-                INSERT INTO factor_rps_daily (
+                INSERT INTO {factor_table} (
                     code, date, {ret_names}, {rps_names},
                     universe, factor_version, updated_at
                 )
@@ -198,7 +215,7 @@ class DuckDBManager:
                         code,
                         date,
                         {lag_columns}
-                    FROM stock_daily
+                    FROM {market_table}
                 ),
                 ranked AS (
                     SELECT
@@ -218,9 +235,9 @@ class DuckDBManager:
                     CURRENT_TIMESTAMP
                 FROM ranked
             """, [universe, factor_version])
-            count = self.con.execute("SELECT COUNT(*) FROM factor_rps_daily").fetchone()[0]
-            self.con.execute("""
-                INSERT INTO factor_update_log (
+            count = self.con.execute(f"SELECT COUNT(*) FROM {factor_table}").fetchone()[0]
+            self.con.execute(f"""
+                INSERT INTO {log_table} (
                     factor_name, universe, factor_version, start_date, end_date,
                     status, message, updated_at
                 )
@@ -230,8 +247,8 @@ class DuckDBManager:
             return count
         except Exception as e:
             self.con.execute("ROLLBACK")
-            self.con.execute("""
-                INSERT INTO factor_update_log (
+            self.con.execute(f"""
+                INSERT INTO {log_table} (
                     factor_name, universe, factor_version, start_date, end_date,
                     status, message, updated_at
                 )
@@ -585,6 +602,178 @@ class DuckDBManager:
         except Exception as e:
             logger.error(f"Export data failed: {e}")
             return False
+
+    def repair_latest_derived_fields(self, frequency: str = "d") -> dict:
+        """Repair locally derivable fields for the latest market-data date."""
+        table_name = self._get_table_name(frequency, self.asset_type)
+        latest_date = self.con.execute(f"SELECT MAX(date) FROM {table_name}").fetchone()[0]
+        if not latest_date:
+            return {
+                "table": table_name,
+                "latest_date": None,
+                "preclose_repaired": 0,
+                "pctchg_repaired": 0,
+                "st_repaired": 0,
+            }
+
+        date_filter = "AND d.date = ?"
+        preclose_count = self.con.execute(f"""
+            WITH lagged AS (
+                SELECT code, date, LAG(close) OVER (PARTITION BY code ORDER BY date) AS previous_close
+                FROM {table_name}
+            )
+            SELECT COUNT(1)
+            FROM {table_name} d
+            JOIN lagged l ON d.code = l.code AND d.date = l.date
+            WHERE d.preclose = 0 AND l.previous_close IS NOT NULL {date_filter}
+        """, [latest_date]).fetchone()[0]
+        self.con.execute(f"""
+            WITH lagged AS (
+                SELECT code, date, LAG(close) OVER (PARTITION BY code ORDER BY date) AS previous_close
+                FROM {table_name}
+            )
+            UPDATE {table_name} AS d
+            SET preclose = l.previous_close
+            FROM lagged AS l
+            WHERE d.code = l.code AND d.date = l.date
+              AND d.preclose = 0 AND l.previous_close IS NOT NULL {date_filter}
+        """, [latest_date])
+
+        pctchg_count = self.con.execute(f"""
+            SELECT COUNT(1)
+            FROM {table_name}
+            WHERE date = ? AND preclose <> 0
+              AND (
+                pctChg IS NULL
+                OR ABS(pctChg - ((close - preclose) / preclose * 100)) > 0.0001
+              )
+        """, [latest_date]).fetchone()[0]
+        self.con.execute(f"""
+            UPDATE {table_name}
+            SET pctChg = ROUND((close - preclose) / NULLIF(preclose, 0) * 100, 4)
+            WHERE date = ? AND preclose <> 0
+        """, [latest_date])
+
+        st_count = 0
+        if self.asset_type == "stock":
+            info_table = INFO_TABLES[self.asset_type]
+            st_count = self.con.execute(f"""
+                SELECT COUNT(1)
+                FROM {table_name} d
+                JOIN {info_table} i ON d.code = i.code
+                WHERE d.date = ?
+                  AND (d.isST = '1') <> (
+                    UPPER(COALESCE(i.name, '')) LIKE 'ST%'
+                    OR UPPER(COALESCE(i.name, '')) LIKE '*ST%'
+                    OR UPPER(COALESCE(i.name, '')) LIKE 'SST%'
+                    OR UPPER(COALESCE(i.name, '')) LIKE 'S*ST%'
+                  )
+            """, [latest_date]).fetchone()[0]
+            self.con.execute(f"""
+                UPDATE {table_name} AS d
+                SET isST = CASE
+                    WHEN UPPER(COALESCE(i.name, '')) LIKE 'ST%'
+                      OR UPPER(COALESCE(i.name, '')) LIKE '*ST%'
+                      OR UPPER(COALESCE(i.name, '')) LIKE 'SST%'
+                      OR UPPER(COALESCE(i.name, '')) LIKE 'S*ST%'
+                    THEN '1'
+                    ELSE '0'
+                END
+                FROM {info_table} AS i
+                WHERE d.code = i.code AND d.date = ?
+            """, [latest_date])
+
+        self.con.commit()
+        return {
+            "table": table_name,
+            "latest_date": str(latest_date),
+            "preclose_repaired": int(preclose_count),
+            "pctchg_repaired": int(pctchg_count),
+            "st_repaired": int(st_count),
+        }
+
+    def rebuild_trade_calendar_from_daily(self) -> dict:
+        """Rebuild a natural-day calendar from the locally stored daily bars."""
+        daily_table = MARKET_TABLES[self.asset_type]["d"]
+        date_range = self.con.execute(
+            f"SELECT MIN(date), MAX(date) FROM {daily_table} WHERE date IS NOT NULL"
+        ).fetchone()
+        start_date, end_date = date_range if date_range else (None, None)
+        if not start_date or not end_date:
+            self.con.execute("DELETE FROM trade_calendar")
+            self.con.commit()
+            return {
+                "asset_type": self.asset_type,
+                "source_table": daily_table,
+                "calendar_rows": 0,
+                "open_days": 0,
+                "closed_days": 0,
+                "start_date": None,
+                "end_date": None,
+            }
+
+        source = f"derived:{daily_table}"
+        try:
+            self.con.execute("BEGIN TRANSACTION")
+            self.con.execute("DELETE FROM trade_calendar")
+            self.con.execute(f"""
+                INSERT INTO trade_calendar (
+                    date, is_open, prev_trade_date, next_trade_date, source, updated_at
+                )
+                WITH open_days AS (
+                    SELECT DISTINCT date
+                    FROM {daily_table}
+                    WHERE date IS NOT NULL
+                ),
+                calendar_days AS (
+                    SELECT CAST(day AS DATE) AS date
+                    FROM generate_series(?::DATE, ?::DATE, INTERVAL 1 DAY) AS days(day)
+                ),
+                annotated AS (
+                    SELECT
+                        c.date,
+                        o.date IS NOT NULL AS is_open,
+                        MAX(o.date) OVER (
+                            ORDER BY c.date
+                            ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                        ) AS prev_trade_date,
+                        MIN(o.date) OVER (
+                            ORDER BY c.date
+                            ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING
+                        ) AS next_trade_date
+                    FROM calendar_days c
+                    LEFT JOIN open_days o ON c.date = o.date
+                )
+                SELECT
+                    date,
+                    is_open,
+                    prev_trade_date,
+                    next_trade_date,
+                    ?,
+                    CURRENT_TIMESTAMP
+                FROM annotated
+                ORDER BY date
+            """, [start_date, end_date, source])
+            stats = self.con.execute("""
+                SELECT COUNT(*), SUM(CASE WHEN is_open THEN 1 ELSE 0 END)
+                FROM trade_calendar
+            """).fetchone()
+            self.con.execute("COMMIT")
+        except Exception:
+            self.con.execute("ROLLBACK")
+            raise
+
+        calendar_rows = int(stats[0] or 0)
+        open_days = int(stats[1] or 0)
+        return {
+            "asset_type": self.asset_type,
+            "source_table": daily_table,
+            "calendar_rows": calendar_rows,
+            "open_days": open_days,
+            "closed_days": calendar_rows - open_days,
+            "start_date": str(start_date),
+            "end_date": str(end_date),
+        }
 
     def _clean_data(self, df: pd.DataFrame) -> pd.DataFrame:
         df_copy = df.copy()

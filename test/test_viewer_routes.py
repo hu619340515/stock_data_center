@@ -48,7 +48,25 @@ class TestViewerRoutes(unittest.TestCase):
             response = self.client.post("/api/calculate_rps", json={})
 
             self.assertEqual(response.status_code, 200)
-            run_rps_task.assert_called_once_with()
+            run_rps_task.assert_called_once_with("stock")
+
+    def test_etf_rps_route_starts_etf_background_calculation(self):
+        with patch.object(server, "_run_rps_task") as run_rps_task:
+            run_rps_task.return_value = (True, "ok")
+
+            response = self.client.post("/api/calculate_rps", json={"target": "etf"})
+
+            self.assertEqual(response.status_code, 200)
+            run_rps_task.assert_called_once_with("etf")
+
+    def test_calendar_route_starts_calendar_rebuild(self):
+        with patch.object(server, "_run_calendar_task") as run_calendar_task:
+            run_calendar_task.return_value = (True, "ok")
+
+            response = self.client.post("/api/rebuild_trade_calendar", json={})
+
+            self.assertEqual(response.status_code, 200)
+            run_calendar_task.assert_called_once_with()
 
 
 if __name__ == "__main__":

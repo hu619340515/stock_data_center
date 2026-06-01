@@ -1,11 +1,15 @@
 """
 量化数据可视化管理 - Flask API Server
-接口清单（共 14 个）：
+主要接口：
   GET  /                        → 前端首页
+  GET  /api/dashboard           → 首页聚合指标、健康度和质量提醒
+  GET  /api/data_quality        → 数据质量诊断
+  GET  /api/task_history        → 当前任务与最近任务历史
   GET  /api/status              → 数据库连接状态
   GET  /api/overview            → 概览卡片 / 所有表行数
   GET  /api/table               → 分页表格查询（支持关键词+日期筛选）
   GET  /api/codes               → 获取指定表的 code 列表
+  GET  /api/security_search     → 按代码或名称联想证券
   GET  /api/kline               → 单只证券 K 线数据
   GET  /api/stats               → 数值列统计（min/max/avg/sum）
   GET  /api/top_movers          → 涨跌幅排行榜
@@ -14,6 +18,7 @@
   GET  /api/refresh_status      → 各表最新更新时间统计
   GET  /api/export              → 导出 CSV（流式下载）
   POST /api/delete              → 删除指定 code 或日期范围记录
+  POST /api/delete_preview      → 删除前预览影响条数
   GET  /api/schema              → 查询表字段结构
   GET  /api/summary_by_code     → 按 code 聚合统计（均价/最大最小/总量）
   GET  /api/progress            → 获取更新进度
@@ -27,6 +32,8 @@ import traceback
 import threading
 import socketserver
 import sys
+import time
+from collections import deque
 import duckdb
 from flask import Flask, request, jsonify, send_from_directory, make_response, Response
 from flask_cors import CORS
@@ -98,6 +105,9 @@ def _get_core():
 _task_lock = threading.Lock()
 _task_running = False
 _current_pipeline = None  # 保存当前正在运行的 pipeline 实例
+_current_task = None
+_task_history = deque(maxlen=20)
+_dashboard_cache = {'key': None, 'expires_at': 0, 'data': None}
 
 # ─────────────────────────────────────────────
 # 路径配置
@@ -146,18 +156,45 @@ def _cleanup_pipeline(pipeline):
             db.close()
 
 
-def _run_task_sequence(steps):
+def _finish_task_history(status, message=''):
+    """Finalize the active task summary for the viewer task drawer."""
+    global _current_task, _dashboard_cache
+    if not _current_task:
+        return
+    _current_task['status'] = status
+    _current_task['message'] = message
+    _current_task['finished_at'] = datetime.datetime.now().isoformat(timespec='seconds')
+    started_at = _current_task.get('started_timestamp')
+    if started_at:
+        _current_task['duration_seconds'] = round(time.time() - started_at, 1)
+    _current_task.pop('started_timestamp', None)
+    _task_history.appendleft(dict(_current_task))
+    _current_task = None
+    _dashboard_cache['expires_at'] = 0
+
+
+def _run_task_sequence(steps, task_name='后台数据任务'):
     """Run one or more pipeline tasks serially in a background thread."""
-    global _task_running, _current_pipeline
+    global _task_running, _current_pipeline, _current_task
     with _task_lock:
         if _task_running:
             return False, '已有任务正在运行，请等待完成'
         _task_running = True
+        started_at = datetime.datetime.now()
+        _current_task = {
+            'name': task_name,
+            'status': 'running',
+            'started_at': started_at.isoformat(timespec='seconds'),
+            'started_timestamp': started_at.timestamp(),
+            'message': '任务正在运行',
+        }
+        _dashboard_cache['expires_at'] = 0
         reset_progress = _get_core()[2]
         reset_progress()
 
     def worker():
         global _task_running, _current_pipeline
+        was_stopped = False
         try:
             StockDataPipeline = _get_core()[0]
             for step in steps:
@@ -169,11 +206,13 @@ def _run_task_sequence(steps):
                 step['func'](pipeline)
                 _merge_pipeline_if_needed(pipeline, step.get('use_temp_db', False), step.get('asset_type', 'stock'))
                 should_stop = pipeline.should_stop
+                was_stopped = was_stopped or should_stop
                 _cleanup_pipeline(pipeline)
                 _current_pipeline = None
                 if should_stop:
                     break
         except Exception as e:
+            _finish_task_history('failed', str(e))
             print(f"❌ 后台任务出错: {e}")
             import traceback
             traceback.print_exc()
@@ -185,6 +224,11 @@ def _run_task_sequence(steps):
                 _current_pipeline = None
             with _task_lock:
                 _task_running = False
+            if _current_task:
+                if was_stopped:
+                    _finish_task_history('stopped', '任务已停止，临时数据未合并')
+                else:
+                    _finish_task_history('completed', '任务执行完成')
             print(f"✅ 任务完成，_task_running={_task_running}")
     
     t = threading.Thread(target=worker, daemon=True)
@@ -192,13 +236,13 @@ def _run_task_sequence(steps):
     return True, '任务已启动，请在进度条中查看'
 
 
-def _run_task(func, *args, use_temp_db=False, asset_type='stock'):
+def _run_task(func, *args, use_temp_db=False, asset_type='stock', task_name='后台数据任务'):
     """Run one pipeline task in a background thread."""
     return _run_task_sequence([{
         'func': lambda pipeline: func(pipeline, *args),
         'use_temp_db': use_temp_db,
         'asset_type': asset_type,
-    }])
+    }], task_name=task_name)
 
 
 def _run_frequency_for_all_assets(frequency):
@@ -214,16 +258,30 @@ def _run_frequency_for_all_assets(frequency):
             'use_temp_db': True,
             'asset_type': 'etf',
         },
-    ])
+    ], task_name=f'股票与ETF {frequency.upper()}周期数据计算')
 
 
-def _run_rps_task():
-    """Calculate RPS in the background without initializing a market data source."""
-    global _task_running
+def _run_rps_task(asset_type='stock'):
+    """Calculate stock or ETF RPS in the background without a market-data source."""
+    global _task_running, _current_task
+    asset_type = (asset_type or 'stock').lower()
+    if asset_type not in {'stock', 'etf'}:
+        return False, '不支持的 RPS 资产类型'
+    asset_label = '股票' if asset_type == 'stock' else 'ETF'
+    db_path = STOCK_DB_PATH if asset_type == 'stock' else ETF_DB_PATH
     with _task_lock:
         if _task_running:
             return False, '已有任务正在运行，请等待完成'
         _task_running = True
+        started_at = datetime.datetime.now()
+        _current_task = {
+            'name': f'计算{asset_label}RPS日频因子',
+            'status': 'running',
+            'started_at': started_at.isoformat(timespec='seconds'),
+            'started_timestamp': started_at.timestamp(),
+            'message': '任务正在运行',
+        }
+        _dashboard_cache['expires_at'] = 0
         reset_progress = _get_core()[2]
         reset_progress()
 
@@ -233,13 +291,15 @@ def _run_rps_task():
         set_progress = _get_core()[3]
         try:
             from database import DuckDBManager
-            set_progress(is_running=True, task_name='计算RPS日频因子', start_time=datetime.datetime.now().timestamp())
-            db = DuckDBManager(db_path=STOCK_DB_PATH, asset_type='stock')
+            set_progress(is_running=True, task_name=f'计算{asset_label}RPS日频因子', start_time=datetime.datetime.now().timestamp())
+            db = DuckDBManager(db_path=db_path, asset_type=asset_type)
             count = db.calculate_rps_daily()
-            set_progress(is_running=False, processed=count, total=count, success=count, message=f'RPS计算完成，共{count}条')
+            set_progress(is_running=False, processed=count, total=count, success=count, message=f'{asset_label} RPS计算完成，共{count}条')
+            _finish_task_history('completed', f'{asset_label} RPS计算完成，共{count}条')
         except Exception as e:
-            set_progress(is_running=False, error=1, message=f'RPS计算失败: {e}')
-            print(f"❌ RPS计算失败: {e}")
+            set_progress(is_running=False, error=1, message=f'{asset_label} RPS计算失败: {e}')
+            _finish_task_history('failed', f'{asset_label} RPS计算失败: {e}')
+            print(f"❌ {asset_label} RPS计算失败: {e}")
             traceback.print_exc()
         finally:
             if db:
@@ -248,7 +308,59 @@ def _run_rps_task():
                 _task_running = False
 
     threading.Thread(target=worker, daemon=True).start()
-    return True, 'RPS计算任务已启动，请在进度条中查看'
+    return True, f'{asset_label} RPS计算任务已启动，请在进度条中查看'
+
+def _run_calendar_task():
+    """Rebuild stock and ETF trade calendars from locally stored daily bars."""
+    global _task_running, _current_task
+    with _task_lock:
+        if _task_running:
+            return False, '已有任务正在运行，请等待完成'
+        _task_running = True
+        started_at = datetime.datetime.now()
+        _current_task = {
+            'name': '重建交易日历',
+            'status': 'running',
+            'started_at': started_at.isoformat(timespec='seconds'),
+            'started_timestamp': started_at.timestamp(),
+            'message': '正在根据本地日线重建交易日历',
+        }
+        _dashboard_cache['expires_at'] = 0
+        reset_progress = _get_core()[2]
+        reset_progress()
+
+    def worker():
+        global _task_running
+        set_progress = _get_core()[3]
+        results = []
+        try:
+            from database import DuckDBManager
+            set_progress(is_running=True, task_name='重建交易日历', total=2, start_time=datetime.datetime.now().timestamp())
+            for index, (asset_type, db_path) in enumerate([('stock', STOCK_DB_PATH), ('etf', ETF_DB_PATH)], start=1):
+                db = DuckDBManager(db_path=db_path, asset_type=asset_type)
+                try:
+                    result = db.rebuild_trade_calendar_from_daily()
+                    results.append(result)
+                finally:
+                    db.close()
+                set_progress(processed=index, success=index, message=f"已完成 {index}/2 个资产库")
+            detail = '；'.join(
+                f"{item['asset_type']} {item['open_days']} 个交易日，{item['closed_days']} 个闭市日"
+                for item in results
+            )
+            set_progress(is_running=False, processed=2, total=2, success=2, message=f'交易日历重建完成：{detail}')
+            _finish_task_history('completed', f'交易日历重建完成：{detail}')
+        except Exception as e:
+            set_progress(is_running=False, error=1, message=f'交易日历重建失败: {e}')
+            _finish_task_history('failed', f'交易日历重建失败: {e}')
+            print(f"❌ 交易日历重建失败: {e}")
+            traceback.print_exc()
+        finally:
+            with _task_lock:
+                _task_running = False
+
+    threading.Thread(target=worker, daemon=True).start()
+    return True, '交易日历重建任务已启动，请在进度条中查看'
 
 @app.route('/api/stop_task', methods=['POST'])
 def api_stop_task():
@@ -263,30 +375,30 @@ def api_stop_task():
 def api_daily_download():
     target = request.json.get('target', 'stock')
     if target == 'etf':
-        ok, msg = _run_task(lambda p: p.etf_download_pipeline('d'), use_temp_db=True, asset_type='etf')
+        ok, msg = _run_task(lambda p: p.etf_download_pipeline('d'), use_temp_db=True, asset_type='etf', task_name='ETF日线全量下载')
     else:
-        ok, msg = _run_task(lambda p: p.full_download_pipeline('d'), use_temp_db=True, asset_type='stock')
+        ok, msg = _run_task(lambda p: p.full_download_pipeline('d'), use_temp_db=True, asset_type='stock', task_name='股票日线全量下载')
     return jsonify({'success': ok, 'message': msg})
 
 @app.route('/api/daily_to_latest', methods=['POST'])
 def api_daily_to_latest():
     target = request.json.get('target', 'stock')
     if target == 'etf':
-        ok, msg = _run_task(lambda p: p.etf_update_pipeline('d'), use_temp_db=False, asset_type='etf')
+        ok, msg = _run_task(lambda p: p.etf_update_pipeline('d'), use_temp_db=False, asset_type='etf', task_name='ETF日线增量更新')
     else:
-        ok, msg = _run_task(lambda p: p.daily_update_pipeline('d'), use_temp_db=False, asset_type='stock')
+        ok, msg = _run_task(lambda p: p.daily_update_pipeline('d'), use_temp_db=False, asset_type='stock', task_name='股票日线增量更新')
     return jsonify({'success': ok, 'message': msg})
 
 @app.route('/api/download_stock_all_cycles', methods=['POST'])
 def api_download_stock_all_cycles():
     """下载股票的日/周/月全周期数据，自动判断全量/增量"""
-    ok, msg = _run_task(lambda p: p.download_all_cycles(asset_type='stock'), use_temp_db=False, asset_type='stock')
+    ok, msg = _run_task(lambda p: p.download_all_cycles(asset_type='stock'), use_temp_db=False, asset_type='stock', task_name='股票智能全周期更新')
     return jsonify({'success': ok, 'message': msg})
 
 @app.route('/api/download_etf_all_cycles', methods=['POST'])
 def api_download_etf_all_cycles():
     """下载ETF的日/周/月全周期数据，自动判断全量/增量"""
-    ok, msg = _run_task(lambda p: p.download_all_cycles(asset_type='etf'), use_temp_db=False, asset_type='etf')
+    ok, msg = _run_task(lambda p: p.download_all_cycles(asset_type='etf'), use_temp_db=False, asset_type='etf', task_name='ETF智能全周期更新')
     return jsonify({'success': ok, 'message': msg})
 
 @app.route('/api/aggregate_weekly', methods=['POST'])
@@ -301,17 +413,23 @@ def api_aggregate_monthly():
 
 @app.route('/api/calculate_rps', methods=['POST'])
 def api_calculate_rps():
-    ok, msg = _run_rps_task()
+    body = request.get_json(force=True, silent=True) or {}
+    ok, msg = _run_rps_task(body.get('target', 'stock'))
+    return jsonify({'success': ok, 'message': msg})
+
+@app.route('/api/rebuild_trade_calendar', methods=['POST'])
+def api_rebuild_trade_calendar():
+    ok, msg = _run_calendar_task()
     return jsonify({'success': ok, 'message': msg})
 
 @app.route('/api/etf_download', methods=['POST'])
 def api_etf_download():
-    ok, msg = _run_task(lambda p: p.etf_download_pipeline('d'), use_temp_db=True, asset_type='etf')
+    ok, msg = _run_task(lambda p: p.etf_download_pipeline('d'), use_temp_db=True, asset_type='etf', task_name='ETF日线全量下载')
     return jsonify({'success': ok, 'message': msg})
 
 @app.route('/api/etf_update_latest', methods=['POST'])
 def api_etf_update_latest():
-    ok, msg = _run_task(lambda p: p.etf_update_pipeline('d'), use_temp_db=True, asset_type='etf')
+    ok, msg = _run_task(lambda p: p.etf_update_pipeline('d'), use_temp_db=True, asset_type='etf', task_name='ETF日线增量更新')
     return jsonify({'success': ok, 'message': msg})
 
 
@@ -323,13 +441,15 @@ ALLOWED_TABLES = {
     'etf_daily',   'etf_weekly',   'etf_monthly',
     'stock_info', 'etf_info',
     'trade_calendar',
-    'factor_rps_daily', 'factor_update_log'
+    'factor_rps_daily', 'factor_update_log',
+    'etf_factor_rps_daily', 'etf_factor_update_log'
 }
 
 MARKET_TABLES = {
     'stock_daily', 'stock_weekly', 'stock_monthly',
     'etf_daily', 'etf_weekly', 'etf_monthly'
 }
+FACTOR_RPS_TABLES = {'factor_rps_daily', 'etf_factor_rps_daily'}
 
 # ─────────────────────────────────────────────
 # 工具函数
@@ -372,9 +492,12 @@ def get_conn(read_only=True, asset_type='stock'):
                 time.sleep(retry_delay)
 
 def df_to_records(df):
+    # Flask JSON encoder may emit non-standard NaN tokens; normalize to None first.
+    # Cast to object first, otherwise float columns coerce None back to NaN.
+    df = df.astype(object).where(df.notna(), None)
     for col in df.columns:
         dtype_str = str(df[col].dtype)
-        if 'datetime' in dtype_str or 'date' in dtype_str or dtype_str == 'object':
+        if 'datetime' in dtype_str or 'date' in dtype_str:
             df[col] = df[col].astype(str)
     return df.to_dict(orient='records')
 
@@ -451,6 +574,210 @@ def build_market_where(keyword='', start='', end='', code=''):
     return clause, params
 
 
+TABLE_LABELS = {
+    'stock_daily': '股票日线',
+    'stock_weekly': '股票周线',
+    'stock_monthly': '股票月线',
+    'stock_info': '股票基础信息',
+    'etf_daily': 'ETF日线',
+    'etf_weekly': 'ETF周线',
+    'etf_monthly': 'ETF月线',
+    'etf_info': 'ETF基础信息',
+    'trade_calendar': '交易日历',
+    'factor_rps_daily': 'RPS日频因子',
+    'factor_update_log': '因子更新日志',
+    'etf_factor_rps_daily': 'ETF RPS日频因子',
+    'etf_factor_update_log': 'ETF因子更新日志',
+}
+
+
+def _table_status(conn, table):
+    """Return lightweight table metrics for the dashboard."""
+    columns = set(table_columns(conn, table))
+    count = conn.execute(f"SELECT COUNT(1) FROM {table}").fetchone()[0]
+    min_date = max_date = None
+    if 'date' in columns:
+        row = conn.execute(f"SELECT MIN(date), MAX(date) FROM {table}").fetchone()
+        min_date = str(row[0]) if row and row[0] else None
+        max_date = str(row[1]) if row and row[1] else None
+    return {
+        'table': table,
+        'label': TABLE_LABELS.get(table, table),
+        'count': int(count),
+        'min_date': min_date,
+        'max_date': max_date,
+    }
+
+
+def _dashboard_data(force_refresh=False):
+    """Collect dashboard metrics once and keep the heavy reads briefly cached."""
+    cache_key = (STOCK_DB_PATH, ETF_DB_PATH)
+    if (
+        not force_refresh
+        and _dashboard_cache.get('key') == cache_key
+        and _dashboard_cache.get('data') is not None
+        and _dashboard_cache.get('expires_at', 0) > time.time()
+    ):
+        return _dashboard_cache['data']
+
+    databases = {}
+    tables = []
+    table_map = {}
+    market_checks = {}
+    for asset_type, path in [('stock', STOCK_DB_PATH), ('etf', ETF_DB_PATH)]:
+        database = {
+            'asset_type': asset_type,
+            'name': os.path.basename(path),
+            'path': path,
+            'status': 'error',
+            'tables': [],
+        }
+        try:
+            conn = get_conn(asset_type=asset_type)
+            names = [row[0] for row in conn.execute("SHOW TABLES").fetchall()]
+            database['status'] = 'ok'
+            database['tables'] = names
+            for table in names:
+                if table not in ALLOWED_TABLES:
+                    continue
+                if asset_type == 'stock' and table.startswith('etf_'):
+                    continue
+                if asset_type == 'etf' and not (table.startswith('etf_') or table == 'trade_calendar'):
+                    continue
+                # trade_calendar exists in both databases; keep the stock copy in the main list.
+                if table == 'trade_calendar' and asset_type == 'etf':
+                    continue
+                status = _table_status(conn, table)
+                status['asset_type'] = asset_type
+                tables.append(status)
+                table_map[table] = status
+            daily_table = f'{asset_type}_daily'
+            if daily_table in names:
+                columns = set(table_columns(conn, daily_table))
+                if 'pctChg' in columns:
+                    latest = conn.execute(f"SELECT MAX(date) FROM {daily_table}").fetchone()[0]
+                    if latest:
+                        row = conn.execute(
+                            f"SELECT COUNT(1), "
+                            f"SUM(CASE WHEN pctChg > 0 THEN 1 ELSE 0 END), "
+                            f"SUM(CASE WHEN pctChg < 0 THEN 1 ELSE 0 END), "
+                            f"SUM(CASE WHEN pctChg = 0 THEN 1 ELSE 0 END), "
+                            f"AVG(pctChg), "
+                            f"SUM(CASE WHEN turn = 0 THEN 1 ELSE 0 END), "
+                            f"COUNT(turn) FROM {daily_table} WHERE date = ?",
+                            [latest],
+                        ).fetchone()
+                        market_checks[asset_type] = {
+                            'date': str(latest),
+                            'total': int(row[0] or 0),
+                            'rise_count': int(row[1] or 0),
+                            'fall_count': int(row[2] or 0),
+                            'flat_count': int(row[3] or 0),
+                            'avg_pct_chg': round(float(row[4] or 0), 4),
+                            'turn_zero_count': int(row[5] or 0),
+                            'turn_count': int(row[6] or 0),
+                        }
+                        if asset_type == 'stock':
+                            st_row = conn.execute(
+                                "SELECT "
+                                "SUM(CASE WHEN d.isST = '1' THEN 1 ELSE 0 END), "
+                                "SUM(CASE WHEN "
+                                "  UPPER(COALESCE(i.name, '')) LIKE 'ST%' "
+                                "  OR UPPER(COALESCE(i.name, '')) LIKE '*ST%' "
+                                "  OR UPPER(COALESCE(i.name, '')) LIKE 'SST%' "
+                                "  OR UPPER(COALESCE(i.name, '')) LIKE 'S*ST%' "
+                                "THEN 1 ELSE 0 END), "
+                                "SUM(CASE WHEN "
+                                "  (d.isST = '1') <> ("
+                                "    UPPER(COALESCE(i.name, '')) LIKE 'ST%' "
+                                "    OR UPPER(COALESCE(i.name, '')) LIKE '*ST%' "
+                                "    OR UPPER(COALESCE(i.name, '')) LIKE 'SST%' "
+                                "    OR UPPER(COALESCE(i.name, '')) LIKE 'S*ST%'"
+                                "  ) "
+                                "THEN 1 ELSE 0 END) "
+                                "FROM stock_daily d "
+                                "LEFT JOIN stock_info i ON d.code = i.code "
+                                "WHERE d.date = ?",
+                                [latest],
+                            ).fetchone()
+                            market_checks[asset_type].update({
+                                'st_flag_count': int(st_row[0] or 0),
+                                'st_name_count': int(st_row[1] or 0),
+                                'st_mismatch_count': int(st_row[2] or 0),
+                            })
+            conn.close()
+        except Exception as e:
+            database['error'] = str(e)
+        databases[asset_type] = database
+
+    issues = []
+    for asset_type, database in databases.items():
+        if database['status'] != 'ok':
+            issues.append({
+                'level': 'error',
+                'code': f'{asset_type}_database_unavailable',
+                'title': f"{'股票' if asset_type == 'stock' else 'ETF'}数据库无法连接",
+                'detail': database.get('error', '请检查数据库文件和后台任务状态。'),
+            })
+    for table, title in [
+        ('trade_calendar', '交易日历'),
+        ('factor_rps_daily', '股票 RPS日频因子'),
+        ('etf_factor_rps_daily', 'ETF RPS日频因子'),
+    ]:
+        status = table_map.get(table)
+        if not status or status['count'] == 0:
+            issues.append({
+                'level': 'warning' if table == 'trade_calendar' else 'info',
+                'code': f'{table}_empty',
+                'title': f'{title}当前为空',
+                'detail': '建议补齐交易日基准。' if table == 'trade_calendar' else '可在因子中心启动首次 RPS 计算。',
+            })
+    stock_market = market_checks.get('stock')
+    if stock_market and stock_market['total'] > 0 and stock_market['rise_count'] == 0 and stock_market['fall_count'] == 0:
+        issues.append({
+            'level': 'warning',
+            'code': 'stock_pct_chg_all_zero',
+            'title': f"股票日线涨跌幅在 {stock_market['date']} 全部为 0",
+            'detail': '涨跌榜和市场宽度可能失真，建议检查数据源字段映射或重新计算。',
+        })
+    if stock_market and stock_market['turn_count'] > 0 and stock_market['turn_zero_count'] == stock_market['turn_count']:
+        issues.append({
+            'level': 'warning',
+            'code': 'stock_turn_all_zero',
+            'title': f"股票日线换手率在 {stock_market['date']} 全部为 0",
+            'detail': '标准 QMT K 线不直接返回换手率。采集器会使用当前流通股本派生新数据，历史数据仍需专项回填。',
+        })
+    if stock_market and stock_market.get('st_mismatch_count', 0) > 0:
+        issues.append({
+            'level': 'warning',
+            'code': 'stock_st_mismatch',
+            'title': f"股票日线 ST 标记在 {stock_market['date']} 有 {stock_market['st_mismatch_count']} 条不一致",
+            'detail': '已按股票基础信息中的 ST / *ST 名称补齐新采集数据；历史状态需要专项回填。',
+        })
+
+    score = max(0, 100 - sum(20 if item['level'] == 'error' else 8 if item['level'] == 'warning' else 3 for item in issues))
+    payload = {
+        'generated_at': datetime.datetime.now().isoformat(timespec='seconds'),
+        'health_score': score,
+        'databases': databases,
+        'tables': sorted(tables, key=lambda item: item['label']),
+        'summary': {
+            'stock_daily_count': table_map.get('stock_daily', {}).get('count', 0),
+            'etf_daily_count': table_map.get('etf_daily', {}).get('count', 0),
+            'stock_count': table_map.get('stock_info', {}).get('count', 0),
+            'etf_count': table_map.get('etf_info', {}).get('count', 0),
+            'latest_trade_date': table_map.get('stock_daily', {}).get('max_date'),
+        },
+        'market_checks': market_checks,
+        'issues': issues,
+        'task': dict(_current_task) if _current_task else None,
+    }
+    if payload['task']:
+        payload['task'].pop('started_timestamp', None)
+    _dashboard_cache.update({'key': cache_key, 'expires_at': time.time() + 15, 'data': payload})
+    return payload
+
+
 # ═══════════════════════════════════════════════════════════
 # 静态页面路由
 # ═══════════════════════════════════════════════════════════
@@ -465,6 +792,43 @@ def root_index():
 @app.route('/favicon.ico')
 def favicon():
     return make_response('', 204)
+
+
+# ═══════════════════════════════════════════════════════════
+# Dashboard aggregation and quality checks
+# ═══════════════════════════════════════════════════════════
+@app.route('/api/dashboard')
+def api_dashboard():
+    conn = None
+    conn = None
+    try:
+        force_refresh = request.args.get('refresh', '0') == '1'
+        return jsonify(_dashboard_data(force_refresh=force_refresh))
+    except Exception as e:
+        return jsonify({'status': 'error', 'msg': str(e)}), 500
+
+
+@app.route('/api/data_quality')
+def api_data_quality():
+    try:
+        dashboard = _dashboard_data(force_refresh=request.args.get('refresh', '0') == '1')
+        return jsonify({
+            'generated_at': dashboard['generated_at'],
+            'health_score': dashboard['health_score'],
+            'issues': dashboard['issues'],
+            'tables': dashboard['tables'],
+        })
+    except Exception as e:
+        return jsonify({'status': 'error', 'msg': str(e)}), 500
+
+
+@app.route('/api/task_history')
+def api_task_history():
+    limit = max(1, min(int(request.args.get('limit', 10)), 20))
+    current = dict(_current_task) if _current_task else None
+    if current:
+        current.pop('started_timestamp', None)
+    return jsonify({'current': current, 'history': list(_task_history)[:limit]})
 
 
 # ═══════════════════════════════════════════════════════════
@@ -525,7 +889,9 @@ def api_status():
             'status': 'error',
             'msg': str(e)
         }), 500
-
+    finally:
+        if conn is not None:
+            conn.close()
 
 # ═══════════════════════════════════════════════════════════
 # 进度查询接口
@@ -538,6 +904,9 @@ def api_progress():
         progress['backend_task_running'] = _task_running
         progress['data_source'] = 'qmt'
         progress['log_path'] = APP_LOG_PATH
+        progress['task'] = dict(_current_task) if _current_task else None
+        if progress['task']:
+            progress['task'].pop('started_timestamp', None)
         return jsonify(progress)
     except Exception as e:
         return jsonify({
@@ -656,6 +1025,7 @@ def api_table():
     if err:
         return err
 
+    conn = None
     try:
         #  参数化 WHERE，防注入，同时避免特殊字符（如 sh.600006 中的点）破坏 SQL
         asset_type = asset_type_for_table(table)
@@ -666,6 +1036,22 @@ def api_table():
             sql_data  = (
                 f"SELECT {select_cols} FROM {from_sql} {where} "
                 f"ORDER BY d.date DESC, d.code "
+                f"LIMIT {page_size} OFFSET {offset}"
+            )
+            sql_count = f"SELECT COUNT(1) FROM {from_sql} {where}"
+        elif table in FACTOR_RPS_TABLES:
+            info_table = 'etf_info' if table.startswith('etf_') else 'stock_info'
+            from_sql = f"{table} d LEFT JOIN {info_table} i ON d.code = i.code"
+            where, params = build_market_where(keyword=keyword, start=start, end=end)
+            factor_columns = set(table_columns(conn, table))
+            ret_5_expr = "d.ret_5, " if "ret_5" in factor_columns else "NULL AS ret_5, "
+            rps_5_expr = "d.rps_5, " if "rps_5" in factor_columns else "NULL AS rps_5, "
+            sql_data = (
+                "SELECT d.code, COALESCE(i.name, '') AS name, d.date, "
+                f"{ret_5_expr}d.ret_20, d.ret_50, d.ret_120, d.ret_250, "
+                f"{rps_5_expr}d.rps_20, d.rps_50, d.rps_120, d.rps_250, d.universe, d.factor_version, d.updated_at "
+                f"FROM {from_sql} {where} "
+                "ORDER BY d.date DESC, d.code "
                 f"LIMIT {page_size} OFFSET {offset}"
             )
             sql_count = f"SELECT COUNT(1) FROM {from_sql} {where}"
@@ -684,7 +1070,6 @@ def api_table():
         # ② 用参数列表执行，DuckDB 支持 ? 占位符
         df    = conn.execute(sql_data,  params).fetchdf()
         total = conn.execute(sql_count, params).fetchone()[0]
-        conn.close()
 
         return jsonify({
             'columns': df.columns.tolist(),
@@ -702,7 +1087,9 @@ def api_table():
             'msg':    str(e),
             'detail': tb,          # 开发期暴露，上线后可删
         }), 500
-
+    finally:
+        if conn is not None:
+            conn.close()
 
 # ═══════════════════════════════════════════════════════════
 # 4. /api/codes
@@ -721,6 +1108,33 @@ def api_codes():
         codes = conn.execute(f"SELECT DISTINCT code FROM {table} ORDER BY code").fetchall()
         conn.close()
         return jsonify([c[0] for c in codes])
+    except Exception as e:
+        return jsonify({'status': 'error', 'msg': str(e)}), 500
+
+
+@app.route('/api/security_search')
+def api_security_search():
+    asset_type = request.args.get('asset_type', 'stock').strip()
+    keyword = request.args.get('keyword', '').strip()
+    limit = max(1, min(int(request.args.get('limit', 20)), 100))
+    if asset_type not in {'stock', 'etf'}:
+        return jsonify({'status': 'error', 'msg': f'不支持的资产类型: {asset_type}'}), 400
+    table = 'stock_info' if asset_type == 'stock' else 'etf_info'
+    try:
+        conn = get_conn(asset_type=asset_type)
+        if keyword:
+            rows = conn.execute(
+                f"SELECT code, name FROM {table} "
+                f"WHERE code LIKE ? OR name LIKE ? ORDER BY code LIMIT ?",
+                [f'%{keyword}%', f'%{keyword}%', limit],
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                f"SELECT code, name FROM {table} ORDER BY code LIMIT ?",
+                [limit],
+            ).fetchall()
+        conn.close()
+        return jsonify([{'code': row[0], 'name': row[1] or ''} for row in rows])
     except Exception as e:
         return jsonify({'status': 'error', 'msg': str(e)}), 500
 
@@ -964,16 +1378,22 @@ def api_trend():
     end   = request.args.get('end', '').strip()
     field = request.args.get('field', 'close')
     limit = min(int(request.args.get('limit', 500)), 2000)
+    allowed_fields = {'open', 'high', 'low', 'close', 'volume', 'amount', 'pctChg', 'turn'}
 
     tbl, err = check_table(table)
     if err: return err
     if table not in MARKET_TABLES:
         return jsonify({'status': 'error', 'msg': '该接口仅支持行情表'}), 400
+    if field not in allowed_fields:
+        return jsonify({'status': 'error', 'msg': f'不支持的字段: {field}'}), 400
 
     try:
         asset_type = asset_type_for_table(table)
         conn  = get_conn(asset_type=asset_type)
         columns = table_columns(conn, table)
+        if field not in columns:
+            conn.close()
+            return jsonify({'status': 'error', 'msg': f'字段不存在: {field}'}), 400
         where, params = build_where(code=code, start=start, end=end, columns=columns)
         sql   = (f"SELECT CAST(date AS VARCHAR) as date, "
                  f"ROUND(AVG({field}),4) as avg_val, "
@@ -1084,6 +1504,62 @@ def api_export():
 # ═══════════════════════════════════════════════════════════
 # 12. /api/delete — 删除记录（POST）
 # ═══════════════════════════════════════════════════════════
+@app.route('/api/repair_latest_derived_fields', methods=['POST'])
+def api_repair_latest_derived_fields():
+    body = request.get_json(force=True, silent=True) or {}
+    asset_type = body.get('asset_type', 'stock').strip()
+    frequency = body.get('frequency', 'd').strip()
+    confirm = body.get('confirm', False)
+
+    if not confirm:
+        return jsonify({'status': 'error', 'msg': '请传入 confirm:true 以确认修复'}), 400
+    if asset_type not in {'stock', 'etf'}:
+        return jsonify({'status': 'error', 'msg': '不支持的资产类型'}), 400
+    if frequency not in {'d', 'w', 'm'}:
+        return jsonify({'status': 'error', 'msg': '不支持的数据周期'}), 400
+
+    db = None
+    try:
+        from database import DuckDBManager
+        db_path = STOCK_DB_PATH if asset_type == 'stock' else ETF_DB_PATH
+        db = DuckDBManager(db_path=db_path, asset_type=asset_type)
+        result = db.repair_latest_derived_fields(frequency=frequency)
+        _dashboard_cache['expires_at'] = 0
+        return jsonify({'status': 'ok', **result})
+    except Exception as e:
+        return jsonify({'status': 'error', 'msg': str(e)}), 500
+    finally:
+        if db is not None:
+            db.close()
+
+
+@app.route('/api/delete_preview', methods=['POST'])
+def api_delete_preview():
+    body  = request.get_json(force=True, silent=True) or {}
+    table = body.get('table', '')
+    code  = body.get('code', '').strip()
+    start = body.get('start', '').strip()
+    end   = body.get('end', '').strip()
+
+    tbl, err = check_table(table)
+    if err: return err
+    if not code and not start and not end:
+        return jsonify({'status': 'error', 'msg': '必须指定 code 或 start/end 至少一个条件'}), 400
+    try:
+        asset_type = asset_type_for_table(table)
+        conn = get_conn(asset_type=asset_type)
+        columns = table_columns(conn, table)
+        where, params = build_where(code=code, start=start, end=end, columns=columns)
+        if not where:
+            conn.close()
+            return jsonify({'status': 'error', 'msg': '条件为空，拒绝全表删除'}), 400
+        count = conn.execute(f"SELECT COUNT(1) FROM {table} {where}", params).fetchone()[0]
+        conn.close()
+        return jsonify({'status': 'ok', 'count': int(count)})
+    except Exception as e:
+        return jsonify({'status': 'error', 'msg': str(e)}), 500
+
+
 @app.route('/api/delete', methods=['POST'])
 def api_delete():
     body    = request.get_json(force=True, silent=True) or {}

@@ -4,6 +4,7 @@ from multiprocessing import Process, Queue, current_process, Event
 import logging # ✅ 单独导入标准 logging 模块
 import queue
 import traceback
+import re
 from typing import List, Tuple, Optional, Set, Any
 from database import DuckDBManager
 from data_source_factory import DataSourceFactory
@@ -113,6 +114,10 @@ def prepare_market_df_for_db(df: pd.DataFrame, name: str) -> pd.DataFrame:
                 df[col] = '0'
             else:
                 df[col] = ''
+    if name:
+        # Standard QMT K-lines do not carry ST status. The instrument name is
+        # authoritative for newly fetched bars and avoids silently storing 0.
+        df['isST'] = '1' if re.search(r'^(?:S\*?ST|\*?ST)', str(name).upper()) else '0'
     return df[DB_MARKET_COLUMNS]
 
 def _safe_queue_put(q: Queue, item, process_id: int, max_retries: int = 5, timeout: float = 10.0):
@@ -383,6 +388,7 @@ class StockDataPipeline:
             # 连接主数据库进行合并
             main_db = DuckDBManager(db_path=main_db_path, asset_type=self.asset_type)
             result = main_db.merge_from_db(self.temp_db_path, tables)
+            main_db.rebuild_trade_calendar_from_daily()
             main_db.close()
             safe_print(f"✅ 主数据库合并完成")
             
@@ -543,6 +549,15 @@ class StockDataPipeline:
             if new_batch_size != self.current_batch_size:
                 self.current_batch_size = new_batch_size
                 safe_print(f"📈 内存使用率低 ({memory_usage:.2f}%)，增加批处理大小至: {self.current_batch_size}")
+
+    def _refresh_trade_calendar_if_daily(self, frequency: str) -> None:
+        if frequency != "d" or self.should_stop:
+            return
+        result = self.db.rebuild_trade_calendar_from_daily()
+        safe_print(
+            f"Trade calendar updated: {result['start_date']} ~ {result['end_date']}, "
+            f"open={result['open_days']}, closed={result['closed_days']}"
+        )
 
     def full_download_pipeline(self, frequency: str = "d") -> None:
         """
@@ -854,6 +869,7 @@ class StockDataPipeline:
         if batch_buffer:
             self.db.upload_batch(batch_buffer, frequency)
 
+        self._refresh_trade_calendar_if_daily(frequency)
         self.end_time = pd.Timestamp.now()
         log_listener.stop()
         elapsed_time = (self.end_time - self.start_time).total_seconds()
@@ -1196,6 +1212,7 @@ class StockDataPipeline:
             self.db.upload_batch(batch_buffer, frequency)
             safe_print(f"💾 最终批量写入完成: {len(batch_buffer)} 条记录 (表: {self.db._get_table_name(frequency)})")
         
+        self._refresh_trade_calendar_if_daily(frequency)
         self.end_time = pd.Timestamp.now()
         log_listener.stop()
         elapsed_time = (self.end_time - self.start_time).total_seconds()
@@ -1447,6 +1464,7 @@ class StockDataPipeline:
         if batch_buffer:
             self.db.upload_batch(batch_buffer, frequency, asset_type="etf")
 
+        self._refresh_trade_calendar_if_daily(frequency)
         self.end_time = pd.Timestamp.now()
         log_listener.stop()
         elapsed_time = (self.end_time - self.start_time).total_seconds()
@@ -1783,6 +1801,7 @@ class StockDataPipeline:
             safe_print(f"💾 最终批量写入完成: {len(batch_buffer)} 条记录 (表: {self.db._get_table_name(frequency, 'etf')})")
         
         # 记录结束时间
+        self._refresh_trade_calendar_if_daily(frequency)
         self.end_time = pd.Timestamp.now()
         log_listener.stop()
         elapsed_time = (self.end_time - self.start_time).total_seconds()

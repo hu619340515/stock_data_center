@@ -4,6 +4,12 @@
 
 ## 更新日志
 
+### 2026-06-01
+- **ETF RPS 查询稳定性修复**：修复数据浏览页在异常响应结构下出现 `Cannot read properties of undefined (reading 'map')` 的问题。前端 `loadBrowserTable` 现在会对 `columns/rows/total` 做防御性兜底，不再因字段缺失直接崩溃。
+- **RPS 周期扩展（股票+ETF）**：RPS 日频因子新增 `5日` 维度，计算与存储字段扩展为 `ret_5`、`rps_5`（同时保留 `20/50/120/250`）。
+- **历史库兼容**：因子表初始化新增自动补列逻辑（缺少 `ret_5/rps_5` 时自动 `ALTER TABLE ADD COLUMN`），避免升级后老库查询报错。
+- **接口兼容与回退**：`/api/table` 查询 `factor_rps_daily` / `etf_factor_rps_daily` 时优先返回 `ret_5/rps_5`；若当前库尚未补列则回退为 `NULL` 占位，保证接口可用。
+
 ### 2026-05-31
 - **数据库边界清理**：`stock_data.db` 只创建和保留 `stock_*`、股票基础信息、交易日历和股票因子表；`etf_data.db` 只创建和保留 `etf_*`、ETF 基础信息和交易日历，避免两个库混放全套表。
 - **基础信息拆分**：行情表不再存储 `name`，证券名称统一保存在 `stock_info` / `etf_info`，避免日线、周线、月线中重复写入名称。

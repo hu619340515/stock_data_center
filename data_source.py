@@ -3,6 +3,7 @@ import time
 import random
 import re
 import os
+import math
 from logger_config import setup_logger
 from config import (
     MAX_RETRIES,
@@ -84,6 +85,12 @@ class QMTClient(DataSourceInterface):
         'code', 'date', 'open', 'high', 'low', 'close', 'preclose',
         'volume', 'amount', 'adjustflag', 'turn', 'tradestatus', 'pctChg', 'isST'
     ]
+    HISTORY_FIELDS = [
+        "open", "high", "low", "close", "volume", "amount", "preClose", "suspendFlag"
+    ]
+
+    def __init__(self):
+        self._instrument_detail_cache = {}
 
     @retry_with_backoff
     def login(self):
@@ -155,21 +162,42 @@ class QMTClient(DataSourceInterface):
             "none": "3",
         }.get(str(QMT_DIVIDEND_TYPE).lower(), "2")
 
-    def _get_name(self, qmt_code: str) -> str:
+    def _get_instrument_detail(self, qmt_code: str) -> dict:
+        if qmt_code in self._instrument_detail_cache:
+            return self._instrument_detail_cache[qmt_code]
         xtdata = _xtdata()
         try:
-            detail = xtdata.get_instrument_detail(qmt_code)
-            if isinstance(detail, dict):
-                return (
-                    detail.get("InstrumentName")
-                    or detail.get("instrument_name")
-                    or detail.get("name")
-                    or detail.get("Name")
-                    or ""
-                )
+            detail = xtdata.get_instrument_detail(qmt_code) or {}
         except Exception:
-            return ""
-        return ""
+            detail = {}
+        self._instrument_detail_cache[qmt_code] = detail if isinstance(detail, dict) else {}
+        return self._instrument_detail_cache[qmt_code]
+
+    def _get_name(self, qmt_code: str) -> str:
+        detail = self._get_instrument_detail(qmt_code)
+        return (
+            detail.get("InstrumentName")
+            or detail.get("instrument_name")
+            or detail.get("name")
+            or detail.get("Name")
+            or ""
+        )
+
+    @staticmethod
+    def _st_flag_from_name(name: str) -> str:
+        return "1" if re.search(r"^(?:S\*?ST|\*?ST)", str(name or "").upper()) else "0"
+
+    @staticmethod
+    def _turnover_rate_from_float_volume(volume: pd.Series, float_volume) -> pd.Series:
+        """Derive turnover rate from QMT lots and current circulating shares."""
+        try:
+            shares = float(float_volume)
+        except (TypeError, ValueError):
+            shares = 0.0
+        if not math.isfinite(shares) or shares <= 0 or shares >= 1e18:
+            return pd.Series(0.0, index=volume.index)
+        # QMT stock K-line volume uses lots (手); one lot is 100 shares.
+        return pd.to_numeric(volume, errors="coerce").fillna(0) * 100 * 100 / shares
 
     def _code_list_dirs(self) -> list:
         xtdata = _xtdata()
@@ -310,7 +338,14 @@ class QMTClient(DataSourceInterface):
             return pd.to_datetime(numeric, unit="ms", errors="coerce").dt.strftime("%Y-%m-%d")
         return pd.to_datetime(raw_str, errors="coerce").dt.strftime("%Y-%m-%d")
 
-    def _standardize_history_df(self, raw_df: pd.DataFrame, code: str) -> pd.DataFrame:
+    def _standardize_history_df(
+        self,
+        raw_df: pd.DataFrame,
+        code: str,
+        *,
+        float_volume=None,
+        security_name: str = "",
+    ) -> pd.DataFrame:
         if raw_df.empty:
             return pd.DataFrame(columns=self.TARGET_COLUMNS)
 
@@ -327,6 +362,7 @@ class QMTClient(DataSourceInterface):
 
         df["date"] = self._normalize_date_series(df)
         df = df.dropna(subset=["date"])
+        df = df.sort_values("date").reset_index(drop=True)
         df["code"] = code
 
         for col in ["open", "high", "low", "close", "volume", "amount"]:
@@ -343,9 +379,25 @@ class QMTClient(DataSourceInterface):
         df["pctChg"] = pd.to_numeric(df["pctChg"], errors="coerce").fillna(0)
 
         df["adjustflag"] = self._adjustflag()
-        df["turn"] = pd.to_numeric(df["turn"], errors="coerce").fillna(0) if "turn" in df.columns else 0.0
-        df["tradestatus"] = df["tradestatus"].astype(str) if "tradestatus" in df.columns else "1"
-        df["isST"] = df["isST"].astype(str) if "isST" in df.columns else "0"
+        if "turn" in df.columns:
+            df["turn"] = pd.to_numeric(df["turn"], errors="coerce").fillna(0)
+        else:
+            df["turn"] = self._turnover_rate_from_float_volume(df["volume"], float_volume)
+
+        if "tradestatus" in df.columns:
+            df["tradestatus"] = df["tradestatus"].astype(str)
+        elif "suspendFlag" in df.columns:
+            suspend_flag = pd.to_numeric(df["suspendFlag"], errors="coerce").fillna(0)
+            df["tradestatus"] = suspend_flag.apply(lambda value: "0" if value == 1 else "1")
+        else:
+            df["tradestatus"] = "1"
+
+        if "isST" in df.columns:
+            df["isST"] = df["isST"].astype(str)
+        else:
+            # Standard QMT K-lines do not contain historical ST status. The
+            # current instrument name still gives the right flag for new bars.
+            df["isST"] = self._st_flag_from_name(security_name)
 
         return df[self.TARGET_COLUMNS]
 
@@ -362,7 +414,7 @@ class QMTClient(DataSourceInterface):
         if QMT_DOWNLOAD_BEFORE_QUERY and hasattr(xtdata, "download_history_data"):
             xtdata.download_history_data(qmt_code, period=period, start_time=start, end_time=end)
 
-        fields = ["open", "high", "low", "close", "volume", "amount"]
+        fields = self.HISTORY_FIELDS
         if hasattr(xtdata, "get_market_data_ex"):
             market_data = xtdata.get_market_data_ex(
                 fields,
@@ -387,7 +439,13 @@ class QMTClient(DataSourceInterface):
             )
 
         raw_df = self._extract_market_df(market_data, qmt_code)
-        df = self._standardize_history_df(raw_df, code)
+        detail = self._get_instrument_detail(qmt_code)
+        df = self._standardize_history_df(
+            raw_df,
+            code,
+            float_volume=detail.get("FloatVolume"),
+            security_name=detail.get("InstrumentName", ""),
+        )
         if df.empty:
             logger.warning(f"⚠️ QMT未获取到 {code} 的历史数据")
         else:

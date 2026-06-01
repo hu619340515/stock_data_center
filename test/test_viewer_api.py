@@ -42,6 +42,16 @@ class TestViewerApi(unittest.TestCase):
             "isST": ["0", "0"],
         })
         self.db.upload_batch([df])
+        self.db.con.execute("""
+            INSERT INTO factor_rps_daily (
+                code, date, ret_20, ret_50, ret_120, ret_250,
+                rps_20, rps_50, rps_120, rps_250, universe, factor_version
+            ) VALUES (
+                'sh.600000', '2024-01-02', 0.01, 0.02, 0.03, 0.04,
+                80, 70, 60, 50, 'all_stocks', 'rps_v1'
+            )
+        """)
+        self.db.con.commit()
         self.db.close()
         self.db = None
 
@@ -58,6 +68,12 @@ class TestViewerApi(unittest.TestCase):
             "table": "stock_daily",
             "code": "sh.600000",
         })
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("confirm", response.get_json()["msg"])
+
+    def test_repair_latest_derived_fields_requires_confirm(self):
+        response = self.client.post("/api/repair_latest_derived_fields", json={})
 
         self.assertEqual(response.status_code, 400)
         self.assertIn("confirm", response.get_json()["msg"])
@@ -124,6 +140,66 @@ class TestViewerApi(unittest.TestCase):
         self.assertEqual(body["status"], "ok")
         self.assertIn("logs", body)
         self.assertIn("log_path", body)
+
+    def test_dashboard_returns_health_summary_and_quality_issues(self):
+        response = self.client.get("/api/dashboard?refresh=1")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.get_json()
+        self.assertIn("health_score", body)
+        self.assertIn("summary", body)
+        self.assertEqual(body["summary"]["stock_daily_count"], 2)
+        self.assertIn("issues", body)
+
+    def test_security_search_matches_name(self):
+        response = self.client.get("/api/security_search?asset_type=stock&keyword=\u6d66\u53d1")
+
+        self.assertEqual(response.status_code, 200)
+        rows = response.get_json()
+        self.assertEqual(rows, [{"code": "sh.600000", "name": "\u6d66\u53d1\u94f6\u884c"}])
+
+    def test_trend_rejects_unknown_field(self):
+        response = self.client.get("/api/trend?table=stock_daily&field=close)%20FROM%20stock_daily")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("\u4e0d\u652f\u6301\u7684\u5b57\u6bb5", response.get_json()["msg"])
+
+    def test_factor_table_includes_name_and_supports_keyword(self):
+        response = self.client.get("/api/table?table=factor_rps_daily&page=0&page_size=10&keyword=\u6d66\u53d1")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.get_json()
+        self.assertIn("name", body["columns"])
+        self.assertEqual(body["total"], 1)
+        self.assertEqual(body["rows"][0]["name"], "\u6d66\u53d1\u94f6\u884c")
+
+    def test_factor_table_serializes_nan_as_null(self):
+        db = DuckDBManager(db_path=self.temp_db, asset_type="stock")
+        db.con.execute("""
+            INSERT INTO factor_rps_daily (
+                code, date, ret_20, ret_50, ret_120, ret_250,
+                rps_20, rps_50, rps_120, rps_250, universe, factor_version
+            ) VALUES (
+                'sh.600001', '2024-01-03', 0.01, 0.02, 0.03, CAST('NaN' AS DOUBLE),
+                80, 70, 60, 50, 'all_stocks', 'rps_v1'
+            )
+        """)
+        db.close()
+
+        response = self.client.get("/api/table?table=factor_rps_daily&page=0&page_size=10&keyword=600001")
+
+        self.assertEqual(response.status_code, 200)
+        row = response.get_json()["rows"][0]
+        self.assertIsNone(row["ret_250"])
+
+    def test_delete_preview_returns_matching_count(self):
+        response = self.client.post("/api/delete_preview", json={
+            "table": "stock_daily",
+            "code": "sh.600000",
+        })
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["count"], 1)
 
 
 if __name__ == "__main__":

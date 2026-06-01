@@ -29,6 +29,28 @@ class TestCoreHelpers(unittest.TestCase):
         self.assertEqual(result.columns.tolist(), DB_MARKET_COLUMNS)
         self.assertNotIn("name", result.columns)
 
+    def test_prepare_market_df_for_db_infers_current_st_flag_from_name(self):
+        frame = pd.DataFrame({
+            "code": ["sh.600053"],
+            "date": ["2026-05-29"],
+            "open": [1.0],
+            "high": [1.0],
+            "low": [1.0],
+            "close": [1.0],
+            "preclose": [1.0],
+            "volume": [1],
+            "amount": [1.0],
+            "adjustflag": ["2"],
+            "turn": [0.1],
+            "tradestatus": ["1"],
+            "pctChg": [0.0],
+            "isST": ["0"],
+        })
+
+        result = prepare_market_df_for_db(frame, "*ST九鼎")
+
+        self.assertEqual(result["isST"].iloc[0], "1")
+
 
 if __name__ == "__main__":
     unittest.main()
