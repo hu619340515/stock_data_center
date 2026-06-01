@@ -566,6 +566,40 @@ let currentTable = 'stock_daily';
 let currentPage  = 1;
 let totalPages   = 1;
 const PAGE_SIZE  = 50;
+const COLUMN_LABEL_MAP = {
+  code: '代码',
+  name: '名称',
+  date: '日期',
+  open: '开盘价',
+  high: '最高价',
+  low: '最低价',
+  close: '收盘价',
+  preclose: '前收盘价',
+  volume: '成交量',
+  amount: '成交额',
+  adjustflag: '复权标记',
+  turn: '换手率',
+  tradestatus: '交易状态',
+  pctChg: '涨跌幅',
+  isST: 'ST标记',
+  update_time: '更新时间',
+  updated_at: '更新时间',
+  is_trading_day: '是否交易日',
+  market: '市场',
+  rps_5: 'RPS5',
+  rps_10: 'RPS10',
+  rps_20: 'RPS20',
+  rps_50: 'RPS50',
+  rps_120: 'RPS120',
+  rps_250: 'RPS250',
+  universe: '股票池',
+  factor_version: '因子版本',
+  factor_name: '因子名称',
+  start_date: '开始日期',
+  end_date: '结束日期',
+  status: '状态',
+  message: '消息'
+};
 
 /* ───────── 工具函数 ───────── */
 function toast(msg, type = 'ok', dur = 4000) {
@@ -587,6 +621,10 @@ function fmt(n) {
   if (n == null) return '-';
   if (typeof n === 'number') return n.toLocaleString('zh-CN', { maximumFractionDigits: 4 });
   return n;
+}
+
+function getColumnLabel(col) {
+  return COLUMN_LABEL_MAP[col] || col;
 }
 
 /* ───────── 表选择 ───────── */
@@ -807,7 +845,7 @@ async function loadTable(page = 1) {
     const trh = document.createElement('tr');
     d.columns.forEach(col => {
       const th = document.createElement('th');
-      th.textContent = col;
+      th.textContent = getColumnLabel(col);
       trh.appendChild(th);
     });
     thead.appendChild(trh);
