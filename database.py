@@ -1,10 +1,11 @@
 import os
+import time
 from typing import List
 
 import duckdb
 import pandas as pd
 
-from config import STOCK_DB_PATH
+from config import ETF_DB_PATH, STOCK_DB_PATH
 from logger_config import setup_logger
 
 logger = setup_logger("Database")
@@ -45,16 +46,21 @@ def safe_print(msg):
 
 class DuckDBManager:
     def __init__(self, db_path=None, asset_type: str = "stock"):
-        db_path = db_path or STOCK_DB_PATH
         asset_type = (asset_type or "stock").lower()
         if asset_type not in VALID_ASSET_TYPES:
             raise ValueError(f"unsupported asset_type: {asset_type}")
+        if db_path is None:
+            db_path = ETF_DB_PATH if asset_type == "etf" else STOCK_DB_PATH
 
         self.db_path = db_path
         self.asset_type = asset_type
         self.con = duckdb.connect(db_path)
         self._create_table()
         logger.info(f"DuckDB initialized: {db_path} ({asset_type})")
+
+    @staticmethod
+    def _norm_path(path: str) -> str:
+        return os.path.normcase(os.path.abspath(path))
 
     def _create_table(self):
         self._drop_foreign_asset_tables()
@@ -169,6 +175,28 @@ class DuckDBManager:
                 self.con.execute(f"ALTER TABLE {factor_table} ADD COLUMN {column} DOUBLE")
 
     def _drop_foreign_asset_tables(self):
+        stock_db_path = self._norm_path(STOCK_DB_PATH)
+        etf_db_path = self._norm_path(ETF_DB_PATH)
+        current_db_path = self._norm_path(self.db_path)
+
+        # If both asset types point to the same file, dropping "foreign" tables is unsafe.
+        if stock_db_path == etf_db_path:
+            logger.warning(
+                "STOCK_DB_PATH and ETF_DB_PATH resolve to the same file; "
+                "skip foreign table cleanup to avoid cross-asset data loss."
+            )
+            return
+
+        # Guard against accidental cross-asset manager/path mismatch.
+        if (self.asset_type == "etf" and current_db_path == stock_db_path) or (
+            self.asset_type == "stock" and current_db_path == etf_db_path
+        ):
+            logger.warning(
+                f"DB path mismatch detected (asset_type={self.asset_type}, db_path={self.db_path}); "
+                "skip foreign table cleanup to avoid dropping the other asset's tables."
+            )
+            return
+
         foreign_asset = "etf" if self.asset_type == "stock" else "stock"
         foreign_tables = list(MARKET_TABLES[foreign_asset].values()) + [INFO_TABLES[foreign_asset]]
         foreign_tables.extend(FACTOR_TABLES[foreign_asset].values())
@@ -202,59 +230,82 @@ class DuckDBManager:
         ret_names = ", ".join(f"ret_{period}" for period in RPS_PERIODS)
         rps_names = ", ".join(f"rps_{period}" for period in RPS_PERIODS)
 
-        try:
-            self.con.execute("BEGIN TRANSACTION")
-            self.con.execute(f"DELETE FROM {factor_table}")
-            self.con.execute(f"""
-                INSERT INTO {factor_table} (
-                    code, date, {ret_names}, {rps_names},
-                    universe, factor_version, updated_at
-                )
-                WITH returns AS (
-                    SELECT
-                        code,
-                        date,
-                        {lag_columns}
-                    FROM {market_table}
-                ),
-                ranked AS (
+        max_retries = 3
+        last_error = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                self.con.execute(f"""
+                    INSERT OR REPLACE INTO {factor_table} (
+                        code, date, {ret_names}, {rps_names},
+                        universe, factor_version, updated_at
+                    )
+                    WITH returns AS (
+                        SELECT
+                            code,
+                            date,
+                            {lag_columns}
+                        FROM {market_table}
+                    ),
+                    ranked AS (
+                        SELECT
+                            code,
+                            date,
+                            {ret_names},
+                            {rank_columns}
+                        FROM returns
+                    )
                     SELECT
                         code,
                         date,
                         {ret_names},
-                        {rank_columns}
-                    FROM returns
-                )
-                SELECT
-                    code,
-                    date,
-                    {ret_names},
-                    {rps_names},
-                    ?,
-                    ?,
-                    CURRENT_TIMESTAMP
-                FROM ranked
-            """, [universe, factor_version])
-            count = self.con.execute(f"SELECT COUNT(*) FROM {factor_table}").fetchone()[0]
-            self.con.execute(f"""
-                INSERT INTO {log_table} (
-                    factor_name, universe, factor_version, start_date, end_date,
-                    status, message, updated_at
-                )
-                VALUES ('rps_daily', ?, ?, ?, ?, 'success', ?, CURRENT_TIMESTAMP)
-            """, [universe, factor_version, start_date, end_date, f"calculated {count} rows"])
-            self.con.execute("COMMIT")
-            return count
-        except Exception as e:
-            self.con.execute("ROLLBACK")
+                        {rps_names},
+                        ?,
+                        ?,
+                        CURRENT_TIMESTAMP
+                    FROM ranked
+                """, [universe, factor_version])
+                count = self.con.execute(f"SELECT COUNT(*) FROM {factor_table}").fetchone()[0]
+                self.con.execute(f"""
+                    INSERT INTO {log_table} (
+                        factor_name, universe, factor_version, start_date, end_date,
+                        status, message, updated_at
+                    )
+                    VALUES ('rps_daily', ?, ?, ?, ?, 'success', ?, CURRENT_TIMESTAMP)
+                """, [universe, factor_version, start_date, end_date, f"calculated {count} rows"])
+                self.con.commit()
+                return count
+            except Exception as e:
+                last_error = e
+                message = str(e).lower()
+                retryable_conflict = "write-write conflict" in message or "transaction conflict" in message
+                try:
+                    self.con.rollback()
+                except Exception as rollback_error:
+                    rollback_msg = str(rollback_error).lower()
+                    if "no transaction is active" not in rollback_msg:
+                        logger.warning(f"RPS rollback failed: {rollback_error}")
+                if retryable_conflict and attempt < max_retries:
+                    wait_seconds = attempt
+                    logger.warning(
+                        f"RPS transaction conflict on {self.asset_type} "
+                        f"(attempt {attempt}/{max_retries}), retry in {wait_seconds}s: {e}"
+                    )
+                    time.sleep(wait_seconds)
+                    continue
+                break
+
+        try:
             self.con.execute(f"""
                 INSERT INTO {log_table} (
                     factor_name, universe, factor_version, start_date, end_date,
                     status, message, updated_at
                 )
                 VALUES ('rps_daily', ?, ?, ?, ?, 'failed', ?, CURRENT_TIMESTAMP)
-            """, [universe, factor_version, start_date, end_date, str(e)])
-            raise
+            """, [universe, factor_version, start_date, end_date, str(last_error)])
+            self.con.commit()
+        except Exception as log_error:
+            logger.warning(f"RPS failure log write failed: {log_error}")
+        raise last_error
 
     def _table_exists(self, table_name: str) -> bool:
         return self.con.execute(

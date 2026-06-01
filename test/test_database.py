@@ -336,5 +336,42 @@ class TestDatabase(unittest.TestCase):
             if os.path.exists(etf_temp_db):
                 os.remove(etf_temp_db)
 
+    def test_calculate_rps_preserves_original_error(self):
+        import database
+        import pandas as pd
+
+        self.db.upload_batch([pd.DataFrame({
+            "code": ["sh.600000"],
+            "date": ["2024-01-01"],
+            "open": [10.0],
+            "high": [10.0],
+            "low": [10.0],
+            "close": [10.0],
+            "preclose": [10.0],
+            "volume": [1000],
+            "amount": [10000.0],
+            "adjustflag": ["2"],
+            "turn": [1.0],
+            "tradestatus": ["1"],
+            "pctChg": [0.0],
+            "isST": ["0"],
+        })])
+        original_periods = database.RPS_PERIODS
+        database.RPS_PERIODS = original_periods + (999,)
+        try:
+            with self.assertRaisesRegex(Exception, "ret_999"):
+                self.db.calculate_rps_daily()
+        finally:
+            database.RPS_PERIODS = original_periods
+
+        log = self.db.con.execute("""
+            SELECT status, message
+            FROM factor_update_log
+            ORDER BY updated_at DESC
+            LIMIT 1
+        """).fetchone()
+        self.assertEqual(log[0], "failed")
+        self.assertIn("ret_999", log[1])
+
 if __name__ == '__main__':
     unittest.main()
