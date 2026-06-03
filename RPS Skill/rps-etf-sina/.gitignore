@@ -1,0 +1,12 @@
+data/
+output/
+logs/
+*.duckdb
+*.duckdb.wal
+*.duckdb.tmp
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.DS_Store

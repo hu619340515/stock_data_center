@@ -1,0 +1,4 @@
+interface:
+  display_name: "ETF RPS"
+  short_description: "从新浪ETF日线更新DuckDB并生成RPS前100中文图片表格"
+  default_prompt: "更新新浪ETF日线并生成RPS前100图片表格"
