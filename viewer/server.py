@@ -116,11 +116,19 @@ _VIEWER_DIR   = os.path.abspath(os.path.dirname(__file__))
 _PROJECT_ROOT = os.path.abspath(os.path.join(_VIEWER_DIR, '..'))
 if _PROJECT_ROOT not in sys.path:
     sys.path.append(_PROJECT_ROOT)
-from config import STOCK_DB_PATH as CONFIG_STOCK_DB_PATH, ETF_DB_PATH as CONFIG_ETF_DB_PATH, LOG_DIR
+from config import (
+    STOCK_DB_PATH as CONFIG_STOCK_DB_PATH,
+    ETF_DB_PATH as CONFIG_ETF_DB_PATH,
+    STOCK_FACTOR_DB_PATH as CONFIG_STOCK_FACTOR_DB_PATH,
+    ETF_FACTOR_DB_PATH as CONFIG_ETF_FACTOR_DB_PATH,
+    LOG_DIR,
+)
 
 # 数据库路径配置
 STOCK_DB_PATH = os.environ.get('STOCK_DB_PATH', CONFIG_STOCK_DB_PATH)
 ETF_DB_PATH = os.environ.get('ETF_DB_PATH', CONFIG_ETF_DB_PATH)
+STOCK_FACTOR_DB_PATH = os.environ.get('STOCK_FACTOR_DB_PATH', CONFIG_STOCK_FACTOR_DB_PATH)
+ETF_FACTOR_DB_PATH = os.environ.get('ETF_FACTOR_DB_PATH', CONFIG_ETF_FACTOR_DB_PATH)
 DEFAULT_DB_PATH = STOCK_DB_PATH  # 默认使用股票数据库
 
 # 优先读环境变量
@@ -138,10 +146,38 @@ def _merge_pipeline_if_needed(pipeline, use_temp_db, asset_type):
     print(f"🔍 检查合并条件 - use_temp_db={use_temp_db}, should_stop={pipeline.should_stop}")
     if use_temp_db and not pipeline.should_stop:
         print(f"🔄 开始合并到主数据库: {target_db_path}")
+        try:
+            set_progress = _get_core()[3]
+            set_progress(
+                is_running=True,
+                task_name=f"{'股票' if asset_type == 'stock' else 'ETF'}临时库合并",
+                processed=0,
+                total=1,
+                success=0,
+                error=0,
+                eta='合并中',
+                message='下载完成，正在合并临时数据库'
+            )
+        except Exception:
+            pass
         tables = ['stock_daily', 'stock_weekly', 'stock_monthly']
         if asset_type == 'etf':
             tables = ['etf_daily', 'etf_weekly', 'etf_monthly']
-        pipeline.merge_to_main_db(target_db_path, tables)
+        if not pipeline.merge_to_main_db(target_db_path, tables):
+            raise RuntimeError('临时数据库合并失败')
+        try:
+            set_progress = _get_core()[3]
+            set_progress(
+                is_running=False,
+                processed=1,
+                total=1,
+                success=1,
+                error=0,
+                eta='完成',
+                message='临时数据库合并完成'
+            )
+        except Exception:
+            pass
     else:
         print(f"⏭️ 跳过合并 - use_temp_db={use_temp_db}, should_stop={pipeline.should_stop}")
 
@@ -269,6 +305,7 @@ def _run_rps_task(asset_type='stock'):
         return False, '不支持的 RPS 资产类型'
     asset_label = '股票' if asset_type == 'stock' else 'ETF'
     db_path = STOCK_DB_PATH if asset_type == 'stock' else ETF_DB_PATH
+    factor_db_path = STOCK_FACTOR_DB_PATH if asset_type == 'stock' else ETF_FACTOR_DB_PATH
     with _task_lock:
         if _task_running:
             return False, '已有任务正在运行，请等待完成'
@@ -292,7 +329,7 @@ def _run_rps_task(asset_type='stock'):
         try:
             from database import DuckDBManager
             set_progress(is_running=True, task_name=f'计算{asset_label}RPS日频因子', start_time=datetime.datetime.now().timestamp())
-            db = DuckDBManager(db_path=db_path, asset_type=asset_type)
+            db = DuckDBManager(db_path=db_path, asset_type=asset_type, factor_db_path=factor_db_path)
             count = db.calculate_rps_daily()
             set_progress(is_running=False, processed=count, total=count, success=count, message=f'{asset_label} RPS计算完成，共{count}条')
             _finish_task_history('completed', f'{asset_label} RPS计算完成，共{count}条')
@@ -450,13 +487,15 @@ MARKET_TABLES = {
     'etf_daily', 'etf_weekly', 'etf_monthly'
 }
 FACTOR_RPS_TABLES = {'factor_rps_daily', 'etf_factor_rps_daily'}
+FACTOR_TABLES = {'factor_rps_daily', 'factor_update_log', 'etf_factor_rps_daily', 'etf_factor_update_log'}
 
 # ─────────────────────────────────────────────
 # 工具函数
 # ─────────────────────────────────────────────
-def get_conn(read_only=True, asset_type='stock'):
-    # 根据资产类型选择数据库
-    if asset_type == 'etf':
+def get_conn(read_only=True, asset_type='stock', db_role='market'):
+    if db_role == 'factor':
+        db_path = ETF_FACTOR_DB_PATH if asset_type == 'etf' else STOCK_FACTOR_DB_PATH
+    elif asset_type == 'etf':
         db_path = ETF_DB_PATH
     else:
         db_path = STOCK_DB_PATH
@@ -490,6 +529,34 @@ def get_conn(read_only=True, asset_type='stock'):
                 # 等待后重试
                 import time
                 time.sleep(retry_delay)
+
+def db_role_for_table(table):
+    return 'factor' if table in FACTOR_TABLES else 'market'
+
+
+def market_db_path_for_asset(asset_type):
+    return ETF_DB_PATH if asset_type == 'etf' else STOCK_DB_PATH
+
+
+def factor_db_path_for_asset(asset_type):
+    return ETF_FACTOR_DB_PATH if asset_type == 'etf' else STOCK_FACTOR_DB_PATH
+
+
+def quote_path(path):
+    return str(path).replace("'", "''")
+
+
+def attach_market_db(conn, asset_type):
+    conn.execute(f"ATTACH '{quote_path(market_db_path_for_asset(asset_type))}' AS market_db (READ_ONLY)")
+
+
+def get_conn_for_table(table, read_only=True, attach_market=False):
+    asset_type = asset_type_for_table(table)
+    role = db_role_for_table(table)
+    conn = get_conn(read_only=read_only, asset_type=asset_type, db_role=role)
+    if role == 'factor' and attach_market:
+        attach_market_db(conn, asset_type)
+    return conn
 
 def df_to_records(df):
     # Flask JSON encoder may emit non-standard NaN tokens; normalize to None first.
@@ -611,7 +678,7 @@ def _table_status(conn, table):
 
 def _dashboard_data(force_refresh=False):
     """Collect dashboard metrics once and keep the heavy reads briefly cached."""
-    cache_key = (STOCK_DB_PATH, ETF_DB_PATH)
+    cache_key = (STOCK_DB_PATH, ETF_DB_PATH, STOCK_FACTOR_DB_PATH, ETF_FACTOR_DB_PATH)
     if (
         not force_refresh
         and _dashboard_cache.get('key') == cache_key
@@ -624,35 +691,54 @@ def _dashboard_data(force_refresh=False):
     tables = []
     table_map = {}
     market_checks = {}
-    for asset_type, path in [('stock', STOCK_DB_PATH), ('etf', ETF_DB_PATH)]:
+    db_sources = [
+        ('stock_market', 'stock', 'market', STOCK_DB_PATH, '股票行情库'),
+        ('etf_market', 'etf', 'market', ETF_DB_PATH, 'ETF行情库'),
+        ('stock_factor', 'stock', 'factor', STOCK_FACTOR_DB_PATH, '股票因子库'),
+        ('etf_factor', 'etf', 'factor', ETF_FACTOR_DB_PATH, 'ETF因子库'),
+    ]
+    for db_key, asset_type, db_role, path, label in db_sources:
         database = {
             'asset_type': asset_type,
+            'db_role': db_role,
+            'label': label,
             'name': os.path.basename(path),
             'path': path,
             'status': 'error',
             'tables': [],
         }
         try:
-            conn = get_conn(asset_type=asset_type)
+            conn = get_conn(asset_type=asset_type, db_role=db_role)
             names = [row[0] for row in conn.execute("SHOW TABLES").fetchall()]
             database['status'] = 'ok'
             database['tables'] = names
             for table in names:
                 if table not in ALLOWED_TABLES:
                     continue
-                if asset_type == 'stock' and table.startswith('etf_'):
-                    continue
-                if asset_type == 'etf' and not (table.startswith('etf_') or table == 'trade_calendar'):
-                    continue
-                # trade_calendar exists in both databases; keep the stock copy in the main list.
-                if table == 'trade_calendar' and asset_type == 'etf':
-                    continue
+                if db_role == 'market':
+                    if table in FACTOR_TABLES:
+                        continue
+                    if asset_type == 'stock' and table.startswith('etf_'):
+                        continue
+                    if asset_type == 'etf' and not (table.startswith('etf_') or table == 'trade_calendar'):
+                        continue
+                    # trade_calendar exists in both market databases; keep the stock copy in the main list.
+                    if table == 'trade_calendar' and asset_type == 'etf':
+                        continue
+                else:
+                    if table not in FACTOR_TABLES:
+                        continue
+                    if asset_type == 'stock' and table.startswith('etf_'):
+                        continue
+                    if asset_type == 'etf' and not table.startswith('etf_'):
+                        continue
                 status = _table_status(conn, table)
                 status['asset_type'] = asset_type
+                status['db_role'] = db_role
                 tables.append(status)
                 table_map[table] = status
             daily_table = f'{asset_type}_daily'
-            if daily_table in names:
+            if db_role == 'market' and daily_table in names:
                 columns = set(table_columns(conn, daily_table))
                 if 'pctChg' in columns:
                     latest = conn.execute(f"SELECT MAX(date) FROM {daily_table}").fetchone()[0]
@@ -708,15 +794,15 @@ def _dashboard_data(force_refresh=False):
             conn.close()
         except Exception as e:
             database['error'] = str(e)
-        databases[asset_type] = database
+        databases[db_key] = database
 
     issues = []
-    for asset_type, database in databases.items():
+    for db_key, database in databases.items():
         if database['status'] != 'ok':
             issues.append({
                 'level': 'error',
-                'code': f'{asset_type}_database_unavailable',
-                'title': f"{'股票' if asset_type == 'stock' else 'ETF'}数据库无法连接",
+                'code': f'{db_key}_database_unavailable',
+                'title': f"{database.get('label', database.get('name', db_key))}无法连接",
                 'detail': database.get('error', '请检查数据库文件和后台任务状态。'),
             })
     for table, title in [
@@ -836,53 +922,44 @@ def api_task_history():
 # ═══════════════════════════════════════════════════════════
 @app.route('/api/status')
 def api_status():
+    conn = None
     try:
-        # 同时检查两个数据库的状态
-        stock_status = {'name': 'stock_data.db', 'path': STOCK_DB_PATH, 'status': 'error', 'tables': []}
-        etf_status = {'name': 'etf_data.db', 'path': ETF_DB_PATH, 'status': 'error', 'tables': []}
-        
-        # 检查股票数据库
-        try:
-            conn = get_conn(asset_type='stock')
-            stock_tables = conn.execute("SHOW TABLES").fetchall()
-            stock_status['status'] = 'ok'
-            stock_status['tables'] = [t[0] for t in stock_tables]
-            conn.close()
-        except Exception as e:
-            stock_status['error'] = str(e)
-            # 尝试初始化
+        databases = {}
+        for key, asset_type, db_role, path, label in [
+            ('stock_market', 'stock', 'market', STOCK_DB_PATH, '股票行情库'),
+            ('etf_market', 'etf', 'market', ETF_DB_PATH, 'ETF行情库'),
+            ('stock_factor', 'stock', 'factor', STOCK_FACTOR_DB_PATH, '股票因子库'),
+            ('etf_factor', 'etf', 'factor', ETF_FACTOR_DB_PATH, 'ETF因子库'),
+        ]:
+            db_status = {
+                'asset_type': asset_type,
+                'db_role': db_role,
+                'label': label,
+                'name': os.path.basename(path),
+                'path': path,
+                'status': 'error',
+                'tables': [],
+            }
             try:
-                from database import DuckDBManager
-                db = DuckDBManager(db_path=STOCK_DB_PATH, asset_type='stock')
-                db.close()
-                stock_status['status'] = 'ok'
-            except Exception as init_e:
-                stock_status['init_error'] = str(init_e)
-        
-        # 检查ETF数据库
-        try:
-            conn = get_conn(asset_type='etf')
-            etf_tables = conn.execute("SHOW TABLES").fetchall()
-            etf_status['status'] = 'ok'
-            etf_status['tables'] = [t[0] for t in etf_tables]
-            conn.close()
-        except Exception as e:
-            etf_status['error'] = str(e)
-            # 尝试初始化
-            try:
-                from database import DuckDBManager
-                db = DuckDBManager(db_path=ETF_DB_PATH, asset_type='etf')
-                db.close()
-                etf_status['status'] = 'ok'
-            except Exception as init_e:
-                etf_status['init_error'] = str(init_e)
-        
+                conn = get_conn(asset_type=asset_type, db_role=db_role)
+                db_status['tables'] = [t[0] for t in conn.execute("SHOW TABLES").fetchall()]
+                db_status['status'] = 'ok'
+                conn.close()
+            except Exception as e:
+                db_status['error'] = str(e)
+                if db_role == 'market':
+                    try:
+                        from database import DuckDBManager
+                        db = DuckDBManager(db_path=path, asset_type=asset_type)
+                        db.close()
+                        db_status['status'] = 'ok'
+                    except Exception as init_e:
+                        db_status['init_error'] = str(init_e)
+            databases[key] = db_status
+
         return jsonify({
             'status': 'ok',
-            'databases': {
-                'stock': stock_status,
-                'etf': etf_status
-            }
+            'databases': databases,
         })
     except Exception as e:
         return jsonify({
@@ -950,11 +1027,10 @@ def api_logs():
 @app.route('/api/overview')
 def api_overview():
     table = request.args.get('table', '').strip()
+    conn = None
     try:
-        # 根据表名自动选择数据库
-        asset_type = asset_type_for_table(table)
-        conn = get_conn(asset_type=asset_type)
         if table and table in ALLOWED_TABLES:
+            conn = get_conn_for_table(table)
             columns = set(table_columns(conn, table))
             count      = conn.execute(f"SELECT COUNT(1) FROM {table}").fetchone()[0]
             code_count = conn.execute(f"SELECT COUNT(DISTINCT code) FROM {table}").fetchone()[0] if 'code' in columns else 0
@@ -990,14 +1066,19 @@ def api_overview():
             conn.close()
             return jsonify(cards)
         else:
-            # 查询两个数据库的所有表
             result = []
-            for atype in ['stock', 'etf']:
+            for atype, role in [('stock', 'market'), ('etf', 'market'), ('stock', 'factor'), ('etf', 'factor')]:
                 try:
-                    conn_atype = get_conn(asset_type=atype)
+                    conn_atype = get_conn(asset_type=atype, db_role=role)
                     all_tables = conn_atype.execute("SHOW TABLES").fetchall()
                     for t in all_tables:
                         tname = t[0]
+                        if tname not in ALLOWED_TABLES:
+                            continue
+                        if role == 'market' and tname in FACTOR_TABLES:
+                            continue
+                        if role == 'factor' and tname not in FACTOR_TABLES:
+                            continue
                         cnt   = conn_atype.execute(f"SELECT COUNT(1) FROM {tname}").fetchone()[0]
                         result.append({'table': tname, 'count': cnt})
                     conn_atype.close()
@@ -1019,6 +1100,8 @@ def api_table():
     keyword   = request.args.get('keyword', '').strip()
     start     = request.args.get('start', '').strip()
     end       = request.args.get('end', '').strip()
+    sort      = request.args.get('sort', '').strip()
+    order     = request.args.get('order', 'desc').strip().lower()
     offset    = page * page_size
 
     tbl, err = check_table(table)
@@ -1028,8 +1111,7 @@ def api_table():
     conn = None
     try:
         #  参数化 WHERE，防注入，同时避免特殊字符（如 sh.600006 中的点）破坏 SQL
-        asset_type = asset_type_for_table(table)
-        conn  = get_conn(asset_type=asset_type)
+        conn = get_conn_for_table(table, attach_market=table in FACTOR_RPS_TABLES)
         if table in MARKET_TABLES:
             select_cols, from_sql = market_display_sql(conn, table)
             where, params = build_market_where(keyword=keyword, start=start, end=end)
@@ -1041,17 +1123,42 @@ def api_table():
             sql_count = f"SELECT COUNT(1) FROM {from_sql} {where}"
         elif table in FACTOR_RPS_TABLES:
             info_table = 'etf_info' if table.startswith('etf_') else 'stock_info'
-            from_sql = f"{table} d LEFT JOIN {info_table} i ON d.code = i.code"
-            where, params = build_market_where(keyword=keyword, start=start, end=end)
+            from_sql = f"{table} d LEFT JOIN market_db.{info_table} i ON d.code = i.code"
+            if sort == 'rps_score':
+                where, params = build_market_where(keyword=keyword)
+                latest_date_filter = f"d.date = (SELECT MAX(date) FROM {table})"
+                where = f"{where} AND {latest_date_filter}" if where else f"WHERE {latest_date_filter}"
+            else:
+                where, params = build_market_where(keyword=keyword, start=start, end=end)
             factor_columns = set(table_columns(conn, table))
-            ret_5_expr = "d.ret_5, " if "ret_5" in factor_columns else "NULL AS ret_5, "
-            rps_5_expr = "d.rps_5, " if "rps_5" in factor_columns else "NULL AS rps_5, "
+            rps_columns = ['rps_5', 'rps_20', 'rps_50', 'rps_120', 'rps_250']
+            ret_columns = ['ret_5', 'ret_20', 'ret_50', 'ret_120', 'ret_250']
+            rps_score_expr = ' + '.join(
+                f"COALESCE(d.{column}, 0)" if column in factor_columns else '0'
+                for column in rps_columns
+            )
+            rps_select = ', '.join(
+                f"d.{column}" if column in factor_columns else f"NULL AS {column}"
+                for column in rps_columns
+            )
+            ret_select = ', '.join(
+                f"d.{column}" if column in factor_columns else f"NULL AS {column}"
+                for column in ret_columns
+            )
+            universe_expr = "d.universe" if "universe" in factor_columns else "NULL AS universe"
+            version_expr = "d.factor_version" if "factor_version" in factor_columns else "NULL AS factor_version"
+            updated_expr = "d.updated_at" if "updated_at" in factor_columns else "NULL AS updated_at"
+            direction = 'ASC' if order == 'asc' else 'DESC'
+            order_by = (
+                f"rps_score {direction} NULLS LAST, d.code"
+                if sort == 'rps_score'
+                else "d.date DESC, d.code"
+            )
             sql_data = (
-                "SELECT d.code, COALESCE(i.name, '') AS name, d.date, "
-                f"{ret_5_expr}d.ret_20, d.ret_50, d.ret_120, d.ret_250, "
-                f"{rps_5_expr}d.rps_20, d.rps_50, d.rps_120, d.rps_250, d.universe, d.factor_version, d.updated_at "
+                f"SELECT ({rps_score_expr}) AS rps_score, d.code, COALESCE(i.name, '') AS name, "
+                f"{rps_select}, {ret_select}, {universe_expr}, {version_expr}, {updated_expr}, d.date "
                 f"FROM {from_sql} {where} "
-                "ORDER BY d.date DESC, d.code "
+                f"ORDER BY {order_by} "
                 f"LIMIT {page_size} OFFSET {offset}"
             )
             sql_count = f"SELECT COUNT(1) FROM {from_sql} {where}"
@@ -1100,8 +1207,7 @@ def api_codes():
     tbl, err = check_table(table)
     if err: return err
     try:
-        asset_type = asset_type_for_table(table)
-        conn  = get_conn(asset_type=asset_type)
+        conn = get_conn_for_table(table)
         if 'code' not in table_columns(conn, table):
             conn.close()
             return jsonify([])
@@ -1235,8 +1341,7 @@ def api_stats():
     tbl, err = check_table(table)
     if err: return err
     try:
-        asset_type = asset_type_for_table(table)
-        conn   = get_conn(asset_type=asset_type)
+        conn = get_conn_for_table(table)
         schema = conn.execute(f"DESCRIBE {table}").fetchall()
         num_types = ('INTEGER','DOUBLE','FLOAT','BIGINT','DECIMAL','REAL','HUGEINT','UBIGINT')
         num_cols  = [col[0] for col in schema if col[1].upper().split('(')[0] in num_types]
@@ -1412,8 +1517,7 @@ def api_trend():
         return jsonify({'status': 'error', 'msg': f'不支持的字段: {field}'}), 400
 
     try:
-        asset_type = asset_type_for_table(table)
-        conn  = get_conn(asset_type=asset_type)
+        conn = get_conn_for_table(table)
         columns = table_columns(conn, table)
         if field not in columns:
             conn.close()
@@ -1449,12 +1553,18 @@ def api_trend():
 def api_refresh_status():
     try:
         result = []
-        for atype in ['stock', 'etf']:
+        for atype, role in [('stock', 'market'), ('etf', 'market'), ('stock', 'factor'), ('etf', 'factor')]:
             try:
-                conn = get_conn(asset_type=atype)
+                conn = get_conn(asset_type=atype, db_role=role)
                 tables = conn.execute("SHOW TABLES").fetchall()
                 for t in tables:
                     tname = t[0]
+                    if tname not in ALLOWED_TABLES:
+                        continue
+                    if role == 'market' and tname in FACTOR_TABLES:
+                        continue
+                    if role == 'factor' and tname not in FACTOR_TABLES:
+                        continue
                     try:
                         columns = set(table_columns(conn, tname))
                         if 'date' in columns:
@@ -1496,8 +1606,7 @@ def api_export():
     if err: return err
 
     try:
-        asset_type = asset_type_for_table(table)
-        conn  = get_conn(asset_type=asset_type)
+        conn = get_conn_for_table(table)
         if table in MARKET_TABLES:
             select_cols, from_sql = market_display_sql(conn, table)
             where, params = build_market_where(keyword=keyword, start=start, end=end, code=code)
@@ -1570,8 +1679,7 @@ def api_delete_preview():
     if not code and not start and not end:
         return jsonify({'status': 'error', 'msg': '必须指定 code 或 start/end 至少一个条件'}), 400
     try:
-        asset_type = asset_type_for_table(table)
-        conn = get_conn(asset_type=asset_type)
+        conn = get_conn_for_table(table)
         columns = table_columns(conn, table)
         where, params = build_where(code=code, start=start, end=end, columns=columns)
         if not where:
@@ -1601,8 +1709,7 @@ def api_delete():
         return jsonify({'status': 'error', 'msg': '必须指定 code 或 start/end 至少一个条件'}), 400
 
     try:
-        asset_type = asset_type_for_table(table)
-        conn  = get_conn(read_only=False, asset_type=asset_type)
+        conn = get_conn_for_table(table, read_only=False)
         columns = table_columns(conn, table)
         where, params = build_where(code=code, start=start, end=end, columns=columns)
         if not where:
@@ -1626,8 +1733,7 @@ def api_schema():
     tbl, err = check_table(table)
     if err: return err
     try:
-        asset_type = asset_type_for_table(table)
-        conn   = get_conn(asset_type=asset_type)
+        conn = get_conn_for_table(table)
         schema = conn.execute(f"DESCRIBE {table}").fetchall()
         conn.close()
         return jsonify([{'column': row[0], 'type': row[1]} for row in schema])

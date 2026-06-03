@@ -620,6 +620,9 @@ class StockDataPipeline:
         process_last_heartbeat: List[float] = [time.time()] * len(chunks)  # 记录每个进程最后心跳时间
         process_current_progress: List[Tuple[int, int]] = [(0, len(c)) for c in chunks]  # 记录每个进程当前进度(已处理, 总数)
         process_base_completed: List[int] = [0] * len(chunks)  # 复活后累积已完成的偏移量
+        process_last_revive_attempt: List[float] = [0.0] * len(chunks)
+        revive_retry_interval = 5
+        heartbeat_timeout = max(PROCESS_HEARTBEAT_TIMEOUT, 600 if frequency == "d" else PROCESS_HEARTBEAT_TIMEOUT)
         end_date = pd.Timestamp.now().strftime("%Y-%m-%d")
 
         for i, chunk in enumerate(chunks):
@@ -702,10 +705,16 @@ class StockDataPipeline:
                     if not p.is_alive():
                         exit_code = p.exitcode
                         if exit_code != 0 and process_revive_counts[idx] < PROCESS_MAX_REVIVE_TIMES:
+                            if current_time - process_last_revive_attempt[idx] < revive_retry_interval:
+                                continue
                             # 进程异常退出，尝试复活
                             process_revive_counts[idx] += 1
                             safe_print(f"🔄 [进程 {process_id}] 异常退出(退出码: {exit_code})，尝试第 {process_revive_counts[idx]} 次复活...")
-                            logger.warning(f"进程 {process_id} 异常退出，正在复活 (第 {process_revive_counts[idx]} 次)")
+                            logger.warning(
+                                f"进程 {process_id} 异常退出(exit_code={exit_code})，正在复活 "
+                                f"(第 {process_revive_counts[idx]} 次)"
+                            )
+                            process_last_revive_attempt[idx] = current_time
                             
                             # 获取剩余未处理的任务
                             processed, total = process_current_progress[idx]
@@ -725,11 +734,15 @@ class StockDataPipeline:
                     
                     # 检查心跳是否超时
                     time_since_last_heartbeat = current_time - process_last_heartbeat[idx]
-                    if time_since_last_heartbeat > PROCESS_HEARTBEAT_TIMEOUT and process_revive_counts[idx] < PROCESS_MAX_REVIVE_TIMES:
+                    if time_since_last_heartbeat > heartbeat_timeout and process_revive_counts[idx] < PROCESS_MAX_REVIVE_TIMES:
                         # 进程心跳超时，认为卡住，强制终止并复活
                         process_revive_counts[idx] += 1
                         safe_print(f"⚠️ [进程 {process_id}] 心跳超时({time_since_last_heartbeat:.0f}秒)，已卡住，尝试第 {process_revive_counts[idx]} 次复活...")
-                        logger.warning(f"进程 {process_id} 心跳超时，正在复活 (第 {process_revive_counts[idx]} 次)")
+                        logger.warning(
+                            f"进程 {process_id} 心跳超时({time_since_last_heartbeat:.0f}s>{heartbeat_timeout}s)，"
+                            f"正在复活 (第 {process_revive_counts[idx]} 次)"
+                        )
+                        process_last_revive_attempt[idx] = current_time
                         
                         # 强制终止进程
                         p.terminate()
@@ -893,6 +906,16 @@ class StockDataPipeline:
                 message='任务已停止'
             )
             safe_print(f"\n⏹️ 任务已停止 (频率: {frequency})")
+        elif self.processed_count < self.total_stocks:
+            message = f"下载未完成：已处理 {self.processed_count}/{self.total_stocks}，缺失 {self.total_stocks - self.processed_count} 只"
+            set_progress(
+                is_running=False,
+                processed=self.processed_count,
+                success=self.success_count,
+                error=self.error_count,
+                message=message
+            )
+            raise RuntimeError(message)
         else:
             set_progress(
                 is_running=False,

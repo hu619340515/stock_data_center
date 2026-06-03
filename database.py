@@ -1,11 +1,12 @@
 import os
+import tempfile
 import time
 from typing import List
 
 import duckdb
 import pandas as pd
 
-from config import ETF_DB_PATH, STOCK_DB_PATH
+from config import ETF_DB_PATH, ETF_FACTOR_DB_PATH, STOCK_DB_PATH, STOCK_FACTOR_DB_PATH
 from logger_config import setup_logger
 
 logger = setup_logger("Database")
@@ -36,6 +37,117 @@ RPS_UNIVERSES = {
     "etf": "all_etfs",
 }
 
+FACTOR_DB_PATHS = {
+    "stock": STOCK_FACTOR_DB_PATH,
+    "etf": ETF_FACTOR_DB_PATH,
+}
+
+FACTOR_TABLE_COLUMNS = [
+    "code", "date",
+    "ret_5", "ret_20", "ret_50", "ret_120", "ret_250",
+    "rps_5", "rps_20", "rps_50", "rps_120", "rps_250",
+    "universe", "factor_version", "updated_at",
+]
+
+FACTOR_LOG_COLUMNS = [
+    "factor_name", "universe", "factor_version", "start_date", "end_date",
+    "status", "message", "updated_at",
+]
+
+MARKET_COMPACT_TABLES = {
+    "stock": ["stock_daily", "stock_weekly", "stock_monthly", "stock_info", "trade_calendar"],
+    "etf": ["etf_daily", "etf_weekly", "etf_monthly", "etf_info", "trade_calendar"],
+}
+
+
+def _quote_path(path: str) -> str:
+    return str(path).replace("'", "''")
+
+
+def _qualified_table(table_name: str, schema: str = None) -> str:
+    return f"{schema}.{table_name}" if schema else table_name
+
+
+def factor_db_path_for(asset_type: str) -> str:
+    asset_type = (asset_type or "stock").lower()
+    if asset_type not in VALID_ASSET_TYPES:
+        raise ValueError(f"unsupported asset_type: {asset_type}")
+    return FACTOR_DB_PATHS[asset_type]
+
+
+def _ensure_parent_dir(path: str):
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
+def _create_factor_tables_for_connection(
+    con,
+    asset_type: str,
+    schema: str = None,
+    primary_key: bool = True,
+    create_indexes: bool = True,
+):
+    factor_table = _qualified_table(FACTOR_TABLES[asset_type]["rps"], schema)
+    log_table = _qualified_table(FACTOR_TABLES[asset_type]["log"], schema)
+    primary_key_sql = ",\n        PRIMARY KEY (code, date)" if primary_key else ""
+    con.execute(f"""
+    CREATE TABLE IF NOT EXISTS {factor_table} (
+        code VARCHAR,
+        date DATE,
+        ret_5 DOUBLE,
+        ret_20 DOUBLE,
+        ret_50 DOUBLE,
+        ret_120 DOUBLE,
+        ret_250 DOUBLE,
+        rps_5 DOUBLE,
+        rps_20 DOUBLE,
+        rps_50 DOUBLE,
+        rps_120 DOUBLE,
+        rps_250 DOUBLE,
+        universe VARCHAR,
+        factor_version VARCHAR,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP{primary_key_sql}
+    )
+    """)
+    con.execute(f"""
+    CREATE TABLE IF NOT EXISTS {log_table} (
+        factor_name VARCHAR,
+        universe VARCHAR,
+        factor_version VARCHAR,
+        start_date DATE,
+        end_date DATE,
+        status VARCHAR,
+        message VARCHAR,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+    if create_indexes:
+        _create_factor_indexes_for_connection(con, asset_type, schema=schema)
+
+
+def _create_factor_indexes_for_connection(con, asset_type: str, schema: str = None):
+    factor_table_name = FACTOR_TABLES[asset_type]["rps"]
+    factor_table = _qualified_table(factor_table_name, schema)
+    con.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS uq_{factor_table_name}_code_date ON {factor_table} (code, date)")
+    con.execute(f"CREATE INDEX IF NOT EXISTS idx_{factor_table_name}_date ON {factor_table} (date)")
+    con.execute(f"CREATE INDEX IF NOT EXISTS idx_{factor_table_name}_date_rps120 ON {factor_table} (date, rps_120)")
+
+
+def _replace_database_file(source_path: str, target_path: str):
+    _ensure_parent_dir(target_path)
+    os.replace(source_path, target_path)
+
+
+def _new_temp_db_path(target_path: str) -> str:
+    _ensure_parent_dir(target_path)
+    target_dir = os.path.dirname(os.path.abspath(target_path)) or "."
+    target_base = os.path.basename(target_path)
+    fd, temp_path = tempfile.mkstemp(prefix=f".{target_base}.", suffix=".tmp", dir=target_dir)
+    os.close(fd)
+    os.remove(temp_path)
+    return temp_path
+
 
 def safe_print(msg):
     try:
@@ -45,7 +157,7 @@ def safe_print(msg):
 
 
 class DuckDBManager:
-    def __init__(self, db_path=None, asset_type: str = "stock"):
+    def __init__(self, db_path=None, asset_type: str = "stock", factor_db_path: str = None):
         asset_type = (asset_type or "stock").lower()
         if asset_type not in VALID_ASSET_TYPES:
             raise ValueError(f"unsupported asset_type: {asset_type}")
@@ -54,9 +166,21 @@ class DuckDBManager:
 
         self.db_path = db_path
         self.asset_type = asset_type
+        self.factor_db_path = factor_db_path or factor_db_path_for(asset_type)
         self.con = duckdb.connect(db_path)
         self._create_table()
         logger.info(f"DuckDB initialized: {db_path} ({asset_type})")
+
+    def _close_connection(self):
+        if self.con is not None:
+            try:
+                self.con.close()
+            finally:
+                self.con = None
+
+    def _reopen_connection(self):
+        if self.con is None:
+            self.con = duckdb.connect(self.db_path)
 
     @staticmethod
     def _norm_path(path: str) -> str:
@@ -67,7 +191,6 @@ class DuckDBManager:
         self._create_asset_info_table()
         self._create_market_tables()
         self._create_common_tables()
-        self._create_factor_tables()
         self._migrate_legacy_market_name_columns()
         self._drop_foreign_asset_tables()
         self.con.commit()
@@ -199,16 +322,49 @@ class DuckDBManager:
 
         foreign_asset = "etf" if self.asset_type == "stock" else "stock"
         foreign_tables = list(MARKET_TABLES[foreign_asset].values()) + [INFO_TABLES[foreign_asset]]
-        foreign_tables.extend(FACTOR_TABLES[foreign_asset].values())
         for table_name in foreign_tables:
             self.con.execute(f"DROP TABLE IF EXISTS {table_name}")
 
+    def _write_factor_log(
+        self,
+        status: str,
+        universe: str,
+        factor_version: str,
+        start_date,
+        end_date,
+        message: str,
+        factor_db_path: str = None,
+    ):
+        factor_db_path = factor_db_path or self.factor_db_path
+        _ensure_parent_dir(factor_db_path)
+        factor_con = None
+        try:
+            factor_con = duckdb.connect(factor_db_path)
+            _create_factor_tables_for_connection(factor_con, self.asset_type)
+            log_table = FACTOR_TABLES[self.asset_type]["log"]
+            factor_con.execute(f"DELETE FROM {log_table}")
+            factor_con.execute(f"""
+                INSERT INTO {log_table} (
+                    factor_name, universe, factor_version, start_date, end_date,
+                    status, message, updated_at
+                )
+                VALUES ('rps_daily', ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """, [universe, factor_version, start_date, end_date, status, message])
+            factor_con.commit()
+        finally:
+            if factor_con is not None:
+                factor_con.close()
+
     def calculate_rps_daily(self, universe: str = None, factor_version: str = "rps_v1") -> int:
-        """Recalculate daily RPS factors from the selected asset's close history."""
+        """Recalculate daily RPS factors into this asset's standalone factor database."""
         market_table = MARKET_TABLES[self.asset_type]["d"]
         factor_table = FACTOR_TABLES[self.asset_type]["rps"]
         log_table = FACTOR_TABLES[self.asset_type]["log"]
         universe = universe or RPS_UNIVERSES[self.asset_type]
+
+        if self._norm_path(self.db_path) == self._norm_path(self.factor_db_path):
+            raise ValueError("factor database path must be separate from market database path")
+
         date_range = self.con.execute(f"SELECT MIN(date), MAX(date) FROM {market_table}").fetchone()
         start_date, end_date = date_range if date_range else (None, None)
         if not start_date or not end_date:
@@ -230,82 +386,102 @@ class DuckDBManager:
         ret_names = ", ".join(f"ret_{period}" for period in RPS_PERIODS)
         rps_names = ", ".join(f"rps_{period}" for period in RPS_PERIODS)
 
-        max_retries = 3
-        last_error = None
-        for attempt in range(1, max_retries + 1):
-            try:
-                self.con.execute(f"""
-                    INSERT OR REPLACE INTO {factor_table} (
-                        code, date, {ret_names}, {rps_names},
-                        universe, factor_version, updated_at
-                    )
-                    WITH returns AS (
-                        SELECT
-                            code,
-                            date,
-                            {lag_columns}
-                        FROM {market_table}
-                    ),
-                    ranked AS (
-                        SELECT
-                            code,
-                            date,
-                            {ret_names},
-                            {rank_columns}
-                        FROM returns
-                    )
+        temp_factor_path = _new_temp_db_path(self.factor_db_path)
+        market_schema = f"market_src_{os.getpid()}_{int(time.time() * 1000)}"
+        attached = False
+        factor_con = None
+        try:
+            self._close_connection()
+            factor_con = duckdb.connect(temp_factor_path)
+            factor_con.execute(f"ATTACH '{_quote_path(self.db_path)}' AS {market_schema} (READ_ONLY)")
+            attached = True
+            _create_factor_tables_for_connection(
+                factor_con,
+                self.asset_type,
+                primary_key=False,
+                create_indexes=False,
+            )
+            factor_con.execute(f"""
+                INSERT INTO {factor_table} (
+                    code, date, {ret_names}, {rps_names},
+                    universe, factor_version, updated_at
+                )
+                WITH returns AS (
+                    SELECT
+                        code,
+                        date,
+                        {lag_columns}
+                    FROM {market_schema}.{market_table}
+                ),
+                ranked AS (
                     SELECT
                         code,
                         date,
                         {ret_names},
-                        {rps_names},
-                        ?,
-                        ?,
-                        CURRENT_TIMESTAMP
-                    FROM ranked
-                """, [universe, factor_version])
-                count = self.con.execute(f"SELECT COUNT(*) FROM {factor_table}").fetchone()[0]
-                self.con.execute(f"""
-                    INSERT INTO {log_table} (
-                        factor_name, universe, factor_version, start_date, end_date,
-                        status, message, updated_at
-                    )
-                    VALUES ('rps_daily', ?, ?, ?, ?, 'success', ?, CURRENT_TIMESTAMP)
-                """, [universe, factor_version, start_date, end_date, f"calculated {count} rows"])
-                self.con.commit()
-                return count
-            except Exception as e:
-                last_error = e
-                message = str(e).lower()
-                retryable_conflict = "write-write conflict" in message or "transaction conflict" in message
-                try:
-                    self.con.rollback()
-                except Exception as rollback_error:
-                    rollback_msg = str(rollback_error).lower()
-                    if "no transaction is active" not in rollback_msg:
-                        logger.warning(f"RPS rollback failed: {rollback_error}")
-                if retryable_conflict and attempt < max_retries:
-                    wait_seconds = attempt
-                    logger.warning(
-                        f"RPS transaction conflict on {self.asset_type} "
-                        f"(attempt {attempt}/{max_retries}), retry in {wait_seconds}s: {e}"
-                    )
-                    time.sleep(wait_seconds)
-                    continue
-                break
-
-        try:
-            self.con.execute(f"""
+                        {rank_columns}
+                    FROM returns
+                )
+                SELECT
+                    code,
+                    date,
+                    {ret_names},
+                    {rps_names},
+                    ?,
+                    ?,
+                    CURRENT_TIMESTAMP
+                FROM ranked
+            """, [universe, factor_version])
+            count = factor_con.execute(f"SELECT COUNT(*) FROM {factor_table}").fetchone()[0]
+            duplicate_count = factor_con.execute(f"""
+                SELECT COUNT(*)
+                FROM (
+                    SELECT code, date, COUNT(*) AS row_count
+                    FROM {factor_table}
+                    GROUP BY code, date
+                    HAVING COUNT(*) > 1
+                )
+            """).fetchone()[0]
+            if duplicate_count:
+                raise ValueError(f"{factor_table} has {duplicate_count} duplicate code/date groups")
+            _create_factor_indexes_for_connection(factor_con, self.asset_type)
+            factor_con.execute(f"DELETE FROM {log_table}")
+            factor_con.execute(f"""
                 INSERT INTO {log_table} (
                     factor_name, universe, factor_version, start_date, end_date,
                     status, message, updated_at
                 )
-                VALUES ('rps_daily', ?, ?, ?, ?, 'failed', ?, CURRENT_TIMESTAMP)
-            """, [universe, factor_version, start_date, end_date, str(last_error)])
-            self.con.commit()
-        except Exception as log_error:
-            logger.warning(f"RPS failure log write failed: {log_error}")
-        raise last_error
+                VALUES ('rps_daily', ?, ?, ?, ?, 'success', ?, CURRENT_TIMESTAMP)
+            """, [universe, factor_version, start_date, end_date, f"calculated {count} rows"])
+            factor_con.commit()
+            factor_con.execute(f"DETACH {market_schema}")
+            attached = False
+            factor_con.close()
+            factor_con = None
+            _replace_database_file(temp_factor_path, self.factor_db_path)
+            self._reopen_connection()
+            return count
+        except Exception as e:
+            try:
+                if attached and factor_con is not None:
+                    factor_con.execute(f"DETACH {market_schema}")
+            except Exception as detach_error:
+                logger.warning(f"Temporary factor database detach failed: {detach_error}")
+            if factor_con is not None:
+                try:
+                    factor_con.close()
+                except Exception:
+                    pass
+            try:
+                if os.path.exists(temp_factor_path):
+                    os.remove(temp_factor_path)
+            except Exception as cleanup_error:
+                logger.warning(f"Temporary factor database cleanup failed: {cleanup_error}")
+            try:
+                self._write_factor_log("failed", universe, factor_version, start_date, end_date, str(e))
+            except Exception as log_error:
+                logger.warning(f"RPS failure log write failed: {log_error}")
+            self._reopen_connection()
+            raise
 
     def _table_exists(self, table_name: str) -> bool:
         return self.con.execute(
@@ -561,14 +737,19 @@ class DuckDBManager:
             return False
 
     def merge_from_db(self, source_db_path: str, tables: list = None) -> bool:
+        source_attached = False
+        source_schema = f"merge_src_{os.getpid()}_{int(time.time() * 1000)}"
         try:
             if not os.path.exists(source_db_path):
                 logger.error(f"Source database does not exist: {source_db_path}")
                 return False
 
             safe_print(f"Start merge from {source_db_path}, tables={tables}")
-            source_con = duckdb.connect(source_db_path, read_only=True)
-            source_table_names = [t[0] for t in source_con.execute("SHOW TABLES").fetchall()]
+            self.con.execute(f"ATTACH '{_quote_path(source_db_path)}' AS {source_schema} (READ_ONLY)")
+            source_attached = True
+            source_table_names = [
+                t[0] for t in self.con.execute(f"SHOW TABLES FROM {source_schema}").fetchall()
+            ]
             target_table_names = [t[0] for t in self.con.execute("SHOW TABLES").fetchall()]
             tables = tables or source_table_names
 
@@ -579,38 +760,41 @@ class DuckDBManager:
                         safe_print(f"Skip merge table {table}: missing in source or target")
                         continue
 
-                    source_data = source_con.execute(f"SELECT * FROM {table}").fetchdf()
-                    if source_data.empty:
+                    target_columns = self._table_columns(table)
+                    source_columns = [
+                        row[0] for row in self.con.execute(f"DESCRIBE {source_schema}.{table}").fetchall()
+                    ]
+                    columns = [col for col in target_columns if col in source_columns]
+                    if not columns:
+                        safe_print(f"Skip merge table {table}: no compatible columns")
                         continue
 
-                    if table in MARKET_TABLES[self.asset_type].values():
-                        source_data_clean = self._clean_data(source_data)
-                    else:
-                        target_columns = self._table_columns(table)
-                        source_data_clean = source_data[[col for col in target_columns if col in source_data.columns]].copy()
-                        for col in target_columns:
-                            if col not in source_data_clean.columns:
-                                if col == "updated_at":
-                                    source_data_clean[col] = pd.Timestamp.now()
-                                elif col == "update_time":
-                                    source_data_clean[col] = pd.Timestamp.now()
-                                else:
-                                    source_data_clean[col] = None
-                        source_data_clean = source_data_clean[target_columns]
+                    column_sql = ", ".join(columns)
+                    row_count = self.con.execute(f"SELECT COUNT(1) FROM {source_schema}.{table}").fetchone()[0]
+                    if row_count == 0:
+                        continue
 
-                    columns = ", ".join(source_data_clean.columns)
-                    self.con.execute(f"INSERT OR REPLACE INTO {table} ({columns}) SELECT {columns} FROM source_data_clean")
-                    merged_count += len(source_data_clean)
-                    safe_print(f"Merged {table}: {len(source_data_clean)} rows")
+                    self.con.execute(
+                        f"INSERT OR REPLACE INTO {table} ({column_sql}) "
+                        f"SELECT {column_sql} FROM {source_schema}.{table}"
+                    )
+                    merged_count += int(row_count)
+                    safe_print(f"Merged {table}: {row_count} rows")
                 except Exception as e:
                     safe_print(f"Merge table {table} failed: {e}")
                     logger.warning(f"Merge table {table} failed: {e}")
 
-            source_con.close()
             self.con.commit()
+            self.con.execute(f"DETACH {source_schema}")
+            source_attached = False
             safe_print(f"Database merge completed: {merged_count} rows")
             return True
         except Exception as e:
+            if source_attached:
+                try:
+                    self.con.execute(f"DETACH {source_schema}")
+                except Exception:
+                    pass
             logger.error(f"Database merge failed: {e}")
             return False
 
@@ -858,3 +1042,62 @@ class DuckDBManager:
             self.con.close()
         except Exception:
             pass
+
+
+def compact_market_database(db_path: str = None, asset_type: str = "stock") -> dict:
+    """Rebuild a market database without legacy factor tables or stale DuckDB blocks."""
+    asset_type = (asset_type or "stock").lower()
+    if asset_type not in VALID_ASSET_TYPES:
+        raise ValueError(f"unsupported asset_type: {asset_type}")
+    db_path = db_path or (ETF_DB_PATH if asset_type == "etf" else STOCK_DB_PATH)
+    if not os.path.exists(db_path):
+        raise FileNotFoundError(db_path)
+
+    temp_path = _new_temp_db_path(db_path)
+    manager = None
+    source_attached = False
+    copied = {}
+    try:
+        manager = DuckDBManager(db_path=temp_path, asset_type=asset_type)
+        con = manager.con
+        con.execute(f"ATTACH '{_quote_path(db_path)}' AS srcdb (READ_ONLY)")
+        source_attached = True
+        source_tables = {row[0] for row in con.execute("SHOW TABLES FROM srcdb").fetchall()}
+        for table in MARKET_COMPACT_TABLES[asset_type]:
+            if table not in source_tables:
+                copied[table] = 0
+                continue
+            target_columns = manager._table_columns(table)
+            source_columns = [row[0] for row in con.execute(f"DESCRIBE srcdb.{table}").fetchall()]
+            columns = [col for col in target_columns if col in source_columns]
+            if not columns:
+                copied[table] = 0
+                continue
+            column_sql = ", ".join(columns)
+            con.execute(f"INSERT OR REPLACE INTO {table} ({column_sql}) SELECT {column_sql} FROM srcdb.{table}")
+            copied[table] = con.execute(f"SELECT COUNT(1) FROM {table}").fetchone()[0]
+        con.commit()
+        con.execute("DETACH srcdb")
+        source_attached = False
+        manager.close()
+        manager = None
+        _replace_database_file(temp_path, db_path)
+        return {
+            "asset_type": asset_type,
+            "db_path": db_path,
+            "copied": {key: int(value) for key, value in copied.items()},
+        }
+    except Exception:
+        if manager is not None:
+            try:
+                if source_attached:
+                    manager.con.execute("DETACH srcdb")
+            except Exception:
+                pass
+            manager.close()
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+        raise

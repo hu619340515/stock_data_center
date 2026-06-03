@@ -3,9 +3,9 @@ import socketserver
 
 import click
 
-from config import ETF_DB_PATH, STOCK_DB_PATH
+from config import ETF_DB_PATH, ETF_FACTOR_DB_PATH, STOCK_DB_PATH, STOCK_FACTOR_DB_PATH
 from core import StockDataPipeline
-from database import DuckDBManager
+from database import DuckDBManager, compact_market_database
 from logger_config import setup_logger
 
 logger = setup_logger("CLI")
@@ -30,6 +30,10 @@ def _validate_asset_type(asset_type: str) -> str:
 
 def _db_path_for(asset_type: str) -> str:
     return ETF_DB_PATH if asset_type == "etf" else STOCK_DB_PATH
+
+
+def _factor_db_path_for(asset_type: str) -> str:
+    return ETF_FACTOR_DB_PATH if asset_type == "etf" else STOCK_FACTOR_DB_PATH
 
 
 def _run_stock_full(frequency: str) -> None:
@@ -264,6 +268,49 @@ def vacuum(asset_type):
         finally:
             if db is not None:
                 db.close()
+
+
+@cli.command(name="rebuild-factors")
+@click.option("--type", "-t", "asset_type", default="all", help="资产类型 (stock, etf, all)")
+@click.option("--clean-market", is_flag=True, help="重算因子后清理并压实行情库中的旧因子表")
+@click.option("--yes", "-y", is_flag=True, help="跳过清理确认")
+def rebuild_factors(asset_type, clean_market, yes):
+    """重建独立因子库，可同步清理旧行情库因子表。"""
+    asset_type = (asset_type or "all").lower()
+    if asset_type not in {"stock", "etf", "all"}:
+        raise click.BadParameter("资产类型只支持 stock、etf 或 all")
+    targets = ["stock", "etf"] if asset_type == "all" else [asset_type]
+
+    for target in targets:
+        db = None
+        try:
+            db = DuckDBManager(
+                db_path=_db_path_for(target),
+                asset_type=target,
+                factor_db_path=_factor_db_path_for(target),
+            )
+            count = db.calculate_rps_daily()
+            logger.info(f"✅ {target} 独立因子库已重建: {_factor_db_path_for(target)} ({count} rows)")
+        except Exception as e:
+            logger.error(f"{target} 因子重建失败: {e}")
+            raise click.ClickException(str(e))
+        finally:
+            if db is not None:
+                db.close()
+
+    if clean_market:
+        if not yes:
+            click.confirm(
+                "将重建并替换行情库文件以移除旧因子表和历史空闲块，且不保留备份。是否继续？",
+                abort=True,
+            )
+        for target in targets:
+            try:
+                result = compact_market_database(db_path=_db_path_for(target), asset_type=target)
+                logger.info(f"✅ {target} 行情库已清理压实: {result['db_path']}")
+            except Exception as e:
+                logger.error(f"{target} 行情库清理压实失败: {e}")
+                raise click.ClickException(str(e))
 
 
 @cli.command(name="start-viewer")

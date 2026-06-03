@@ -251,7 +251,7 @@
 
         <section class="page" id="page-factors">
           <div class="factor-hero">
-            <div><p class="eyebrow">FACTOR LAYER</p><h2>RPS 相对强度因子</h2><p>股票和 ETF 分别在各自资产池中计算横截面排名，独立存储版本与更新时间，便于后续研究和回测复现。</p></div>
+            <div><p class="eyebrow">FACTOR LAYER</p><h2>RPS 相对强度因子</h2><p>股票和 ETF 分别在各自资产池中计算横截面排名，并写入独立因子库，便于后续研究和回测复现。</p></div>
             <div class="recipe-actions"><button class="btn primary" data-task="/api/calculate_rps" data-body='{"target":"stock"}'><svg><use href="#icon-flask"/></svg>计算股票 RPS</button><button class="btn quiet" data-task="/api/calculate_rps" data-body='{"target":"etf"}'><svg><use href="#icon-flask"/></svg>计算 ETF RPS</button></div>
           </div>
           <div class="metric-grid" id="factor-metrics"></div>

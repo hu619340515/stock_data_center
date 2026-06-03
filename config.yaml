@@ -3,6 +3,8 @@ database:
   path: "quant_data.db"  # 数据库文件路径，默认保存在项目根目录下，支持相对路径和绝对路径
   stock_path: "stock_data.db"  # 股票数据库文件路径
   etf_path: "etf_data.db"  # ETF数据库文件路径
+  stock_factor_path: "stock_factor_data.db"  # 股票因子数据库文件路径
+  etf_factor_path: "etf_factor_data.db"  # ETF因子数据库文件路径
 
 # QMT/xtquant 配置（国金QMT通常通过本机 miniQMT/QMT + xtquant 提供行情）
 qmt:

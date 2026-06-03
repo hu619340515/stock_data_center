@@ -2,8 +2,10 @@ import os
 import tempfile
 import unittest
 
+import duckdb
 import pandas as pd
 
+import database
 from database import DuckDBManager
 import viewer.server as server
 
@@ -11,14 +13,20 @@ import viewer.server as server
 class TestViewerApi(unittest.TestCase):
     def setUp(self):
         self.temp_db = tempfile.mktemp(suffix=".db")
+        self.temp_factor_db = tempfile.mktemp(suffix=".db")
+        self.temp_etf_factor_db = tempfile.mktemp(suffix=".db")
         self.original_stock_path = server.STOCK_DB_PATH
         self.original_etf_path = server.ETF_DB_PATH
+        self.original_stock_factor_path = server.STOCK_FACTOR_DB_PATH
+        self.original_etf_factor_path = server.ETF_FACTOR_DB_PATH
         server.STOCK_DB_PATH = self.temp_db
         server.ETF_DB_PATH = self.temp_db
+        server.STOCK_FACTOR_DB_PATH = self.temp_factor_db
+        server.ETF_FACTOR_DB_PATH = self.temp_etf_factor_db
         server.app.config["TESTING"] = True
         self.client = server.app.test_client()
 
-        self.db = DuckDBManager(db_path=self.temp_db, asset_type="stock")
+        self.db = DuckDBManager(db_path=self.temp_db, asset_type="stock", factor_db_path=self.temp_factor_db)
         info_df = pd.DataFrame({
             "code": ["sh.600000", "sh.600001"],
             "name": ["\u6d66\u53d1\u94f6\u884c", "\u6d4b\u8bd5\u80a1\u7968"],
@@ -42,7 +50,9 @@ class TestViewerApi(unittest.TestCase):
             "isST": ["0", "0"],
         })
         self.db.upload_batch([df])
-        self.db.con.execute("""
+        self.factor_con = duckdb.connect(self.temp_factor_db)
+        database._create_factor_tables_for_connection(self.factor_con, "stock")
+        self.factor_con.execute("""
             INSERT INTO factor_rps_daily (
                 code, date, ret_20, ret_50, ret_120, ret_250,
                 rps_20, rps_50, rps_120, rps_250, universe, factor_version
@@ -51,17 +61,27 @@ class TestViewerApi(unittest.TestCase):
                 80, 70, 60, 50, 'all_stocks', 'rps_v1'
             )
         """)
-        self.db.con.commit()
+        self.factor_con.commit()
+        self.factor_con.close()
+        self.factor_con = None
         self.db.close()
         self.db = None
 
     def tearDown(self):
         if self.db is not None:
             self.db.close()
+        if getattr(self, "factor_con", None) is not None:
+            self.factor_con.close()
         server.STOCK_DB_PATH = self.original_stock_path
         server.ETF_DB_PATH = self.original_etf_path
+        server.STOCK_FACTOR_DB_PATH = self.original_stock_factor_path
+        server.ETF_FACTOR_DB_PATH = self.original_etf_factor_path
         if os.path.exists(self.temp_db):
             os.remove(self.temp_db)
+        if os.path.exists(self.temp_factor_db):
+            os.remove(self.temp_factor_db)
+        if os.path.exists(self.temp_etf_factor_db):
+            os.remove(self.temp_etf_factor_db)
 
     def test_delete_requires_confirm(self):
         response = self.client.post("/api/delete", json={
@@ -199,9 +219,71 @@ class TestViewerApi(unittest.TestCase):
         self.assertEqual(body["total"], 1)
         self.assertEqual(body["rows"][0]["name"], "\u6d66\u53d1\u94f6\u884c")
 
+    def test_factor_table_adds_rps_score_and_sorts_it(self):
+        factor_con = duckdb.connect(self.temp_factor_db)
+        factor_con.execute("""
+            INSERT INTO factor_rps_daily (
+                code, date, ret_20, ret_50, ret_120, ret_250,
+                rps_20, rps_50, rps_120, rps_250, universe, factor_version
+            ) VALUES
+                (
+                    'sh.600002', '2024-01-02', 0.09, 0.09, 0.09, 0.09,
+                    99, 98, 97, 96, 'all_stocks', 'rps_v1'
+                ),
+                (
+                    'sh.600000', '2024-01-03', 0.01, 0.01, 0.01, 0.01,
+                    10, 20, 30, 40, 'all_stocks', 'rps_v1'
+                ),
+                (
+                    'sh.600001', '2024-01-03', 0.02, 0.03, 0.04, 0.05,
+                    95, 85, 75, 65, 'all_stocks', 'rps_v1'
+                )
+        """)
+        factor_con.commit()
+        factor_con.close()
+
+        response = self.client.get("/api/table?table=factor_rps_daily&page=0&page_size=10&sort=rps_score&order=desc")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.get_json()
+        columns = body["columns"]
+        self.assertEqual(columns[:4], ["rps_score", "code", "name", "rps_5"])
+        self.assertLess(columns.index("rps_250"), columns.index("ret_5"))
+        self.assertEqual(columns[-1], "date")
+        self.assertEqual(body["total"], 2)
+        self.assertEqual(body["rows"][0]["code"], "sh.600001")
+        self.assertEqual(body["rows"][0]["rps_score"], 320)
+        self.assertTrue(all("03 Jan 2024" in row["date"] for row in body["rows"]))
+
+        asc_response = self.client.get("/api/table?table=factor_rps_daily&page=0&page_size=10&sort=rps_score&order=asc")
+        self.assertEqual(asc_response.status_code, 200)
+        self.assertEqual(asc_response.get_json()["rows"][0]["code"], "sh.600000")
+
+        date_filtered = self.client.get(
+            "/api/table?table=factor_rps_daily&page=0&page_size=10"
+            "&sort=rps_score&order=desc&start=2024-01-01&end=2024-01-02"
+        )
+        self.assertEqual(date_filtered.status_code, 200)
+        date_filtered_body = date_filtered.get_json()
+        self.assertEqual(date_filtered_body["total"], 2)
+        self.assertTrue(all("03 Jan 2024" in row["date"] for row in date_filtered_body["rows"]))
+
+        keyword_response = self.client.get(
+            "/api/table?table=factor_rps_daily&page=0&page_size=10"
+            "&sort=rps_score&order=desc&keyword=\u6d66\u53d1"
+        )
+        self.assertEqual(keyword_response.status_code, 200)
+        keyword_body = keyword_response.get_json()
+        self.assertEqual(keyword_body["total"], 1)
+        self.assertEqual(keyword_body["rows"][0]["code"], "sh.600000")
+
+        regular_response = self.client.get("/api/table?table=factor_rps_daily&page=0&page_size=10")
+        self.assertEqual(regular_response.status_code, 200)
+        self.assertEqual(regular_response.get_json()["total"], 4)
+
     def test_factor_table_serializes_nan_as_null(self):
-        db = DuckDBManager(db_path=self.temp_db, asset_type="stock")
-        db.con.execute("""
+        factor_con = duckdb.connect(self.temp_factor_db)
+        factor_con.execute("""
             INSERT INTO factor_rps_daily (
                 code, date, ret_20, ret_50, ret_120, ret_250,
                 rps_20, rps_50, rps_120, rps_250, universe, factor_version
@@ -210,7 +292,8 @@ class TestViewerApi(unittest.TestCase):
                 80, 70, 60, 50, 'all_stocks', 'rps_v1'
             )
         """)
-        db.close()
+        factor_con.commit()
+        factor_con.close()
 
         response = self.client.get("/api/table?table=factor_rps_daily&page=0&page_size=10&keyword=600001")
 

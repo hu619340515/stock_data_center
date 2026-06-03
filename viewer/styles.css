@@ -133,6 +133,9 @@ canvas { display: block; width: 100%; max-width: 100%; }
 .compact-table table, table { width: 100%; border-collapse: collapse; }
 th, td { padding: 10px 11px; border-bottom: 1px solid var(--line); color: var(--ink-2); font-size: 12px; text-align: left; white-space: nowrap; }
 th { color: var(--muted); background: #f8f8f3; font-size: 11px; letter-spacing: .03em; }
+th.sortable { cursor: pointer; user-select: none; color: var(--ink-2); }
+th.sortable:hover, th.sortable.active { background: #edf3ec; }
+.sort-indicator { margin-left: 6px; color: var(--teal); font-size: 10px; }
 tbody tr:hover { background: #f6f8f3; }
 .clickable-row { cursor: pointer; }
 .search-row { display: flex; gap: 9px; }

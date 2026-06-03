@@ -1,7 +1,8 @@
 import unittest
 import os
 import tempfile
-from database import DuckDBManager
+import duckdb
+from database import DuckDBManager, compact_market_database
 
 class TestDatabase(unittest.TestCase):
     """数据库操作测试"""
@@ -10,13 +11,16 @@ class TestDatabase(unittest.TestCase):
         """设置测试环境"""
         # 创建临时数据库文件
         self.temp_db = tempfile.mktemp(suffix='.db')
-        self.db = DuckDBManager(db_path=self.temp_db, asset_type="stock")
+        self.temp_factor_db = tempfile.mktemp(suffix='.db')
+        self.db = DuckDBManager(db_path=self.temp_db, asset_type="stock", factor_db_path=self.temp_factor_db)
     
     def tearDown(self):
         """清理测试环境"""
         self.db.close()
         if os.path.exists(self.temp_db):
             os.remove(self.temp_db)
+        if os.path.exists(self.temp_factor_db):
+            os.remove(self.temp_factor_db)
     
     def test_create_tables(self):
         """测试创建表"""
@@ -25,6 +29,7 @@ class TestDatabase(unittest.TestCase):
         self.assertIn('stock_daily', tables['name'].values)
         self.assertIn('stock_weekly', tables['name'].values)
         self.assertIn('stock_monthly', tables['name'].values)
+        self.assertNotIn('factor_rps_daily', tables['name'].values)
     
     def test_upload_batch(self):
         """测试批量上传数据"""
@@ -263,30 +268,116 @@ class TestDatabase(unittest.TestCase):
         count = self.db.calculate_rps_daily()
 
         self.assertEqual(count, 42)
-        result = self.db.con.execute("""
-            SELECT code, ROUND(ret_20, 2), ROUND(rps_20, 2)
-            FROM factor_rps_daily
-            WHERE date = '2024-01-21'
-            ORDER BY code
-        """).fetchall()
-        self.assertEqual(result, [
-            ("sh.600000", 1.0, 100.0),
-            ("sh.600001", 0.1, 0.0),
-        ])
-        log = self.db.con.execute("""
-            SELECT status, message
-            FROM factor_update_log
-            ORDER BY updated_at DESC
-            LIMIT 1
-        """).fetchone()
-        self.assertEqual(log, ("success", "calculated 42 rows"))
+        self.assertNotIn("factor_rps_daily", self.db.con.execute("SHOW TABLES").df()["name"].values)
+        factor_con = duckdb.connect(self.temp_factor_db, read_only=True)
+        try:
+            result = factor_con.execute("""
+                SELECT code, ROUND(ret_20, 2), ROUND(rps_20, 2)
+                FROM factor_rps_daily
+                WHERE date = '2024-01-21'
+                ORDER BY code
+            """).fetchall()
+            self.assertEqual(result, [
+                ("sh.600000", 1.0, 100.0),
+                ("sh.600001", 0.1, 0.0),
+            ])
+            log = factor_con.execute("""
+                SELECT status, message
+                FROM factor_update_log
+                ORDER BY updated_at DESC
+                LIMIT 1
+            """).fetchone()
+            self.assertEqual(log, ("success", "calculated 42 rows"))
+        finally:
+            factor_con.close()
+
+    def test_calculate_rps_replaces_factor_db_and_keeps_latest_log(self):
+        import pandas as pd
+
+        dates = pd.date_range("2024-01-01", periods=21, freq="D")
+        rows = []
+        for code, last_close in [("sh.600000", 200.0), ("sh.600001", 110.0)]:
+            for index, date in enumerate(dates):
+                close = last_close if index == 20 else 100.0
+                rows.append({
+                    "code": code,
+                    "date": date.strftime("%Y-%m-%d"),
+                    "open": close,
+                    "high": close,
+                    "low": close,
+                    "close": close,
+                    "preclose": close,
+                    "volume": 1000,
+                    "amount": 100000.0,
+                    "adjustflag": "2",
+                    "turn": 0.0,
+                    "tradestatus": "1",
+                    "pctChg": 0.0,
+                    "isST": "0",
+                })
+        self.db.upload_batch([pd.DataFrame(rows)])
+
+        self.assertEqual(self.db.calculate_rps_daily(), 42)
+        self.assertEqual(self.db.calculate_rps_daily(), 42)
+
+        factor_con = duckdb.connect(self.temp_factor_db, read_only=True)
+        try:
+            row_count, distinct_keys, duplicate_keys = factor_con.execute("""
+                SELECT
+                    COUNT(*),
+                    COUNT(DISTINCT code || CAST(date AS VARCHAR)),
+                    COUNT(*) - COUNT(DISTINCT code || CAST(date AS VARCHAR))
+                FROM factor_rps_daily
+            """).fetchone()
+            self.assertEqual((row_count, distinct_keys, duplicate_keys), (42, 42, 0))
+            log_count = factor_con.execute("SELECT COUNT(*) FROM factor_update_log").fetchone()[0]
+            self.assertEqual(log_count, 1)
+            status = factor_con.execute("SELECT status FROM factor_update_log").fetchone()[0]
+            self.assertEqual(status, "success")
+        finally:
+            factor_con.close()
+
+    def test_compact_market_database_removes_legacy_factor_tables(self):
+        import pandas as pd
+
+        self.db.upload_batch([pd.DataFrame({
+            "code": ["sh.600000", "sh.600000"],
+            "date": ["2024-01-01", "2024-01-02"],
+            "open": [10.0, 10.1],
+            "high": [10.2, 10.3],
+            "low": [9.9, 10.0],
+            "close": [10.1, 10.2],
+            "preclose": [10.0, 10.1],
+            "volume": [1000, 1200],
+            "amount": [10100.0, 12240.0],
+            "adjustflag": ["2", "2"],
+            "turn": [1.0, 1.2],
+            "tradestatus": ["1", "1"],
+            "pctChg": [1.0, 0.99],
+            "isST": ["0", "0"],
+        })])
+        self.db.con.execute("CREATE TABLE factor_rps_daily(code VARCHAR, date DATE)")
+        self.db.con.execute("CREATE TABLE factor_update_log(status VARCHAR)")
+        self.db.con.commit()
+        self.db.close()
+
+        result = compact_market_database(db_path=self.temp_db, asset_type="stock")
+
+        self.assertEqual(result["copied"]["stock_daily"], 2)
+        self.db = DuckDBManager(db_path=self.temp_db, asset_type="stock", factor_db_path=self.temp_factor_db)
+        tables = self.db.con.execute("SHOW TABLES").df()["name"].values
+        self.assertIn("stock_daily", tables)
+        self.assertNotIn("factor_rps_daily", tables)
+        self.assertNotIn("factor_update_log", tables)
+        self.assertEqual(self.db.con.execute("SELECT COUNT(*) FROM stock_daily").fetchone()[0], 2)
 
     def test_calculate_etf_rps_daily_ranks_cross_sectional_returns(self):
         """ETF RPS uses the ETF universe and writes to the ETF factor tables."""
         import pandas as pd
 
         etf_temp_db = tempfile.mktemp(suffix=".db")
-        etf_db = DuckDBManager(db_path=etf_temp_db, asset_type="etf")
+        etf_factor_temp_db = tempfile.mktemp(suffix=".db")
+        etf_db = DuckDBManager(db_path=etf_temp_db, asset_type="etf", factor_db_path=etf_factor_temp_db)
         try:
             dates = pd.date_range("2024-01-01", periods=21, freq="D")
             rows = []
@@ -314,27 +405,34 @@ class TestDatabase(unittest.TestCase):
             count = etf_db.calculate_rps_daily()
 
             self.assertEqual(count, 42)
-            result = etf_db.con.execute("""
-                SELECT code, ROUND(ret_20, 2), ROUND(rps_20, 2), universe
-                FROM etf_factor_rps_daily
-                WHERE date = '2024-01-21'
-                ORDER BY code
-            """).fetchall()
-            self.assertEqual(result, [
-                ("sh.510300", 0.5, 100.0, "all_etfs"),
-                ("sz.159915", 0.2, 0.0, "all_etfs"),
-            ])
-            log = etf_db.con.execute("""
-                SELECT status, message
-                FROM etf_factor_update_log
-                ORDER BY updated_at DESC
-                LIMIT 1
-            """).fetchone()
-            self.assertEqual(log, ("success", "calculated 42 rows"))
+            self.assertNotIn("etf_factor_rps_daily", etf_db.con.execute("SHOW TABLES").df()["name"].values)
+            factor_con = duckdb.connect(etf_factor_temp_db, read_only=True)
+            try:
+                result = factor_con.execute("""
+                    SELECT code, ROUND(ret_20, 2), ROUND(rps_20, 2), universe
+                    FROM etf_factor_rps_daily
+                    WHERE date = '2024-01-21'
+                    ORDER BY code
+                """).fetchall()
+                self.assertEqual(result, [
+                    ("sh.510300", 0.5, 100.0, "all_etfs"),
+                    ("sz.159915", 0.2, 0.0, "all_etfs"),
+                ])
+                log = factor_con.execute("""
+                    SELECT status, message
+                    FROM etf_factor_update_log
+                    ORDER BY updated_at DESC
+                    LIMIT 1
+                """).fetchone()
+                self.assertEqual(log, ("success", "calculated 42 rows"))
+            finally:
+                factor_con.close()
         finally:
             etf_db.close()
             if os.path.exists(etf_temp_db):
                 os.remove(etf_temp_db)
+            if os.path.exists(etf_factor_temp_db):
+                os.remove(etf_factor_temp_db)
 
     def test_calculate_rps_preserves_original_error(self):
         import database
@@ -364,14 +462,19 @@ class TestDatabase(unittest.TestCase):
         finally:
             database.RPS_PERIODS = original_periods
 
-        log = self.db.con.execute("""
-            SELECT status, message
-            FROM factor_update_log
-            ORDER BY updated_at DESC
-            LIMIT 1
-        """).fetchone()
-        self.assertEqual(log[0], "failed")
-        self.assertIn("ret_999", log[1])
+        self.assertNotIn("factor_rps_daily", self.db.con.execute("SHOW TABLES").df()["name"].values)
+        factor_con = duckdb.connect(self.temp_factor_db, read_only=True)
+        try:
+            log = factor_con.execute("""
+                SELECT status, message
+                FROM factor_update_log
+                ORDER BY updated_at DESC
+                LIMIT 1
+            """).fetchone()
+            self.assertEqual(log[0], "failed")
+            self.assertIn("ret_999", log[1])
+        finally:
+            factor_con.close()
 
 if __name__ == '__main__':
     unittest.main()

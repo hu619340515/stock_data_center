@@ -145,7 +145,11 @@ class ConfigLoader:
         """获取默认配置"""
         return {
             "database": {
-                "path": "quant_data.db"
+                "path": "quant_data.db",
+                "stock_path": "stock_data.db",
+                "etf_path": "etf_data.db",
+                "stock_factor_path": "stock_factor_data.db",
+                "etf_factor_path": "etf_factor_data.db",
             },
             "qmt": {
                 "ip": "127.0.0.1",
@@ -214,9 +218,21 @@ class ConfigLoader:
 config_loader = ConfigLoader()
 
 # 数据库配置
-DATABASE_PATH = os.path.join(PROJECT_ROOT, config_loader.get("database.path", "quant_data.db"))
-STOCK_DB_PATH = os.path.join(PROJECT_ROOT, config_loader.get("database.stock_path", "stock_data.db"))
-ETF_DB_PATH = os.path.join(PROJECT_ROOT, config_loader.get("database.etf_path", "etf_data.db"))
+def _resolve_project_path(path: str) -> str:
+    return path if os.path.isabs(path) else os.path.join(PROJECT_ROOT, path)
+
+
+def _database_path(config_key: str, default: str, env_name: str = None) -> str:
+    configured = os.environ.get(env_name, "") if env_name else ""
+    configured = configured or config_loader.get(config_key, default)
+    return _resolve_project_path(configured)
+
+
+DATABASE_PATH = _database_path("database.path", "quant_data.db")
+STOCK_DB_PATH = _database_path("database.stock_path", "stock_data.db", "STOCK_DB_PATH")
+ETF_DB_PATH = _database_path("database.etf_path", "etf_data.db", "ETF_DB_PATH")
+STOCK_FACTOR_DB_PATH = _database_path("database.stock_factor_path", "stock_factor_data.db", "STOCK_FACTOR_DB_PATH")
+ETF_FACTOR_DB_PATH = _database_path("database.etf_factor_path", "etf_factor_data.db", "ETF_FACTOR_DB_PATH")
 
 QMT_IP = config_loader.get("qmt.ip", "127.0.0.1")
 QMT_PORT = config_loader.get("qmt.port", 58610)

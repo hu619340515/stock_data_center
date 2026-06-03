@@ -14,13 +14,14 @@ const COLUMN_LABELS = {
   status: "状态", message: "消息", asset_type: "资产", ret_5: "RET5", ret_20: "RET20", ret_50: "RET50", ret_120: "RET120", ret_250: "RET250", rps_5: "RPS5", rps_10: "RPS10", rps_20: "RPS20",
   rps_50: "RPS50", rps_120: "RPS120", rps_250: "RPS250"
 };
+COLUMN_LABELS.rps_score = "RPS总分";
 const PAGE_META = {
   overview: ["DATA ASSET OVERVIEW", "数据资产总览"], market: ["MARKET SNAPSHOT", "市场快照"],
   research: ["SECURITY RESEARCH", "证券研究"], browser: ["DATA EXPLORER", "数据浏览"],
   sync: ["SYNC CENTER", "同步中心"], factors: ["FACTOR LAYER", "因子中心"],
   quality: ["QUALITY & OBSERVABILITY", "质量与日志"]
 };
-const state = { page: "overview", dashboard: null, browserPage: 1, browserPages: 1, securityMap: {}, taskOpen: false };
+const state = { page: "overview", dashboard: null, browserPage: 1, browserPages: 1, browserSort: { table: "", column: "", order: "desc" }, securityMap: {}, taskOpen: false };
 const $ = (id) => document.getElementById(id);
 const qsa = (selector) => [...document.querySelectorAll(selector)];
 const icon = (name) => `<svg><use href="#icon-${name}"/></svg>`;
@@ -36,6 +37,35 @@ const compact = (value) => {
 const tableFor = (asset, frequency) => `${asset}_${frequency}`;
 const pctClass = (value) => Number(value) > 0 ? "rise" : Number(value) < 0 ? "fall" : "";
 const pct = (value) => `${Number(value || 0) > 0 ? "+" : ""}${fmt(value)}%`;
+const RPS_BROWSER_TABLES = new Set(["factor_rps_daily", "etf_factor_rps_daily"]);
+const NUMERIC_FACTOR_COLUMNS = new Set(["ret_5","ret_20","ret_50","ret_120","ret_250","rps_score","rps_5","rps_10","rps_20","rps_50","rps_120","rps_250"]);
+const DATE_COLUMNS = new Set(["date","start_date","end_date","updated_at","update_time","started_at","finished_at","generated_at","latest_trade_date","min_date","max_date"]);
+const MONTH_NUMBERS = { jan: "01", feb: "02", mar: "03", apr: "04", may: "05", jun: "06", jul: "07", aug: "08", sep: "09", oct: "10", nov: "11", dec: "12" };
+function isDateColumn(column) {
+  const name = String(column || "").toLowerCase();
+  return DATE_COLUMNS.has(name) || name.endsWith("_date") || name.endsWith("_at") || name.endsWith("_time");
+}
+function compactDate(value) {
+  if (value == null || value === "") return "--";
+  const text = String(value).trim();
+  let match = text.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (match) return `${match[1]}${match[2]}${match[3]}`;
+  match = text.match(/^(\d{4})(\d{2})(\d{2})$/);
+  if (match) return text;
+  match = text.match(/^\w{3},\s+(\d{2})\s+([A-Za-z]{3})\s+(\d{4})/);
+  if (match) return `${match[3]}${MONTH_NUMBERS[match[2].toLowerCase()] || match[2]}${match[1]}`;
+  const parsed = new Date(text);
+  if (!Number.isNaN(parsed.getTime()) && /(?:GMT|T|\d{4}-\d{2}-\d{2})/.test(text)) {
+    return `${parsed.getUTCFullYear()}${String(parsed.getUTCMonth() + 1).padStart(2, "0")}${String(parsed.getUTCDate()).padStart(2, "0")}`;
+  }
+  return text;
+}
+function compactRange(start, end) {
+  return start && end ? `${compactDate(start)} ~ ${compactDate(end)}` : "--";
+}
+function isSortableBrowserColumn(table, column) {
+  return RPS_BROWSER_TABLES.has(table) && column === "rps_score";
+}
 async function api(url, options = {}) {
   const response = await fetch(url, options);
   const body = await response.json().catch(() => ({}));
@@ -94,11 +124,11 @@ async function loadDashboard(force = false) {
 function renderDashboard(data) {
   $("health-score").textContent = data.health_score;
   $("health-ring").style.setProperty("--score-angle", `${data.health_score * 3.6}deg`);
-  $("latest-date").textContent = data.summary.latest_trade_date || "--";
+  $("latest-date").textContent = compactDate(data.summary.latest_trade_date);
   const databases = Object.values(data.databases || {});
   const healthy = databases.every((item) => item.status === "ok");
-  $("db-pill").innerHTML = `<span class="status-light ${healthy ? "" : "error"}"></span><span>${healthy ? "股票库与 ETF 库已连接" : "数据库连接异常"}</span>`;
-  $("db-mini-grid").innerHTML = databases.map((db) => `<div class="db-mini"><b>${db.asset_type === "stock" ? "股票库" : "ETF 库"}</b>${db.status === "ok" ? "连接正常" : "连接异常"} · ${db.tables.length} 张表</div>`).join("");
+  $("db-pill").innerHTML = `<span class="status-light ${healthy ? "" : "error"}"></span><span>${healthy ? "行情库与因子库已连接" : "数据库连接异常"}</span>`;
+  $("db-mini-grid").innerHTML = databases.map((db) => `<div class="db-mini"><b>${esc(db.label || (db.asset_type === "stock" ? "股票库" : "ETF 库"))}</b>${db.status === "ok" ? "连接正常" : "连接异常"} · ${db.tables.length} 张表</div>`).join("");
   $("metric-grid").innerHTML = [
     metricHtml("股票日线", compact(data.summary.stock_daily_count), "本地行情明细"),
     metricHtml("ETF 日线", compact(data.summary.etf_daily_count), "本地基金行情"),
@@ -106,12 +136,16 @@ function renderDashboard(data) {
     metricHtml("ETF 数量", fmtCount(data.summary.etf_count), "ETF 基础信息")
   ].join("");
   const byTable = Object.fromEntries(data.tables.map((item) => [item.table, item]));
-  const rows = [["股票", "stock"], ["ETF", "etf"], ["因子", "factor"]];
-  $("freshness-grid").innerHTML = rows.map(([label, prefix]) => {
-    const tables = prefix === "factor" ? ["factor_rps_daily", "factor_update_log", "trade_calendar"] : [`${prefix}_daily`, `${prefix}_weekly`, `${prefix}_monthly`];
+  const rows = [
+    ["股票行情", ["stock_daily", "stock_weekly", "stock_monthly"]],
+    ["ETF 行情", ["etf_daily", "etf_weekly", "etf_monthly"]],
+    ["股票因子", ["factor_rps_daily", "factor_update_log"]],
+    ["ETF 因子", ["etf_factor_rps_daily", "etf_factor_update_log"]]
+  ];
+  $("freshness-grid").innerHTML = rows.map(([label, tables]) => {
     return `<div class="fresh-row"><b>${label}</b>${tables.map((table) => {
       const item = byTable[table] || {};
-      return `<div class="fresh-cell ${item.count ? "" : "empty"}"><span>${esc(TABLE_LABELS[table])}</span><b>${esc(item.max_date || (item.count ? `${fmtCount(item.count)} 条` : "待补齐"))}</b></div>`;
+      return `<div class="fresh-cell ${item.count ? "" : "empty"}"><span>${esc(TABLE_LABELS[table])}</span><b>${esc(item.max_date ? compactDate(item.max_date) : (item.count ? `${fmtCount(item.count)} 条` : "待补齐"))}</b></div>`;
     }).join("")}</div>`;
   }).join("");
   $("overview-issues").innerHTML = data.issues.length ? data.issues.slice(0, 4).map(issueHtml).join("") : issueHtml({ level: "info", title: "没有发现明显问题", detail: "本地数据资产状态良好。" });
@@ -137,8 +171,9 @@ async function loadMarket() {
     renderMovers("rise-table", rise.data || []);
     renderMovers("fall-table", fall.data || []);
     const broken = Number(distribution.rise_count || 0) === 0 && Number(distribution.fall_count || 0) === 0 && Number(distribution.flat_count || 0) > 0;
+    const displaySnapshotDate = snapshotDate ? compactDate(snapshotDate) : "";
     $("market-diagnostic").innerHTML = broken
-      ? issueHtml({ level: "warning", title: `${rise.date || "当前日期"} 的涨跌幅全部为 0`, detail: "涨跌榜和市场宽度可能失真。建议检查 pctChg 字段映射后再使用该快照进行判断。" })
+      ? issueHtml({ level: "warning", title: `${displaySnapshotDate || "当前日期"} 的涨跌幅全部为 0`, detail: "涨跌榜和市场宽度可能失真。建议检查 pctChg 字段映射后再使用该快照进行判断。" })
       : issueHtml({ level: "info", title: "快照分布可用", detail: `当前快照覆盖 ${fmtCount((distribution.rise_count || 0) + (distribution.fall_count || 0) + (distribution.flat_count || 0))} 个证券。` });
   } catch (error) {
     toast(`市场快照加载失败：${error.message}`, "error");
@@ -207,16 +242,16 @@ async function loadResearch() {
     if (!data.dates.length) throw new Error("当前条件下没有行情数据");
     $("research-empty").classList.add("hidden"); $("research-content").classList.remove("hidden");
     $("research-name").textContent = data.name || code; $("research-code").textContent = code;
-    $("research-caption").textContent = `${TABLE_LABELS[table]} · ${data.dates[0]} 至 ${data.dates[data.dates.length - 1]}`;
+    $("research-caption").textContent = `${TABLE_LABELS[table]} · ${compactDate(data.dates[0])} 至 ${compactDate(data.dates[data.dates.length - 1])}`;
     const last = data.ohlc.length - 1, closes = data.ohlc.map((item) => Number(item[1])), highs = data.ohlc.map((item) => Number(item[3])), lows = data.ohlc.map((item) => Number(item[2]));
     $("research-metrics").innerHTML = [
-      metricHtml("最新收盘", fmt(closes[last]), data.dates[last]), metricHtml("区间最高", fmt(Math.max(...highs)), "当前筛选区间"),
+      metricHtml("最新收盘", fmt(closes[last]), compactDate(data.dates[last])), metricHtml("区间最高", fmt(Math.max(...highs)), "当前筛选区间"),
       metricHtml("区间最低", fmt(Math.min(...lows)), "当前筛选区间"), metricHtml("最新成交额", compact(data.amounts[last]), "最近交易日")
     ].join("");
     drawKline($("kline-chart"), data);
     $("research-recent").innerHTML = data.dates.slice(-12).reverse().map((date, reverseIndex) => {
       const index = data.dates.length - 1 - reverseIndex, row = data.ohlc[index];
-      return `<tr><td>${esc(date)}</td><td>${fmt(row[0])}</td><td>${fmt(row[3])}</td><td>${fmt(row[2])}</td><td>${fmt(row[1])}</td><td>${fmtCount(data.volumes[index])}</td><td>${compact(data.amounts[index])}</td></tr>`;
+      return `<tr><td>${esc(compactDate(date))}</td><td>${fmt(row[0])}</td><td>${fmt(row[3])}</td><td>${fmt(row[2])}</td><td>${fmt(row[1])}</td><td>${fmtCount(data.volumes[index])}</td><td>${compact(data.amounts[index])}</td></tr>`;
     }).join("");
   } catch (error) {
     toast(`证券研究加载失败：${error.message}`, "error");
@@ -247,7 +282,12 @@ function drawKline(canvas, data) {
 }
 async function loadBrowserTable(page = 1) {
   state.browserPage = Math.max(1, page);
-  const params = new URLSearchParams({ table: $("browser-table").value, page: state.browserPage - 1, page_size: 50, keyword: $("browser-keyword").value.trim(), start: $("browser-start").value, end: $("browser-end").value });
+  const table = $("browser-table").value;
+  const params = new URLSearchParams({ table, page: state.browserPage - 1, page_size: 50, keyword: $("browser-keyword").value.trim(), start: $("browser-start").value, end: $("browser-end").value });
+  if (state.browserSort.table === table && state.browserSort.column) {
+    params.set("sort", state.browserSort.column);
+    params.set("order", state.browserSort.order);
+  }
   $("browser-tbody").innerHTML = `<tr><td>正在加载...</td></tr>`;
   try {
     const data = await api(`/api/table?${params}`);
@@ -259,8 +299,19 @@ async function loadBrowserTable(page = 1) {
     $("browser-result").textContent = `找到 ${fmtCount(total)} 条记录`;
     $("browser-page").textContent = `第 ${state.browserPage} / ${state.browserPages} 页`;
     $("browser-prev").disabled = state.browserPage <= 1; $("browser-next").disabled = state.browserPage >= state.browserPages;
-    $("browser-thead").innerHTML = `<tr>${columns.map((column) => `<th>${esc(COLUMN_LABELS[column] || column)}</th>`).join("")}</tr>`;
-    const marketTable = ["stock_daily","stock_weekly","stock_monthly","etf_daily","etf_weekly","etf_monthly","factor_rps_daily","etf_factor_rps_daily"].includes($("browser-table").value);
+    $("browser-thead").innerHTML = `<tr>${columns.map((column) => {
+      const sortable = isSortableBrowserColumn(table, column);
+      const active = sortable && state.browserSort.table === table && state.browserSort.column === column;
+      const indicator = active ? (state.browserSort.order === "asc" ? "↑" : "↓") : "↕";
+      return `<th class="${sortable ? "sortable" : ""} ${active ? "active" : ""}" ${sortable ? `data-sort-column="${esc(column)}" title="按${esc(COLUMN_LABELS[column] || column)}排序"` : ""}>${esc(COLUMN_LABELS[column] || column)}${sortable ? `<span class="sort-indicator">${indicator}</span>` : ""}</th>`;
+    }).join("")}</tr>`;
+    qsa("#browser-thead th[data-sort-column]").forEach((header) => header.addEventListener("click", () => {
+      const column = header.dataset.sortColumn;
+      const sameSort = state.browserSort.table === table && state.browserSort.column === column;
+      state.browserSort = { table, column, order: sameSort && state.browserSort.order === "desc" ? "asc" : "desc" };
+      loadBrowserTable(1);
+    }));
+    const marketTable = ["stock_daily","stock_weekly","stock_monthly","etf_daily","etf_weekly","etf_monthly","factor_rps_daily","etf_factor_rps_daily"].includes(table);
     $("browser-tbody").innerHTML = rows.length ? rows.map((row) => `<tr class="${marketTable ? "clickable-row" : ""}" ${marketTable ? `data-security="${esc(row.code)}" data-name="${esc(row.name)}"` : ""}>${columns.map((column) => `<td class="${column === "pctChg" ? pctClass(row[column]) : ""}">${esc(formatCell(column, row[column]))}</td>`).join("")}</tr>`).join("") : `<tr><td colspan="${Math.max(columns.length, 1)}">暂无数据</td></tr>`;
     qsa("#browser-tbody .clickable-row").forEach((row) => row.addEventListener("click", () => openResearch(row.dataset.security, row.dataset.name)));
   } catch (error) {
@@ -273,8 +324,13 @@ async function loadBrowserTable(page = 1) {
   }
 }
 function formatCell(column, value) {
-  if (value == null) return "--"; if (column === "amount") return compact(value); if (column === "pctChg") return pct(value);
-  if (["open","high","low","close","preclose","turn","ret_5","ret_20","ret_50","ret_120","ret_250","rps_5","rps_20","rps_50","rps_120","rps_250"].includes(column)) return fmt(value, 4); if (column === "volume") return fmtCount(value); return value;
+  if (value == null) return "--";
+  if (isDateColumn(column)) return compactDate(value);
+  if (column === "amount") return compact(value);
+  if (column === "pctChg") return pct(value);
+  if (["open","high","low","close","preclose","turn"].includes(column) || NUMERIC_FACTOR_COLUMNS.has(column)) return fmt(value, 4);
+  if (column === "volume") return fmtCount(value);
+  return value;
 }
 function exportData() {
   const params = new URLSearchParams({ table: $("browser-table").value, keyword: $("browser-keyword").value.trim(), start: $("browser-start").value, end: $("browser-end").value });
@@ -298,7 +354,7 @@ async function loadTaskDrawer() {
       $("task-current").innerHTML = `<div class="current-task"><div class="task-title-row"><h3>${esc(history.current?.name || progress.task_name || "后台任务")}</h3><span>${percent}%</span></div><div class="progress-track"><div class="progress-fill" style="width:${percent}%"></div></div><div class="task-meta"><span>${fmtCount(progress.processed)}/${fmtCount(progress.total)}</span><span>成功 ${fmtCount(progress.success)}</span><span>失败 ${fmtCount(progress.error)}</span><span>${progress.speed ? `${fmt(progress.speed)} 只/秒` : "正在准备"}</span></div><div class="recipe-actions" style="margin-top:13px"><button class="btn danger" id="stop-current-task">停止任务</button></div></div>`;
       $("stop-current-task").addEventListener("click", stopTask);
     } else $("task-current").innerHTML = emptyHtml("当前没有运行中的后台任务");
-    $("task-history").innerHTML = history.history.length ? history.history.map((item) => `<div class="history-item"><div><b>${esc(item.name)}</b><span>${esc(item.started_at)} · ${esc(item.message || "")}</span></div><div><b>${esc(item.status)}</b><span>${item.duration_seconds != null ? `${item.duration_seconds}s` : ""}</span></div></div>`).join("") : emptyHtml("暂无历史记录");
+    $("task-history").innerHTML = history.history.length ? history.history.map((item) => `<div class="history-item"><div><b>${esc(item.name)}</b><span>${esc(compactDate(item.started_at))} · ${esc(item.message || "")}</span></div><div><b>${esc(item.status)}</b><span>${item.duration_seconds != null ? `${item.duration_seconds}s` : ""}</span></div></div>`).join("") : emptyHtml("暂无历史记录");
     $("task-log-state").textContent = logs.is_running ? "运行中" : "空闲";
     updateLogText($("task-log"), [...(logs.logs || []), ...(logs.error_logs || []).slice(-15)].join("\n") || "暂无日志");
   } catch (error) { $("task-current").innerHTML = emptyHtml(error.message); }
@@ -316,16 +372,16 @@ async function loadFactors() {
   const etf = state.dashboard.tables.find((item) => item.table === "etf_factor_rps_daily") || {};
   $("factor-metrics").innerHTML = [
     metricHtml("股票因子记录", fmtCount(stock.count), stock.count ? "已生成" : "尚未计算"),
-    metricHtml("股票覆盖区间", stock.min_date && stock.max_date ? `${stock.min_date} ~ ${stock.max_date}` : "--", "股票资产池"),
+    metricHtml("股票覆盖区间", compactRange(stock.min_date, stock.max_date), "股票资产池"),
     metricHtml("ETF 因子记录", fmtCount(etf.count), etf.count ? "已生成" : "尚未计算"),
-    metricHtml("ETF 覆盖区间", etf.min_date && etf.max_date ? `${etf.min_date} ~ ${etf.max_date}` : "--", "ETF 资产池")
+    metricHtml("ETF 覆盖区间", compactRange(etf.min_date, etf.max_date), "ETF 资产池")
   ].join("");
   try {
     const [stockLogs, etfLogs] = await Promise.all([api("/api/table?table=factor_update_log&page=0&page_size=20"), api("/api/table?table=etf_factor_update_log&page=0&page_size=20").catch(() => ({ columns: [], rows: [] }))]);
     const columns = ["asset_type", ...(stockLogs.columns || etfLogs.columns || [])];
     const rows = [...(stockLogs.rows || []).map((row) => ({ asset_type: "股票", ...row })), ...(etfLogs.rows || []).map((row) => ({ asset_type: "ETF", ...row }))];
     $("factor-thead").innerHTML = `<tr>${columns.map((column) => `<th>${esc(COLUMN_LABELS[column] || column)}</th>`).join("")}</tr>`;
-    $("factor-tbody").innerHTML = rows.length ? rows.map((row) => `<tr>${columns.map((column) => `<td>${esc(row[column] ?? "--")}</td>`).join("")}</tr>`).join("") : `<tr><td colspan="${Math.max(1, columns.length)}">暂无因子计算记录</td></tr>`;
+    $("factor-tbody").innerHTML = rows.length ? rows.map((row) => `<tr>${columns.map((column) => `<td>${esc(formatCell(column, row[column]))}</td>`).join("")}</tr>`).join("") : `<tr><td colspan="${Math.max(1, columns.length)}">暂无因子计算记录</td></tr>`;
   } catch (error) { $("factor-tbody").innerHTML = `<tr><td>${esc(error.message)}</td></tr>`; }
 }
 async function loadQuality() {
@@ -333,7 +389,7 @@ async function loadQuality() {
     const [quality, logs] = await Promise.all([api("/api/data_quality"), api("/api/logs?limit=220")]);
     $("quality-score").textContent = quality.health_score;
     $("quality-issues").innerHTML = quality.issues.length ? quality.issues.map(issueHtml).join("") : issueHtml({ level: "info", title: "没有发现明显问题", detail: "本地数据状态良好。" });
-    $("quality-tables").innerHTML = quality.tables.map((item) => `<tr><td>${esc(item.label)}</td><td>${item.asset_type === "stock" ? "股票" : "ETF"}</td><td>${fmtCount(item.count)}</td><td>${esc(item.min_date || "--")}</td><td>${esc(item.max_date || "--")}</td><td>${item.count ? "可用" : "待补齐"}</td></tr>`).join("");
+    $("quality-tables").innerHTML = quality.tables.map((item) => `<tr><td>${esc(item.label)}</td><td>${item.asset_type === "stock" ? "股票" : "ETF"}${item.db_role === "factor" ? "因子" : "行情"}</td><td>${fmtCount(item.count)}</td><td>${esc(compactDate(item.min_date))}</td><td>${esc(compactDate(item.max_date))}</td><td>${item.count ? "可用" : "待补齐"}</td></tr>`).join("");
     renderQualityLogs(logs);
   } catch (error) { toast(`质量诊断加载失败：${error.message}`, "error"); }
 }
@@ -345,7 +401,7 @@ async function repairLatestFields() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ asset_type: "stock", frequency: "d", confirm: true })
     });
-    toast(`已修复 ${data.latest_date || "最新日"}：前收 ${fmtCount(data.preclose_repaired)} 条，涨跌幅 ${fmtCount(data.pctchg_repaired)} 条，ST ${fmtCount(data.st_repaired)} 条`);
+    toast(`已修复 ${data.latest_date ? compactDate(data.latest_date) : "最新日"}：前收 ${fmtCount(data.preclose_repaired)} 条，涨跌幅 ${fmtCount(data.pctchg_repaired)} 条，ST ${fmtCount(data.st_repaired)} 条`);
     await loadDashboard(true);
     await loadQuality();
   } catch (error) { toast(error.message, "error"); }
